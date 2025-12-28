@@ -1,0 +1,22 @@
+#!/bin/bash
+# catap launcher script
+# This script launches Python with the catap module
+
+# Set environment variable to indicate we're running from bundle
+export CATAP_RUNNING_FROM_BUNDLE=1
+
+# Try to find Python with catap installed
+# First try python3 from PATH (works for installed packages and activated venvs)
+if command -v python3 &> /dev/null && python3 -c "import catap" 2>/dev/null; then
+    exec python3 -m catap "$@"
+fi
+
+# Try just 'python' as fallback
+if command -v python &> /dev/null && python -c "import catap" 2>/dev/null; then
+    exec python -m catap "$@"
+fi
+
+# If we get here, catap is not installed
+echo "Error: catap module not found in any available Python installation" >&2
+echo "Please ensure catap is installed: pip install catap" >&2
+exit 1
