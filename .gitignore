@@ -11,3 +11,6 @@ wheels/
 
 # macOS code signature (regenerated on build)
 _CodeSignature/
+
+# Log files
+*.log
