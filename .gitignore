@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# macOS code signature (regenerated on build)
+_CodeSignature/

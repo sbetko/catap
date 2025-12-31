@@ -239,12 +239,98 @@ def record(
     APP_NAME can be a partial match (case-insensitive) of the application name.
     Use 'catap list-apps' to see available applications.
     """
-    click.echo(f"record command - not yet implemented")
-    click.echo(f"App: {app_name}")
+    import signal
+    import time
+    from catap.bindings.process import find_process_by_name, list_audio_processes
+    from catap.bindings.tap_description import TapDescription, TapMuteBehavior
+    from catap.bindings.hardware import create_process_tap, destroy_process_tap
+    from catap.core.recorder import AudioRecorder
+
+    # Find the process
+    process = find_process_by_name(app_name)
+    if not process:
+        # Show available processes to help user
+        all_procs = list_audio_processes()
+        click.echo(f"Error: No audio process found matching '{app_name}'", err=True)
+        if all_procs:
+            click.echo("\nAvailable audio processes:", err=True)
+            for p in all_procs[:10]:
+                status = "outputting" if p.is_outputting else "idle"
+                click.echo(f"  - {p.name} ({status})", err=True)
+            if len(all_procs) > 10:
+                click.echo(f"  ... and {len(all_procs) - 10} more", err=True)
+        return
+
+    click.echo(f"Recording from: {process.name} (PID: {process.pid})")
     click.echo(f"Output: {output}")
-    if duration:
-        click.echo(f"Duration: {duration}s")
-    click.echo(f"Mute: {mute}")
+
+    # Create tap description
+    tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
+    tap_desc.name = f"catap recording {process.name}"
+    tap_desc.is_private = True
+
+    if mute:
+        tap_desc.mute_behavior = TapMuteBehavior.MUTED
+        click.echo("Muting app audio during recording")
+    else:
+        tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
+
+    # Create tap
+    try:
+        tap_id = create_process_tap(tap_desc)
+    except OSError as e:
+        click.echo(f"Error creating audio tap: {e}", err=True)
+        click.echo("\nThis may be a permissions issue. Try:", err=True)
+        click.echo("  1. Check System Settings > Privacy & Security > Microphone", err=True)
+        click.echo("  2. Run through the app bundle for proper permissions", err=True)
+        return
+
+    click.echo(f"Created tap (ID: {tap_id})")
+
+    # Create recorder
+    recorder = AudioRecorder(tap_id, output)
+
+    # Handle Ctrl+C gracefully
+    stop_flag = False
+
+    def signal_handler(sig, frame):
+        nonlocal stop_flag
+        stop_flag = True
+        click.echo("\nStopping recording...")
+
+    original_handler = signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        # Start recording
+        recorder.start()
+
+        if duration:
+            click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
+            start_time = time.time()
+            while time.time() - start_time < duration and not stop_flag:
+                time.sleep(0.1)
+        else:
+            click.echo("Recording... (Ctrl+C to stop)")
+            while not stop_flag:
+                time.sleep(0.1)
+
+        # Stop recording
+        recorder.stop()
+
+        click.echo(f"Recorded {recorder.duration_seconds:.2f} seconds")
+        click.echo(f"Saved to: {output}")
+
+    except OSError as e:
+        click.echo(f"Recording error: {e}", err=True)
+    finally:
+        # Restore signal handler
+        signal.signal(signal.SIGINT, original_handler)
+
+        # Clean up tap
+        try:
+            destroy_process_tap(tap_id)
+        except OSError:
+            pass  # Ignore cleanup errors
 
 
 if __name__ == "__main__":
