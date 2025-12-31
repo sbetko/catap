@@ -19,7 +19,7 @@ Python wrapper for Apple's Core Audio Tap API (macOS 14.2+). Capture audio from 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/catap.git
+git clone https://github.com/sbetko/catap.git
 cd catap
 
 # Install with uv (recommended)

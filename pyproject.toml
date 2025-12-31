@@ -3,16 +3,34 @@ name = "catap"
 version = "0.1.0"
 description = "Python wrapper for Apple's Core Audio Tap API"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "Sage Betko", email = "sage.betko@gmail.com" }
 ]
 requires-python = ">=3.12"
+keywords = ["audio", "macos", "core-audio", "recording", "tap", "capture"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+]
 dependencies = [
     "pyobjc-core>=11.0",
     "pyobjc-framework-Cocoa>=11.0",
     "pyobjc-framework-CoreAudio>=11.0",
     "click>=8.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/sbetko/catap"
+Repository = "https://github.com/sbetko/catap"
+Issues = "https://github.com/sbetko/catap/issues"
 
 [project.scripts]
 catap = "catap.cli:main"
