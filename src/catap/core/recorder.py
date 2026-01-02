@@ -366,7 +366,7 @@ class AudioRecorder:
     def __init__(
         self,
         tap_id: int,
-        output_path: str | Path,
+        output_path: str | Path | None = None,
         on_data: Callable[[bytes, int], None] | None = None,
     ) -> None:
         """
@@ -374,11 +374,11 @@ class AudioRecorder:
 
         Args:
             tap_id: AudioObjectID of the tap to record from
-            output_path: Path to write the WAV file
+            output_path: Path to write the WAV file, or None for streaming mode
             on_data: Optional callback for each audio buffer (bytes, num_frames)
         """
         self.tap_id = tap_id
-        self.output_path = Path(output_path)
+        self.output_path = Path(output_path) if output_path else None
         self._on_data = on_data
 
         # Aggregate device (created on start)
@@ -455,7 +455,9 @@ class AudioRecorder:
                         num_frames = 0
 
                     with self._lock:
-                        self._audio_chunks.append(data)
+                        # Only accumulate if we have an output path
+                        if self.output_path is not None:
+                            self._audio_chunks.append(data)
                         self._total_frames += num_frames
 
                     # Call user callback if provided
@@ -564,8 +566,9 @@ class AudioRecorder:
                 pass
             self._aggregate_device_id = None
 
-        # Write WAV file
-        self._write_wav()
+        # Write WAV file only if output path is set
+        if self.output_path is not None:
+            self._write_wav()
 
     def _write_wav(self) -> None:
         """Write accumulated audio data to WAV file."""
@@ -621,3 +624,18 @@ class AudioRecorder:
     def duration_seconds(self) -> float:
         """Duration of recorded audio in seconds."""
         return self._total_frames / self._sample_rate
+
+    @property
+    def sample_rate(self) -> float:
+        """Sample rate in Hz."""
+        return self._sample_rate
+
+    @property
+    def num_channels(self) -> int:
+        """Number of audio channels."""
+        return self._num_channels
+
+    @property
+    def is_float(self) -> bool:
+        """True if audio format is float32."""
+        return self._is_float

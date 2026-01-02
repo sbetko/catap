@@ -227,11 +227,17 @@ def test_tap(log: str) -> None:
     default=False,
     help="Mute the app while recording"
 )
+@click.option(
+    "--meter", "-m",
+    is_flag=True,
+    help="Show live VU meter during recording"
+)
 def record(
     app_name: str,
     output: str,
     duration: float | None,
     mute: bool,
+    meter: bool,
 ) -> None:
     """
     Record audio from an application.
@@ -287,8 +293,27 @@ def record(
 
     click.echo(f"Created tap (ID: {tap_id})")
 
-    # Create recorder
-    recorder = AudioRecorder(tap_id, output)
+    # Set up VU meter if requested
+    vu_meter = None
+    if meter:
+        try:
+            from catap.core.meter import VUMeter
+            vu_meter = VUMeter(num_channels=2)
+        except ImportError:
+            click.echo(
+                "Warning: VU meter requires 'rich' library. "
+                "Install with: pip install rich",
+                err=True
+            )
+
+    # Create recorder with optional meter callback
+    def on_data_callback(data: bytes, num_frames: int) -> None:
+        if vu_meter:
+            vu_meter.update(data, num_frames)
+
+    recorder = AudioRecorder(
+        tap_id, output, on_data=on_data_callback if vu_meter else None
+    )
 
     # Handle Ctrl+C gracefully
     stop_flag = False
@@ -296,7 +321,8 @@ def record(
     def signal_handler(sig, frame):
         nonlocal stop_flag
         stop_flag = True
-        click.echo("\nStopping recording...")
+        if not vu_meter:
+            click.echo("\nStopping recording...")
 
     original_handler = signal.signal(signal.SIGINT, signal_handler)
 
@@ -304,15 +330,30 @@ def record(
         # Start recording
         recorder.start()
 
-        if duration:
-            click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
-            start_time = time.time()
-            while time.time() - start_time < duration and not stop_flag:
-                time.sleep(0.1)
+        # Update meter with duration callback after recorder starts
+        if vu_meter:
+            vu_meter._duration_callback = lambda: recorder.duration_seconds
+
+        # Recording loop with optional VU meter display
+        def recording_loop():
+            nonlocal stop_flag
+            if duration:
+                if not vu_meter:
+                    click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
+                start_time = time.time()
+                while time.time() - start_time < duration and not stop_flag:
+                    time.sleep(0.1)
+            else:
+                if not vu_meter:
+                    click.echo("Recording... (Ctrl+C to stop)")
+                while not stop_flag:
+                    time.sleep(0.1)
+
+        if vu_meter:
+            with vu_meter:
+                recording_loop()
         else:
-            click.echo("Recording... (Ctrl+C to stop)")
-            while not stop_flag:
-                time.sleep(0.1)
+            recording_loop()
 
         # Stop recording
         recorder.stop()
@@ -350,10 +391,16 @@ def record(
     multiple=True,
     help="App names to exclude from recording (can be specified multiple times)"
 )
+@click.option(
+    "--meter", "-m",
+    is_flag=True,
+    help="Show live VU meter during recording"
+)
 def record_system(
     output: str,
     duration: float | None,
     exclude: tuple[str, ...],
+    meter: bool,
 ) -> None:
     """
     Record all system audio.
@@ -399,8 +446,27 @@ def record_system(
 
     click.echo(f"Created tap (ID: {tap_id})")
 
-    # Create recorder
-    recorder = AudioRecorder(tap_id, output)
+    # Set up VU meter if requested
+    vu_meter = None
+    if meter:
+        try:
+            from catap.core.meter import VUMeter
+            vu_meter = VUMeter(num_channels=2)
+        except ImportError:
+            click.echo(
+                "Warning: VU meter requires 'rich' library. "
+                "Install with: pip install rich",
+                err=True
+            )
+
+    # Create recorder with optional meter callback
+    def on_data_callback(data: bytes, num_frames: int) -> None:
+        if vu_meter:
+            vu_meter.update(data, num_frames)
+
+    recorder = AudioRecorder(
+        tap_id, output, on_data=on_data_callback if vu_meter else None
+    )
 
     # Handle Ctrl+C gracefully
     stop_flag = False
@@ -408,7 +474,8 @@ def record_system(
     def signal_handler(sig, frame):
         nonlocal stop_flag
         stop_flag = True
-        click.echo("\nStopping recording...")
+        if not vu_meter:
+            click.echo("\nStopping recording...")
 
     original_handler = signal.signal(signal.SIGINT, signal_handler)
 
@@ -416,15 +483,30 @@ def record_system(
         # Start recording
         recorder.start()
 
-        if duration:
-            click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
-            start_time = time.time()
-            while time.time() - start_time < duration and not stop_flag:
-                time.sleep(0.1)
+        # Update meter with duration callback after recorder starts
+        if vu_meter:
+            vu_meter._duration_callback = lambda: recorder.duration_seconds
+
+        # Recording loop with optional VU meter display
+        def recording_loop():
+            nonlocal stop_flag
+            if duration:
+                if not vu_meter:
+                    click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
+                start_time = time.time()
+                while time.time() - start_time < duration and not stop_flag:
+                    time.sleep(0.1)
+            else:
+                if not vu_meter:
+                    click.echo("Recording... (Ctrl+C to stop)")
+                while not stop_flag:
+                    time.sleep(0.1)
+
+        if vu_meter:
+            with vu_meter:
+                recording_loop()
         else:
-            click.echo("Recording... (Ctrl+C to stop)")
-            while not stop_flag:
-                time.sleep(0.1)
+            recording_loop()
 
         # Stop recording
         recorder.stop()
@@ -443,6 +525,251 @@ def record_system(
             destroy_process_tap(tap_id)
         except OSError:
             pass  # Ignore cleanup errors
+
+
+@main.command("stream")
+@click.argument("app_name")
+@click.option(
+    "--format", "-f",
+    type=click.Choice(["f32le", "s16le", "wav"]),
+    default="f32le",
+    help="Output format: f32le (native float), s16le (16-bit int), wav (with header)"
+)
+@click.option(
+    "--duration", "-d",
+    type=float,
+    default=None,
+    help="Duration limit in seconds (default: until Ctrl+C)"
+)
+@click.option(
+    "--mute/--no-mute",
+    default=False,
+    help="Mute the app while streaming"
+)
+def stream(
+    app_name: str,
+    format: str,
+    duration: float | None,
+    mute: bool,
+) -> None:
+    """
+    Stream audio from an application to stdout.
+
+    Output is raw PCM data suitable for piping to ffmpeg, sox, etc.
+    Status messages are written to stderr.
+
+    \b
+    Examples:
+        catap stream Spotify | ffmpeg -f f32le -ar 44100 -ac 2 -i - output.mp3
+        catap stream Safari --format s16le | sox -t raw -r 44100 -c 2 -e signed -b 16 - out.wav
+    """
+    import signal
+    import sys
+    import time
+    from catap.bindings.process import find_process_by_name, list_audio_processes
+    from catap.bindings.tap_description import TapDescription, TapMuteBehavior
+    from catap.bindings.hardware import create_process_tap, destroy_process_tap
+    from catap.core.recorder import AudioRecorder
+    from catap.core.streamer import AudioStreamer
+
+    # Find the process
+    process = find_process_by_name(app_name)
+    if not process:
+        all_procs = list_audio_processes()
+        click.echo(f"Error: No audio process found matching '{app_name}'", err=True)
+        if all_procs:
+            click.echo("\nAvailable audio processes:", err=True)
+            for p in all_procs[:10]:
+                status = "outputting" if p.is_outputting else "idle"
+                click.echo(f"  - {p.name} ({status})", err=True)
+        return
+
+    click.echo(f"Streaming from: {process.name} (PID: {process.pid})", err=True)
+    click.echo(f"Format: {format}", err=True)
+
+    # Create tap description
+    tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
+    tap_desc.name = f"catap streaming {process.name}"
+    tap_desc.is_private = True
+    tap_desc.mute_behavior = TapMuteBehavior.MUTED if mute else TapMuteBehavior.UNMUTED
+
+    # Create tap
+    try:
+        tap_id = create_process_tap(tap_desc)
+    except OSError as e:
+        click.echo(f"Error creating audio tap: {e}", err=True)
+        return
+
+    # Create streamer (sample rate will be updated after recorder starts)
+    streamer = AudioStreamer(
+        format=format,
+        sample_rate=44100,
+        num_channels=2,
+        output=sys.stdout.buffer,
+    )
+
+    # Create recorder in streaming mode (no output file)
+    recorder = AudioRecorder(tap_id, output_path=None, on_data=streamer.write)
+
+    # Handle Ctrl+C gracefully
+    stop_flag = False
+
+    def signal_handler(sig, frame):
+        nonlocal stop_flag
+        stop_flag = True
+        click.echo("\nStopping stream...", err=True)
+
+    original_handler = signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        recorder.start()
+
+        # Update streamer with actual format info
+        streamer.sample_rate = int(recorder.sample_rate)
+        streamer.num_channels = recorder.num_channels
+
+        if duration:
+            click.echo(f"Streaming for {duration} seconds...", err=True)
+            start_time = time.time()
+            while time.time() - start_time < duration and not stop_flag:
+                time.sleep(0.1)
+        else:
+            click.echo("Streaming... (Ctrl+C to stop)", err=True)
+            while not stop_flag:
+                time.sleep(0.1)
+
+        recorder.stop()
+        click.echo(f"Streamed {recorder.duration_seconds:.2f} seconds", err=True)
+
+    except OSError as e:
+        click.echo(f"Streaming error: {e}", err=True)
+    finally:
+        signal.signal(signal.SIGINT, original_handler)
+        try:
+            destroy_process_tap(tap_id)
+        except OSError:
+            pass
+
+
+@main.command("stream-system")
+@click.option(
+    "--format", "-f",
+    type=click.Choice(["f32le", "s16le", "wav"]),
+    default="f32le",
+    help="Output format: f32le (native float), s16le (16-bit int), wav (with header)"
+)
+@click.option(
+    "--duration", "-d",
+    type=float,
+    default=None,
+    help="Duration limit in seconds (default: until Ctrl+C)"
+)
+@click.option(
+    "--exclude", "-e",
+    multiple=True,
+    help="App names to exclude from streaming (can be specified multiple times)"
+)
+def stream_system(
+    format: str,
+    duration: float | None,
+    exclude: tuple[str, ...],
+) -> None:
+    """
+    Stream all system audio to stdout.
+
+    Output is raw PCM data suitable for piping to ffmpeg, sox, etc.
+    Use --exclude to omit specific apps.
+
+    \b
+    Examples:
+        catap stream-system | ffmpeg -f f32le -ar 44100 -ac 2 -i - output.flac
+        catap stream-system --exclude Zoom | ...
+    """
+    import signal
+    import sys
+    import time
+    from catap.bindings.process import find_process_by_name
+    from catap.bindings.tap_description import TapDescription, TapMuteBehavior
+    from catap.bindings.hardware import create_process_tap, destroy_process_tap
+    from catap.core.recorder import AudioRecorder
+    from catap.core.streamer import AudioStreamer
+
+    # Find processes to exclude
+    exclude_ids = []
+    if exclude:
+        for app_name in exclude:
+            process = find_process_by_name(app_name)
+            if process:
+                exclude_ids.append(process.audio_object_id)
+                click.echo(f"Excluding: {process.name} (PID: {process.pid})", err=True)
+            else:
+                click.echo(f"Warning: No audio process found matching '{app_name}'", err=True)
+
+    click.echo("Streaming all system audio", err=True)
+    click.echo(f"Format: {format}", err=True)
+
+    # Create global tap description
+    tap_desc = TapDescription.stereo_global_tap_excluding(exclude_ids)
+    tap_desc.name = "catap system streaming"
+    tap_desc.is_private = True
+    tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
+
+    # Create tap
+    try:
+        tap_id = create_process_tap(tap_desc)
+    except OSError as e:
+        click.echo(f"Error creating audio tap: {e}", err=True)
+        return
+
+    # Create streamer
+    streamer = AudioStreamer(
+        format=format,
+        sample_rate=44100,
+        num_channels=2,
+        output=sys.stdout.buffer,
+    )
+
+    # Create recorder in streaming mode
+    recorder = AudioRecorder(tap_id, output_path=None, on_data=streamer.write)
+
+    # Handle Ctrl+C gracefully
+    stop_flag = False
+
+    def signal_handler(sig, frame):
+        nonlocal stop_flag
+        stop_flag = True
+        click.echo("\nStopping stream...", err=True)
+
+    original_handler = signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        recorder.start()
+
+        # Update streamer with actual format info
+        streamer.sample_rate = int(recorder.sample_rate)
+        streamer.num_channels = recorder.num_channels
+
+        if duration:
+            click.echo(f"Streaming for {duration} seconds...", err=True)
+            start_time = time.time()
+            while time.time() - start_time < duration and not stop_flag:
+                time.sleep(0.1)
+        else:
+            click.echo("Streaming... (Ctrl+C to stop)", err=True)
+            while not stop_flag:
+                time.sleep(0.1)
+
+        recorder.stop()
+        click.echo(f"Streamed {recorder.duration_seconds:.2f} seconds", err=True)
+
+    except OSError as e:
+        click.echo(f"Streaming error: {e}", err=True)
+    finally:
+        signal.signal(signal.SIGINT, original_handler)
+        try:
+            destroy_process_tap(tap_id)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
