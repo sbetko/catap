@@ -1,15 +1,13 @@
 """Bindings for Core Audio hardware tap functions."""
+
 from __future__ import annotations
 
 import ctypes
 from typing import TYPE_CHECKING
 
-import objc
-
 if TYPE_CHECKING:
     from catap.bindings.tap_description import TapDescription
 
-# Load CoreAudio framework
 _CoreAudio = ctypes.cdll.LoadLibrary(
     "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
 )

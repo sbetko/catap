@@ -1,4 +1,5 @@
 """VU meter visualization for audio levels."""
+
 from __future__ import annotations
 
 import math
@@ -192,7 +193,9 @@ class VUMeter:
 
             # Build bar with Unicode blocks
             bar = "\u2588" * filled + "\u2591" * (self.BAR_WIDTH - filled)
-            text.append(f"\u2595{bar}\u258f {name} {level.rms_db:6.1f} dB\n", style=color)
+            text.append(
+                f"\u2595{bar}\u258f {name} {level.rms_db:6.1f} dB\n", style=color
+            )
 
         # Add duration if callback provided
         if self._duration_callback:

@@ -1,4 +1,5 @@
 """Command-line interface for catap."""
+
 from __future__ import annotations
 
 import os
@@ -14,9 +15,10 @@ def main() -> None:
 
 @main.command("list-apps")
 @click.option(
-    "--all", "-a",
+    "--all",
+    "-a",
     is_flag=True,
-    help="Show all audio processes, not just those outputting audio"
+    help="Show all audio processes, not just those outputting audio",
 )
 def list_apps(all: bool) -> None:
     """List applications that are producing audio."""
@@ -40,7 +42,9 @@ def list_apps(all: bool) -> None:
         return
 
     # Display table header
-    click.echo(f"{'Status':<2} {'Name':<30} {'Bundle ID':<40} {'Audio ID':<10} {'PID':<8}")
+    click.echo(
+        f"{'Status':<2} {'Name':<30} {'Bundle ID':<40} {'Audio ID':<10} {'PID':<8}"
+    )
     click.echo("-" * 92)
 
     for proc in processes:
@@ -53,9 +57,10 @@ def list_apps(all: bool) -> None:
 
 @main.command("test-tap")
 @click.option(
-    "--log", "-l",
+    "--log",
+    "-l",
     default="~/catap_tap_test.log",
-    help="Log file path (default: ~/catap_tap_test.log)"
+    help="Log file path (default: ~/catap_tap_test.log)",
 )
 def test_tap(log: str) -> None:
     """Test creating and destroying a tap (requires permissions)."""
@@ -81,10 +86,14 @@ def test_tap(log: str) -> None:
         else:
             # Use first process for testing
             proc = processes[0]
-            output_lines.append(f"Testing with: {proc.name} (ID: {proc.audio_object_id}, PID: {proc.pid})")
+            output_lines.append(
+                f"Testing with: {proc.name} (ID: {proc.audio_object_id}, PID: {proc.pid})"
+            )
 
             # Create tap description
-            tap_desc = TapDescription.stereo_mixdown_of_processes([proc.audio_object_id])
+            tap_desc = TapDescription.stereo_mixdown_of_processes(
+                [proc.audio_object_id]
+            )
             tap_desc.name = f"Test tap for {proc.name}"
             tap_desc.is_private = True
 
@@ -99,7 +108,9 @@ def test_tap(log: str) -> None:
                 try:
                     destroy_process_tap(tap_id)
                     output_lines.append(f"✓ SUCCESS: Destroyed tap {tap_id}")
-                    output_lines.append("\n🎉 TAP TEST PASSED: Creation and destruction working!")
+                    output_lines.append(
+                        "\n🎉 TAP TEST PASSED: Creation and destruction working!"
+                    )
                 except OSError as e:
                     output_lines.append(f"✗ ERROR destroying tap: {e}")
 
@@ -108,23 +119,34 @@ def test_tap(log: str) -> None:
                 error_str = str(e)
 
                 # Parse error code
-                if 'status' in error_str:
-                    error_code = error_str.split('status ')[-1].strip(')')
+                if "status" in error_str:
+                    error_code = error_str.split("status ")[-1].strip(")")
                     output_lines.append(f"Error code: {error_code}")
 
                     # Common error codes
-                    if error_code in ['561211770', '2003329802', '-1']:
-                        output_lines.append("\nLIKELY CAUSE: Audio capture permission denied")
-                        output_lines.append("Expected permission prompt should have appeared")
-                        output_lines.append("Check System Settings > Privacy & Security > Microphone")
-                    elif error_code == '560947818':  # kAudioHardwareIllegalOperationError
-                        output_lines.append("\nLIKELY CAUSE: Invalid operation or process")
+                    if error_code in ["561211770", "2003329802", "-1"]:
+                        output_lines.append(
+                            "\nLIKELY CAUSE: Audio capture permission denied"
+                        )
+                        output_lines.append(
+                            "Expected permission prompt should have appeared"
+                        )
+                        output_lines.append(
+                            "Check System Settings > Privacy & Security > Microphone"
+                        )
+                    elif (
+                        error_code == "560947818"
+                    ):  # kAudioHardwareIllegalOperationError
+                        output_lines.append(
+                            "\nLIKELY CAUSE: Invalid operation or process"
+                        )
                     else:
                         output_lines.append(f"\nUnknown error code: {error_code}")
 
     except Exception as e:
         output_lines.append(f"\n✗ UNEXPECTED ERROR: {e}")
         import traceback
+
         output_lines.append(traceback.format_exc())
 
     # Print to console
@@ -135,9 +157,9 @@ def test_tap(log: str) -> None:
     log_path = os.path.expanduser(log)
     try:
         with open(log_path, "a") as f:
-            f.write("\n" + "="*60 + "\n")
+            f.write("\n" + "=" * 60 + "\n")
             f.write("\n".join(output_lines))
-            f.write("\n" + "="*60 + "\n")
+            f.write("\n" + "=" * 60 + "\n")
         click.echo(f"\n📝 Log written to: {log_path}")
     except Exception as e:
         click.echo(f"\n⚠️  Could not write log: {e}", err=True)
@@ -146,26 +168,20 @@ def test_tap(log: str) -> None:
 @main.command("record")
 @click.argument("app_name")
 @click.option(
-    "--output", "-o",
+    "--output",
+    "-o",
     default="output.wav",
-    help="Output file path (default: output.wav)"
+    help="Output file path (default: output.wav)",
 )
 @click.option(
-    "--duration", "-d",
+    "--duration",
+    "-d",
     type=float,
     default=None,
-    help="Recording duration in seconds (default: until Ctrl+C)"
+    help="Recording duration in seconds (default: until Ctrl+C)",
 )
-@click.option(
-    "--mute/--no-mute",
-    default=False,
-    help="Mute the app while recording"
-)
-@click.option(
-    "--meter", "-m",
-    is_flag=True,
-    help="Show live VU meter during recording"
-)
+@click.option("--mute/--no-mute", default=False, help="Mute the app while recording")
+@click.option("--meter", "-m", is_flag=True, help="Show live VU meter during recording")
 def record(
     app_name: str,
     output: str,
@@ -221,8 +237,13 @@ def record(
     except OSError as e:
         click.echo(f"Error creating audio tap: {e}", err=True)
         click.echo("\nThis may be a permissions issue. Try:", err=True)
-        click.echo("  1. Check System Settings > Privacy & Security > Microphone", err=True)
-        click.echo("  2. Ensure your terminal app (Terminal, iTerm, etc.) has permission", err=True)
+        click.echo(
+            "  1. Check System Settings > Privacy & Security > Microphone", err=True
+        )
+        click.echo(
+            "  2. Ensure your terminal app (Terminal, iTerm, etc.) has permission",
+            err=True,
+        )
         return
 
     click.echo(f"Created tap (ID: {tap_id})")
@@ -232,12 +253,13 @@ def record(
     if meter:
         try:
             from catap.core.meter import VUMeter
+
             vu_meter = VUMeter(num_channels=2)
         except ImportError:
             click.echo(
                 "Warning: VU meter requires 'rich' library. "
                 "Install with: pip install rich",
-                err=True
+                err=True,
             )
 
     # Create recorder with optional meter callback
@@ -273,7 +295,9 @@ def record(
             nonlocal stop_flag
             if duration:
                 if not vu_meter:
-                    click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
+                    click.echo(
+                        f"Recording for {duration} seconds... (Ctrl+C to stop early)"
+                    )
                 start_time = time.time()
                 while time.time() - start_time < duration and not stop_flag:
                     time.sleep(0.1)
@@ -310,26 +334,25 @@ def record(
 
 @main.command("record-system")
 @click.option(
-    "--output", "-o",
+    "--output",
+    "-o",
     default="output.wav",
-    help="Output file path (default: output.wav)"
+    help="Output file path (default: output.wav)",
 )
 @click.option(
-    "--duration", "-d",
+    "--duration",
+    "-d",
     type=float,
     default=None,
-    help="Recording duration in seconds (default: until Ctrl+C)"
+    help="Recording duration in seconds (default: until Ctrl+C)",
 )
 @click.option(
-    "--exclude", "-e",
+    "--exclude",
+    "-e",
     multiple=True,
-    help="App names to exclude from recording (can be specified multiple times)"
+    help="App names to exclude from recording (can be specified multiple times)",
 )
-@click.option(
-    "--meter", "-m",
-    is_flag=True,
-    help="Show live VU meter during recording"
-)
+@click.option("--meter", "-m", is_flag=True, help="Show live VU meter during recording")
 def record_system(
     output: str,
     duration: float | None,
@@ -357,7 +380,9 @@ def record_system(
                 exclude_ids.append(process.audio_object_id)
                 click.echo(f"Excluding: {process.name} (PID: {process.pid})")
             else:
-                click.echo(f"Warning: No audio process found matching '{app_name}'", err=True)
+                click.echo(
+                    f"Warning: No audio process found matching '{app_name}'", err=True
+                )
 
     click.echo("Recording all system audio")
     click.echo(f"Output: {output}")
@@ -374,8 +399,13 @@ def record_system(
     except OSError as e:
         click.echo(f"Error creating audio tap: {e}", err=True)
         click.echo("\nThis may be a permissions issue. Try:", err=True)
-        click.echo("  1. Check System Settings > Privacy & Security > Microphone", err=True)
-        click.echo("  2. Ensure your terminal app (Terminal, iTerm, etc.) has permission", err=True)
+        click.echo(
+            "  1. Check System Settings > Privacy & Security > Microphone", err=True
+        )
+        click.echo(
+            "  2. Ensure your terminal app (Terminal, iTerm, etc.) has permission",
+            err=True,
+        )
         return
 
     click.echo(f"Created tap (ID: {tap_id})")
@@ -385,12 +415,13 @@ def record_system(
     if meter:
         try:
             from catap.core.meter import VUMeter
+
             vu_meter = VUMeter(num_channels=2)
         except ImportError:
             click.echo(
                 "Warning: VU meter requires 'rich' library. "
                 "Install with: pip install rich",
-                err=True
+                err=True,
             )
 
     # Create recorder with optional meter callback
@@ -426,7 +457,9 @@ def record_system(
             nonlocal stop_flag
             if duration:
                 if not vu_meter:
-                    click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
+                    click.echo(
+                        f"Recording for {duration} seconds... (Ctrl+C to stop early)"
+                    )
                 start_time = time.time()
                 while time.time() - start_time < duration and not stop_flag:
                     time.sleep(0.1)
@@ -464,22 +497,20 @@ def record_system(
 @main.command("stream")
 @click.argument("app_name")
 @click.option(
-    "--format", "-f",
+    "--format",
+    "-f",
     type=click.Choice(["f32le", "s16le", "wav"]),
     default="f32le",
-    help="Output format: f32le (native float), s16le (16-bit int), wav (with header)"
+    help="Output format: f32le (native float), s16le (16-bit int), wav (with header)",
 )
 @click.option(
-    "--duration", "-d",
+    "--duration",
+    "-d",
     type=float,
     default=None,
-    help="Duration limit in seconds (default: until Ctrl+C)"
+    help="Duration limit in seconds (default: until Ctrl+C)",
 )
-@click.option(
-    "--mute/--no-mute",
-    default=False,
-    help="Mute the app while streaming"
-)
+@click.option("--mute/--no-mute", default=False, help="Mute the app while streaming")
 def stream(
     app_name: str,
     format: str,
@@ -587,21 +618,24 @@ def stream(
 
 @main.command("stream-system")
 @click.option(
-    "--format", "-f",
+    "--format",
+    "-f",
     type=click.Choice(["f32le", "s16le", "wav"]),
     default="f32le",
-    help="Output format: f32le (native float), s16le (16-bit int), wav (with header)"
+    help="Output format: f32le (native float), s16le (16-bit int), wav (with header)",
 )
 @click.option(
-    "--duration", "-d",
+    "--duration",
+    "-d",
     type=float,
     default=None,
-    help="Duration limit in seconds (default: until Ctrl+C)"
+    help="Duration limit in seconds (default: until Ctrl+C)",
 )
 @click.option(
-    "--exclude", "-e",
+    "--exclude",
+    "-e",
     multiple=True,
-    help="App names to exclude from streaming (can be specified multiple times)"
+    help="App names to exclude from streaming (can be specified multiple times)",
 )
 def stream_system(
     format: str,
@@ -637,7 +671,9 @@ def stream_system(
                 exclude_ids.append(process.audio_object_id)
                 click.echo(f"Excluding: {process.name} (PID: {process.pid})", err=True)
             else:
-                click.echo(f"Warning: No audio process found matching '{app_name}'", err=True)
+                click.echo(
+                    f"Warning: No audio process found matching '{app_name}'", err=True
+                )
 
     click.echo("Streaming all system audio", err=True)
     click.echo(f"Format: {format}", err=True)

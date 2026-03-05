@@ -1,4 +1,5 @@
 """Enumerate audio-producing processes."""
+
 from __future__ import annotations
 
 import ctypes
@@ -7,7 +8,6 @@ from dataclasses import dataclass
 
 from AppKit import NSWorkspace, NSRunningApplication
 
-# Load CoreAudio framework directly via ctypes
 _CoreAudio = ctypes.cdll.LoadLibrary(
     "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
 )
@@ -51,19 +51,20 @@ _AudioObjectGetPropertyData.restype = ctypes.c_int32
 
 # Constants from AudioHardware.h
 kAudioObjectSystemObject = 1
-kAudioObjectPropertyScopeGlobal = int.from_bytes(b'glob', 'big')
+kAudioObjectPropertyScopeGlobal = int.from_bytes(b"glob", "big")
 kAudioObjectPropertyElementMain = 0
 
 # Property selectors
-kAudioHardwarePropertyProcessObjectList = int.from_bytes(b'prs#', 'big')
-kAudioProcessPropertyPID = int.from_bytes(b'ppid', 'big')
-kAudioProcessPropertyBundleID = int.from_bytes(b'pbid', 'big')
-kAudioProcessPropertyIsRunningOutput = int.from_bytes(b'piro', 'big')
+kAudioHardwarePropertyProcessObjectList = int.from_bytes(b"prs#", "big")
+kAudioProcessPropertyPID = int.from_bytes(b"ppid", "big")
+kAudioProcessPropertyBundleID = int.from_bytes(b"pbid", "big")
+kAudioProcessPropertyIsRunningOutput = int.from_bytes(b"piro", "big")
 
 
 @dataclass
 class AudioProcess:
     """Represents a process that is using audio."""
+
     audio_object_id: int
     pid: int
     bundle_id: str | None
@@ -102,14 +103,16 @@ def _get_audio_object_property(
         ctypes.byref(address),
         0,  # inQualifierDataSize
         None,  # inQualifierData
-        ctypes.byref(data_size)
+        ctypes.byref(data_size),
     )
 
     if status != 0:
-        raise OSError(f"Failed to get property size for selector {selector:08x}: status {status}")
+        raise OSError(
+            f"Failed to get property size for selector {selector:08x}: status {status}"
+        )
 
     if data_size.value == 0:
-        return b''
+        return b""
 
     # Allocate buffer for property data
     buffer = ctypes.create_string_buffer(data_size.value)
@@ -122,13 +125,15 @@ def _get_audio_object_property(
         0,  # inQualifierDataSize
         None,  # inQualifierData
         ctypes.byref(actual_size),
-        buffer
+        buffer,
     )
 
     if status != 0:
-        raise OSError(f"Failed to get property data for selector {selector:08x}: status {status}")
+        raise OSError(
+            f"Failed to get property data for selector {selector:08x}: status {status}"
+        )
 
-    return buffer.raw[:actual_size.value]
+    return buffer.raw[: actual_size.value]
 
 
 def list_audio_processes() -> list[AudioProcess]:
@@ -143,8 +148,7 @@ def list_audio_processes() -> list[AudioProcess]:
     # Get list of process object IDs
     try:
         data = _get_audio_object_property(
-            kAudioObjectSystemObject,
-            kAudioHardwarePropertyProcessObjectList
+            kAudioObjectSystemObject, kAudioHardwarePropertyProcessObjectList
         )
     except OSError as e:
         # Property might not exist if no processes are registered
@@ -157,8 +161,7 @@ def list_audio_processes() -> list[AudioProcess]:
     # Each AudioObjectID is 4 bytes
     count = len(data) // 4
     process_ids = [
-        struct.unpack('<I', data[i*4:(i+1)*4])[0]
-        for i in range(count)
+        struct.unpack("<I", data[i * 4 : (i + 1) * 4])[0] for i in range(count)
     ]
 
     # Get running apps for name lookup
@@ -172,18 +175,14 @@ def list_audio_processes() -> list[AudioProcess]:
     for audio_id in process_ids:
         try:
             # Get PID
-            pid_data = _get_audio_object_property(
-                audio_id,
-                kAudioProcessPropertyPID
-            )
-            pid = struct.unpack('<I', pid_data[:4])[0]
+            pid_data = _get_audio_object_property(audio_id, kAudioProcessPropertyPID)
+            pid = struct.unpack("<I", pid_data[:4])[0]
 
             # Get bundle ID (CFString)
             bundle_id = None
             try:
                 bundle_data = _get_audio_object_property(
-                    audio_id,
-                    kAudioProcessPropertyBundleID
+                    audio_id, kAudioProcessPropertyBundleID
                 )
                 if bundle_data:
                     # Bundle ID is returned as a CFString reference
@@ -201,11 +200,10 @@ def list_audio_processes() -> list[AudioProcess]:
             is_outputting = False
             try:
                 output_data = _get_audio_object_property(
-                    audio_id,
-                    kAudioProcessPropertyIsRunningOutput
+                    audio_id, kAudioProcessPropertyIsRunningOutput
                 )
                 if output_data:
-                    is_outputting = struct.unpack('<I', output_data[:4])[0] != 0
+                    is_outputting = struct.unpack("<I", output_data[:4])[0] != 0
             except OSError:
                 pass
 
@@ -222,13 +220,15 @@ def list_audio_processes() -> list[AudioProcess]:
                     if not bundle_id and app.bundleIdentifier():
                         bundle_id = str(app.bundleIdentifier())
 
-            processes.append(AudioProcess(
-                audio_object_id=audio_id,
-                pid=pid,
-                bundle_id=bundle_id,
-                name=name,
-                is_outputting=is_outputting,
-            ))
+            processes.append(
+                AudioProcess(
+                    audio_object_id=audio_id,
+                    pid=pid,
+                    bundle_id=bundle_id,
+                    name=name,
+                    is_outputting=is_outputting,
+                )
+            )
 
         except (OSError, struct.error) as e:
             # Skip processes we can't read

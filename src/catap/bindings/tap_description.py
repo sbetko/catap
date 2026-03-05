@@ -1,15 +1,15 @@
 """Wrapper for CATapDescription Objective-C class."""
+
 from __future__ import annotations
 
 from enum import IntEnum
 from typing import Sequence
 
 import objc
-from Foundation import NSArray, NSNumber, NSUUID, NSString
+from Foundation import NSArray, NSNumber
 
-# Import CATapDescription class from CoreAudio framework
 try:
-    CATapDescription = objc.lookUpClass('CATapDescription')
+    CATapDescription = objc.lookUpClass("CATapDescription")
 except objc.nosuchclass_error:
     raise ImportError(
         "CATapDescription class not found. "
@@ -19,8 +19,9 @@ except objc.nosuchclass_error:
 
 class TapMuteBehavior(IntEnum):
     """Mute behavior for tapped processes."""
-    UNMUTED = 0           # Audio sent to hardware AND captured
-    MUTED = 1             # Audio captured only, not sent to hardware
+
+    UNMUTED = 0  # Audio sent to hardware AND captured
+    MUTED = 1  # Audio captured only, not sent to hardware
     MUTED_WHEN_TAPPED = 2  # Muted only while tap is being read
 
 
@@ -36,10 +37,7 @@ class TapDescription:
         self._desc = CATapDescription.alloc().init()
 
     @classmethod
-    def stereo_mixdown_of_processes(
-        cls,
-        process_ids: Sequence[int]
-    ) -> TapDescription:
+    def stereo_mixdown_of_processes(cls, process_ids: Sequence[int]) -> TapDescription:
         """
         Create a tap that mixes specified processes to stereo.
 
@@ -53,14 +51,13 @@ class TapDescription:
         ns_array = NSArray.arrayWithArray_(
             [NSNumber.numberWithUnsignedInt_(pid) for pid in process_ids]
         )
-        instance._desc = CATapDescription.alloc().initStereoMixdownOfProcesses_(ns_array)
+        instance._desc = CATapDescription.alloc().initStereoMixdownOfProcesses_(
+            ns_array
+        )
         return instance
 
     @classmethod
-    def stereo_global_tap_excluding(
-        cls,
-        process_ids: Sequence[int]
-    ) -> TapDescription:
+    def stereo_global_tap_excluding(cls, process_ids: Sequence[int]) -> TapDescription:
         """
         Create a global stereo tap excluding specified processes.
 
@@ -74,14 +71,13 @@ class TapDescription:
         ns_array = NSArray.arrayWithArray_(
             [NSNumber.numberWithUnsignedInt_(pid) for pid in process_ids]
         )
-        instance._desc = CATapDescription.alloc().initStereoGlobalTapButExcludeProcesses_(ns_array)
+        instance._desc = (
+            CATapDescription.alloc().initStereoGlobalTapButExcludeProcesses_(ns_array)
+        )
         return instance
 
     @classmethod
-    def mono_mixdown_of_processes(
-        cls,
-        process_ids: Sequence[int]
-    ) -> TapDescription:
+    def mono_mixdown_of_processes(cls, process_ids: Sequence[int]) -> TapDescription:
         """
         Create a tap that mixes specified processes to mono.
 
@@ -99,10 +95,7 @@ class TapDescription:
         return instance
 
     @classmethod
-    def mono_global_tap_excluding(
-        cls,
-        process_ids: Sequence[int]
-    ) -> TapDescription:
+    def mono_global_tap_excluding(cls, process_ids: Sequence[int]) -> TapDescription:
         """
         Create a global mono tap excluding specified processes.
 
@@ -116,7 +109,9 @@ class TapDescription:
         ns_array = NSArray.arrayWithArray_(
             [NSNumber.numberWithUnsignedInt_(pid) for pid in process_ids]
         )
-        instance._desc = CATapDescription.alloc().initMonoGlobalTapButExcludeProcesses_(ns_array)
+        instance._desc = CATapDescription.alloc().initMonoGlobalTapButExcludeProcesses_(
+            ns_array
+        )
         return instance
 
     @property
