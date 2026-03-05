@@ -3,12 +3,6 @@ from __future__ import annotations
 
 import os
 import click
-from catap.bundle.launcher import (
-    is_running_from_bundle,
-    check_bundle_exists,
-    get_bundle_path,
-    ensure_running_from_bundle,
-)
 
 
 @click.group()
@@ -16,65 +10,6 @@ from catap.bundle.launcher import (
 def main() -> None:
     """catap - Python Core Audio Tap for capturing application audio."""
     pass
-
-
-@main.command("test-bundle")
-@click.option(
-    "--write-log", "-w",
-    is_flag=True,
-    help="Write test results to a log file for async testing"
-)
-def test_bundle(write_log: bool) -> None:
-    """Test the app bundle configuration and permissions setup."""
-    import sys
-    from datetime import datetime
-
-    output_lines = []
-    output_lines.append("=== catap Bundle Test ===\n")
-
-    # Check if bundle exists
-    bundle_exists = check_bundle_exists()
-    bundle_path = get_bundle_path()
-    output_lines.append(f"Bundle path: {bundle_path}")
-    output_lines.append(f"Bundle exists: {'✓' if bundle_exists else '✗'}")
-
-    if bundle_exists:
-        info_plist = bundle_path / "Contents" / "Info.plist"
-        output_lines.append(f"Info.plist: {info_plist}")
-        output_lines.append(f"Info.plist exists: {'✓' if info_plist.exists() else '✗'}")
-
-        launcher = bundle_path / "Contents" / "MacOS" / "catap"
-        output_lines.append(f"Launcher script: {launcher}")
-        output_lines.append(f"Launcher exists: {'✓' if launcher.exists() else '✗'}")
-        output_lines.append(f"Launcher executable: {'✓' if os.access(launcher, os.X_OK) else '✗'}")
-
-    # Check if running from bundle
-    from_bundle = is_running_from_bundle()
-    output_lines.append(f"\nRunning from bundle: {'✓ YES' if from_bundle else '✗ NO'}")
-
-    if from_bundle:
-        output_lines.append("Environment variable CATAP_RUNNING_FROM_BUNDLE is set")
-        output_lines.append("\nThis means audio capture permissions should work!")
-    else:
-        output_lines.append("\nNOTE: Not running from bundle. Audio capture may not have proper permissions.")
-        output_lines.append(f"To test bundle launch, run:")
-        output_lines.append(f"  open -a {bundle_path} --args test-bundle --write-log")
-
-    output_lines.append(f"\nPython executable: {sys.executable}")
-    output_lines.append(f"Timestamp: {datetime.now().isoformat()}")
-
-    # Print to console
-    for line in output_lines:
-        click.echo(line)
-
-    # Optionally write to log file
-    if write_log:
-        log_file = os.path.expanduser("~/catap_bundle_test.log")
-        with open(log_file, "a") as f:
-            f.write("\n" + "="*60 + "\n")
-            f.write("\n".join(output_lines))
-            f.write("\n" + "="*60 + "\n")
-        click.echo(f"\nTest results written to: {log_file}")
 
 
 @main.command("list-apps")
@@ -133,7 +68,6 @@ def test_tap(log: str) -> None:
     output_lines = []
     output_lines.append("=== catap Tap Creation Test ===")
     output_lines.append(f"Timestamp: {datetime.now().isoformat()}")
-    output_lines.append(f"Running from bundle: {is_running_from_bundle()}")
     output_lines.append(f"Python: {sys.executable}\n")
 
     try:
@@ -288,7 +222,7 @@ def record(
         click.echo(f"Error creating audio tap: {e}", err=True)
         click.echo("\nThis may be a permissions issue. Try:", err=True)
         click.echo("  1. Check System Settings > Privacy & Security > Microphone", err=True)
-        click.echo("  2. Run through the app bundle for proper permissions", err=True)
+        click.echo("  2. Ensure your terminal app (Terminal, iTerm, etc.) has permission", err=True)
         return
 
     click.echo(f"Created tap (ID: {tap_id})")
@@ -441,7 +375,7 @@ def record_system(
         click.echo(f"Error creating audio tap: {e}", err=True)
         click.echo("\nThis may be a permissions issue. Try:", err=True)
         click.echo("  1. Check System Settings > Privacy & Security > Microphone", err=True)
-        click.echo("  2. Run through the app bundle for proper permissions", err=True)
+        click.echo("  2. Ensure your terminal app (Terminal, iTerm, etc.) has permission", err=True)
         return
 
     click.echo(f"Created tap (ID: {tap_id})")

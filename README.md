@@ -49,9 +49,6 @@ catap record Spotify -d 30 -o ~/song.wav
 # Record with app muted (capture only, no playback)
 catap record Spotify --mute -d 60 -o ~/silent_capture.wav
 
-# Test bundle configuration
-catap test-bundle
-
 # Test tap creation (verifies permissions)
 catap test-tap
 ```
@@ -98,16 +95,13 @@ destroy_process_tap(tap_id)
 
 Core Audio Tap requires audio capture permissions. The first time you record, macOS will prompt for permission.
 
-### Running via the App Bundle
+If you run from a terminal (for example `uv run catap record Spotify`), macOS attributes audio capture to that terminal app.
+Grant permission to Terminal, iTerm, or whichever host app is launching `catap`.
 
-For proper permission handling, you can run catap through its app bundle:
+### Running with uv
 
 ```bash
-# Direct execution (recommended for development)
-./src/catap/catap.app/Contents/MacOS/catap record Spotify -d 10 -o output.wav
-
-# Via macOS open command (shows permission dialog from "catap" app)
-open ./src/catap/catap.app --args record Spotify -d 10 -o output.wav
+uv run catap record Spotify -d 10 -o output.wav
 ```
 
 ### Permission Troubleshooting
@@ -115,8 +109,8 @@ open ./src/catap/catap.app --args record Spotify -d 10 -o output.wav
 If recording fails with permission errors:
 
 1. Check System Settings > Privacy & Security > Microphone
-2. Ensure Terminal (or catap) has permission
-3. Try running through the app bundle
+2. Ensure your terminal app has permission (Terminal, iTerm, etc.)
+3. Retry recording from the same terminal app after granting access
 
 ## How It Works
 
@@ -139,13 +133,6 @@ src/catap/
 │   └── hardware.py          # Tap create/destroy (ctypes)
 ├── core/
 │   └── recorder.py          # AudioRecorder class
-├── bundle/
-│   └── launcher.py          # Bundle detection utilities
-└── catap.app/               # macOS app bundle for permissions
-    └── Contents/
-        ├── Info.plist       # Bundle config with NSAudioCaptureUsageDescription
-        ├── MacOS/catap      # Binary launcher
-        └── MacOS/catap.sh   # Shell script launcher
 ```
 
 ## Development
