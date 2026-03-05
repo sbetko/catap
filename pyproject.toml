@@ -26,11 +26,6 @@ dependencies = [
     "click>=8.0",
 ]
 
-[project.optional-dependencies]
-meter = [
-    "rich>=13.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/sbetko/catap"
 Repository = "https://github.com/sbetko/catap"
