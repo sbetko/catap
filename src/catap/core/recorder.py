@@ -78,6 +78,10 @@ class AudioStreamBasicDescription(ctypes.Structure):
     ]
 
 
+AudioTimeStampPtr = ctypes._Pointer[AudioTimeStamp]
+AudioBufferListPtr = ctypes._Pointer[AudioBufferList]
+
+
 # Format constants
 kAudioFormatLinearPCM = int.from_bytes(b"lpcm", "big")
 kAudioFormatFlagIsFloat = 1 << 0
@@ -406,11 +410,11 @@ class AudioRecorder:
     def _io_proc(
         self,
         device: int,
-        now: ctypes.POINTER(AudioTimeStamp),
-        input_data: ctypes.POINTER(AudioBufferList),
-        input_time: ctypes.POINTER(AudioTimeStamp),
-        output_data: ctypes.POINTER(AudioBufferList),
-        output_time: ctypes.POINTER(AudioTimeStamp),
+        now: AudioTimeStampPtr,
+        input_data: AudioBufferListPtr,
+        input_time: AudioTimeStampPtr,
+        output_data: AudioBufferListPtr,
+        output_time: AudioTimeStampPtr,
         client_data: ctypes.c_void_p,
     ) -> int:
         """
