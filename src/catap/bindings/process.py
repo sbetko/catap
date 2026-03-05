@@ -150,7 +150,7 @@ def list_audio_processes() -> list[AudioProcess]:
         data = _get_audio_object_property(
             kAudioObjectSystemObject, kAudioHardwarePropertyProcessObjectList
         )
-    except OSError as e:
+    except OSError:
         # Property might not exist if no processes are registered
         return []
 
@@ -230,7 +230,7 @@ def list_audio_processes() -> list[AudioProcess]:
                 )
             )
 
-        except (OSError, struct.error) as e:
+        except (OSError, struct.error):
             # Skip processes we can't read
             continue
 

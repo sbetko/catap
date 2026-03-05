@@ -10,7 +10,7 @@ import wave
 from pathlib import Path
 from typing import Callable
 
-from Foundation import NSDictionary, NSNumber, NSString, NSArray
+from Foundation import NSDictionary, NSNumber, NSArray
 
 # Load CoreAudio framework
 _CoreAudio = ctypes.cdll.LoadLibrary(
@@ -310,7 +310,6 @@ def _create_aggregate_device_for_tap(tap_uid: str, name: str) -> int:
     )
 
     # Get the CFDictionary pointer
-    import objc
 
     cf_dict_ptr = description.__c_void_p__()
 
