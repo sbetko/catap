@@ -14,7 +14,7 @@ try:
 except objc.nosuchclass_error as e:  # ty: ignore[unresolved-attribute]
     raise ImportError(
         "CATapDescription class not found. "
-        "Ensure you're running on macOS 12.0+ with "
+        "Ensure you're running on macOS 14.10 or later with "
         "pyobjc-framework-CoreAudio installed."
     ) from e
 
