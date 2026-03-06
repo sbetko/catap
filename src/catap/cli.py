@@ -2,415 +2,294 @@
 
 from __future__ import annotations
 
-import os
-import click
+import argparse
+import signal
+import sys
+import time
+from collections.abc import Sequence
+
+from catap import __version__
+
+_PERMISSION_HINT = [
+    "This may be a permissions issue. Try:",
+    "  1. Check System Settings > Privacy & Security > Screen & System Audio Recording",
+    "  2. Ensure your terminal app has permission",
+]
 
 
-@click.group()
-@click.version_option()
-def main() -> None:
-    """catap - Python Core Audio Tap for capturing application audio."""
-    pass
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a valid number") from exc
+
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+
+    return parsed
 
 
-@main.command("list-apps")
-@click.option(
-    "--all",
-    "-a",
-    is_flag=True,
-    help="Show all audio processes, not just those outputting audio",
-)
-def list_apps(all: bool) -> None:
-    """List applications that are producing audio."""
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="catap",
+        description="catap - Python Core Audio Tap for capturing application audio.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_apps_parser = subparsers.add_parser(
+        "list-apps",
+        help="List applications producing audio",
+    )
+    list_apps_parser.add_argument(
+        "--all",
+        "-a",
+        dest="show_all",
+        action="store_true",
+        help="Show all audio processes, not just those outputting audio",
+    )
+
+    record_parser = subparsers.add_parser(
+        "record",
+        help="Record app audio or all system audio",
+    )
+    record_parser.add_argument(
+        "app_name",
+        nargs="?",
+        help=(
+            "Application name to record (partial match, case-insensitive). "
+            "Required unless --system is set."
+        ),
+    )
+    record_parser.add_argument(
+        "--system",
+        action="store_true",
+        help="Record all system audio",
+    )
+    record_parser.add_argument(
+        "--output",
+        "-o",
+        default="output.wav",
+        help="Output file path (default: output.wav)",
+    )
+    record_parser.add_argument(
+        "--duration",
+        "-d",
+        type=_positive_float,
+        default=None,
+        help="Recording duration in seconds (default: until Ctrl+C)",
+    )
+    record_parser.add_argument(
+        "--mute",
+        action="store_true",
+        help="Mute the app while recording (app recording only)",
+    )
+    record_parser.add_argument(
+        "--exclude",
+        "-e",
+        action="append",
+        default=[],
+        help="App names to exclude from system recording (repeatable)",
+    )
+
+    return parser
+
+
+def _list_apps(show_all: bool) -> int:
     from catap.bindings.process import list_audio_processes
 
     try:
         processes = list_audio_processes()
-    except Exception as e:
-        click.echo(f"Error listing audio processes: {e}", err=True)
-        return
+    except Exception as exc:
+        print(f"Error listing audio processes: {exc}", file=sys.stderr)
+        return 1
 
-    if not all:
-        processes = [p for p in processes if p.is_outputting]
+    if not show_all:
+        processes = [process for process in processes if process.is_outputting]
 
     if not processes:
-        if all:
-            click.echo("No audio processes found.")
+        if show_all:
+            print("No audio processes found.")
         else:
-            click.echo("No applications currently outputting audio.")
-            click.echo("Use --all to see all registered audio processes.")
-        return
+            print("No applications currently outputting audio.")
+            print("Use --all to see all registered audio processes.")
+        return 0
 
-    # Display table header
-    click.echo(
-        f"{'Status':<2} {'Name':<30} {'Bundle ID':<40} {'Audio ID':<10} {'PID':<8}"
-    )
-    click.echo("-" * 92)
+    print(f"{'Status':<2} {'Name':<30} {'Bundle ID':<40} {'Audio ID':<10} {'PID':<8}")
+    print("-" * 92)
 
-    for proc in processes:
-        bundle = proc.bundle_id or "N/A"
-        status = "♪" if proc.is_outputting else " "
-        click.echo(
-            f"{status:<2} {proc.name:<30} {bundle:<40} {proc.audio_object_id:<10} {proc.pid:<8}"
+    for process in processes:
+        bundle = process.bundle_id or "N/A"
+        status = "♪" if process.is_outputting else " "
+        print(
+            f"{status:<2} {process.name:<30} {bundle:<40} "
+            f"{process.audio_object_id:<10} {process.pid:<8}"
         )
 
-
-@main.command("test-tap")
-@click.option(
-    "--log",
-    "-l",
-    default="~/catap_tap_test.log",
-    help="Log file path (default: ~/catap_tap_test.log)",
-)
-def test_tap(log: str) -> None:
-    """Test creating and destroying a tap (requires permissions)."""
-    import sys
-    from datetime import datetime
-    from catap.bindings.process import list_audio_processes
-    from catap.bindings.tap_description import TapDescription
-    from catap.bindings.hardware import create_process_tap, destroy_process_tap
-
-    output_lines = []
-    output_lines.append("=== catap Tap Creation Test ===")
-    output_lines.append(f"Timestamp: {datetime.now().isoformat()}")
-    output_lines.append(f"Python: {sys.executable}\n")
-
-    try:
-        # Get audio processes
-        processes = list_audio_processes()
-        output_lines.append(f"Found {len(processes)} audio processes")
-
-        if not processes:
-            output_lines.append("ERROR: No audio processes found to test with")
-            output_lines.append("Try playing some audio and run again")
-        else:
-            # Use first process for testing
-            proc = processes[0]
-            output_lines.append(
-                f"Testing with: {proc.name} (ID: {proc.audio_object_id}, PID: {proc.pid})"
-            )
-
-            # Create tap description
-            tap_desc = TapDescription.stereo_mixdown_of_processes(
-                [proc.audio_object_id]
-            )
-            tap_desc.name = f"Test tap for {proc.name}"
-            tap_desc.is_private = True
-
-            output_lines.append(f"Created tap description: {tap_desc}")
-
-            # Try to create tap
-            try:
-                tap_id = create_process_tap(tap_desc)
-                output_lines.append(f"✓ SUCCESS: Created tap with ID {tap_id}")
-
-                # Try to destroy tap
-                try:
-                    destroy_process_tap(tap_id)
-                    output_lines.append(f"✓ SUCCESS: Destroyed tap {tap_id}")
-                    output_lines.append(
-                        "\n🎉 TAP TEST PASSED: Creation and destruction working!"
-                    )
-                except OSError as e:
-                    output_lines.append(f"✗ ERROR destroying tap: {e}")
-
-            except OSError as e:
-                output_lines.append(f"✗ ERROR creating tap: {e}")
-                error_str = str(e)
-
-                # Parse error code
-                if "status" in error_str:
-                    error_code = error_str.split("status ")[-1].strip(")")
-                    output_lines.append(f"Error code: {error_code}")
-
-                    # Common error codes
-                    if error_code in ["561211770", "2003329802", "-1"]:
-                        output_lines.append(
-                            "\nLIKELY CAUSE: Audio capture permission denied"
-                        )
-                        output_lines.append(
-                            "Expected permission prompt should have appeared"
-                        )
-                        output_lines.append(
-                            "Check System Settings > Privacy & Security > Microphone"
-                        )
-                    elif (
-                        error_code == "560947818"
-                    ):  # kAudioHardwareIllegalOperationError
-                        output_lines.append(
-                            "\nLIKELY CAUSE: Invalid operation or process"
-                        )
-                    else:
-                        output_lines.append(f"\nUnknown error code: {error_code}")
-
-    except Exception as e:
-        output_lines.append(f"\n✗ UNEXPECTED ERROR: {e}")
-        import traceback
-
-        output_lines.append(traceback.format_exc())
-
-    # Print to console
-    for line in output_lines:
-        click.echo(line)
-
-    # Write to log file
-    log_path = os.path.expanduser(log)
-    try:
-        with open(log_path, "a") as f:
-            f.write("\n" + "=" * 60 + "\n")
-            f.write("\n".join(output_lines))
-            f.write("\n" + "=" * 60 + "\n")
-        click.echo(f"\n📝 Log written to: {log_path}")
-    except Exception as e:
-        click.echo(f"\n⚠️  Could not write log: {e}", err=True)
+    return 0
 
 
-@main.command("record")
-@click.argument("app_name")
-@click.option(
-    "--output",
-    "-o",
-    default="output.wav",
-    help="Output file path (default: output.wav)",
-)
-@click.option(
-    "--duration",
-    "-d",
-    type=float,
-    default=None,
-    help="Recording duration in seconds (default: until Ctrl+C)",
-)
-@click.option("--mute/--no-mute", default=False, help="Mute the app while recording")
-def record(
-    app_name: str,
+def _record(
+    app_name: str | None,
+    *,
+    system: bool,
     output: str,
     duration: float | None,
     mute: bool,
-) -> None:
-    """
-    Record audio from an application.
-
-    APP_NAME can be a partial match (case-insensitive) of the application name.
-    Use 'catap list-apps' to see available applications.
-    """
-    import signal
-    import time
+    exclude: list[str],
+) -> int:
     from catap.bindings.process import find_process_by_name, list_audio_processes
     from catap.bindings.tap_description import TapDescription, TapMuteBehavior
-    from catap.bindings.hardware import create_process_tap, destroy_process_tap
-    from catap.core.recorder import AudioRecorder
 
-    # Find the process
-    process = find_process_by_name(app_name)
-    if not process:
-        # Show available processes to help user
-        all_procs = list_audio_processes()
-        click.echo(f"Error: No audio process found matching '{app_name}'", err=True)
-        if all_procs:
-            click.echo("\nAvailable audio processes:", err=True)
-            for p in all_procs[:10]:
-                status = "outputting" if p.is_outputting else "idle"
-                click.echo(f"  - {p.name} ({status})", err=True)
-            if len(all_procs) > 10:
-                click.echo(f"  ... and {len(all_procs) - 10} more", err=True)
-        return
-
-    click.echo(f"Recording from: {process.name} (PID: {process.pid})")
-    click.echo(f"Output: {output}")
-
-    # Create tap description
-    tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
-    tap_desc.name = f"catap recording {process.name}"
-    tap_desc.is_private = True
-
-    if mute:
-        tap_desc.mute_behavior = TapMuteBehavior.MUTED
-        click.echo("Muting app audio during recording")
-    else:
-        tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
-
-    # Create tap
-    try:
-        tap_id = create_process_tap(tap_desc)
-    except OSError as e:
-        click.echo(f"Error creating audio tap: {e}", err=True)
-        click.echo("\nThis may be a permissions issue. Try:", err=True)
-        click.echo(
-            "  1. Check System Settings > Privacy & Security > Microphone", err=True
-        )
-        click.echo(
-            "  2. Ensure your terminal app (Terminal, iTerm, etc.) has permission",
-            err=True,
-        )
-        return
-
-    click.echo(f"Created tap (ID: {tap_id})")
-
-    recorder = AudioRecorder(tap_id, output)
-
-    # Handle Ctrl+C gracefully
-    stop_flag = False
-
-    def signal_handler(sig, frame):
-        nonlocal stop_flag
-        stop_flag = True
-        click.echo("\nStopping recording...")
-
-    original_handler = signal.signal(signal.SIGINT, signal_handler)
-
-    try:
-        # Start recording
-        recorder.start()
-
-        if duration:
-            click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
-            start_time = time.time()
-            while time.time() - start_time < duration and not stop_flag:
-                time.sleep(0.1)
-        else:
-            click.echo("Recording... (Ctrl+C to stop)")
-            while not stop_flag:
-                time.sleep(0.1)
-
-        # Stop recording
-        recorder.stop()
-
-        click.echo(f"Recorded {recorder.duration_seconds:.2f} seconds")
-        click.echo(f"Saved to: {output}")
-
-    except OSError as e:
-        click.echo(f"Recording error: {e}", err=True)
-    finally:
-        # Restore signal handler
-        signal.signal(signal.SIGINT, original_handler)
-
-        # Clean up tap
-        try:
-            destroy_process_tap(tap_id)
-        except OSError:
-            pass  # Ignore cleanup errors
-
-
-@main.command("record-system")
-@click.option(
-    "--output",
-    "-o",
-    default="output.wav",
-    help="Output file path (default: output.wav)",
-)
-@click.option(
-    "--duration",
-    "-d",
-    type=float,
-    default=None,
-    help="Recording duration in seconds (default: until Ctrl+C)",
-)
-@click.option(
-    "--exclude",
-    "-e",
-    multiple=True,
-    help="App names to exclude from recording (can be specified multiple times)",
-)
-def record_system(
-    output: str,
-    duration: float | None,
-    exclude: tuple[str, ...],
-) -> None:
-    """
-    Record all system audio.
-
-    This captures audio from all applications. Use --exclude to omit specific apps.
-    """
-    import signal
-    import time
-    from catap.bindings.process import find_process_by_name
-    from catap.bindings.tap_description import TapDescription, TapMuteBehavior
-    from catap.bindings.hardware import create_process_tap, destroy_process_tap
-    from catap.core.recorder import AudioRecorder
-
-    # Find processes to exclude
-    exclude_ids = []
-    if exclude:
-        for app_name in exclude:
-            process = find_process_by_name(app_name)
+    if system:
+        exclude_ids: list[int] = []
+        for excluded_app_name in exclude:
+            process = find_process_by_name(excluded_app_name)
             if process:
                 exclude_ids.append(process.audio_object_id)
-                click.echo(f"Excluding: {process.name} (PID: {process.pid})")
+                print(f"Excluding: {process.name} (PID: {process.pid})")
             else:
-                click.echo(
-                    f"Warning: No audio process found matching '{app_name}'", err=True
+                print(
+                    f"Warning: No audio process found matching '{excluded_app_name}'",
+                    file=sys.stderr,
                 )
 
-    click.echo("Recording all system audio")
-    click.echo(f"Output: {output}")
+        print("Recording all system audio")
+        print(f"Output: {output}")
 
-    # Create global tap description
-    tap_desc = TapDescription.stereo_global_tap_excluding(exclude_ids)
-    tap_desc.name = "catap system recording"
-    tap_desc.is_private = True
-    tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
+        tap_desc = TapDescription.stereo_global_tap_excluding(exclude_ids)
+        tap_desc.name = "catap system recording"
+        tap_desc.is_private = True
+        tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
+    else:
+        assert app_name is not None
 
-    # Create tap
+        process = find_process_by_name(app_name)
+        if not process:
+            all_processes = list_audio_processes()
+            message_lines = [f"No audio process found matching '{app_name}'"]
+            if all_processes:
+                message_lines.append("")
+                message_lines.append("Available audio processes:")
+                for listed_process in all_processes[:10]:
+                    status = "outputting" if listed_process.is_outputting else "idle"
+                    message_lines.append(f"  - {listed_process.name} ({status})")
+                if len(all_processes) > 10:
+                    message_lines.append(f"  ... and {len(all_processes) - 10} more")
+            print("\n".join(message_lines), file=sys.stderr)
+            return 1
+
+        print(f"Recording from: {process.name} (PID: {process.pid})")
+        print(f"Output: {output}")
+
+        tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
+        tap_desc.name = f"catap recording {process.name}"
+        tap_desc.is_private = True
+
+        if mute:
+            tap_desc.mute_behavior = TapMuteBehavior.MUTED
+            print("Muting app audio during recording")
+        else:
+            tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
+
+    from catap.bindings.hardware import create_process_tap, destroy_process_tap
+    from catap.core.recorder import AudioRecorder
+
     try:
         tap_id = create_process_tap(tap_desc)
-    except OSError as e:
-        click.echo(f"Error creating audio tap: {e}", err=True)
-        click.echo("\nThis may be a permissions issue. Try:", err=True)
-        click.echo(
-            "  1. Check System Settings > Privacy & Security > Microphone", err=True
-        )
-        click.echo(
-            "  2. Ensure your terminal app (Terminal, iTerm, etc.) has permission",
-            err=True,
-        )
-        return
+    except OSError as exc:
+        print(f"Error creating audio tap: {exc}", file=sys.stderr)
+        print("", file=sys.stderr)
+        for line in _PERMISSION_HINT:
+            print(line, file=sys.stderr)
+        return 1
 
-    click.echo(f"Created tap (ID: {tap_id})")
+    print(f"Created tap (ID: {tap_id})")
 
     recorder = AudioRecorder(tap_id, output)
-
-    # Handle Ctrl+C gracefully
     stop_flag = False
 
-    def signal_handler(sig, frame):
+    def signal_handler(_sig: int, _frame: object) -> None:
         nonlocal stop_flag
         stop_flag = True
-        click.echo("\nStopping recording...")
+        print("\nStopping recording...")
 
     original_handler = signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        # Start recording
         recorder.start()
 
-        if duration:
-            click.echo(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
+        if duration is not None:
+            print(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
             start_time = time.time()
             while time.time() - start_time < duration and not stop_flag:
                 time.sleep(0.1)
         else:
-            click.echo("Recording... (Ctrl+C to stop)")
+            print("Recording... (Ctrl+C to stop)")
             while not stop_flag:
                 time.sleep(0.1)
 
-        # Stop recording
         recorder.stop()
-
-        click.echo(f"Recorded {recorder.duration_seconds:.2f} seconds")
-        click.echo(f"Saved to: {output}")
-
-    except OSError as e:
-        click.echo(f"Recording error: {e}", err=True)
+        print(f"Recorded {recorder.duration_seconds:.2f} seconds")
+        print(f"Saved to: {output}")
+        return 0
+    except OSError as exc:
+        print(f"Recording error: {exc}", file=sys.stderr)
+        return 1
     finally:
-        # Restore signal handler
         signal.signal(signal.SIGINT, original_handler)
-
-        # Clean up tap
         try:
             destroy_process_tap(tap_id)
         except OSError:
-            pass  # Ignore cleanup errors
+            pass
+
+
+def _exit_code_from_system_exit(exc: SystemExit) -> int:
+    code = exc.code
+    return code if isinstance(code, int) else 1
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+
+    try:
+        args = parser.parse_args(argv)
+
+        if args.command == "list-apps":
+            return _list_apps(show_all=args.show_all)
+
+        if args.command == "record":
+            if args.system and args.app_name:
+                parser.error("record: APP_NAME cannot be used with --system")
+            if not args.system and not args.app_name:
+                parser.error("record: APP_NAME is required unless --system is set")
+            if args.exclude and not args.system:
+                parser.error("record: --exclude requires --system")
+            if args.mute and args.system:
+                parser.error(
+                    "record: --mute can only be used when recording a single app"
+                )
+
+            return _record(
+                args.app_name,
+                system=args.system,
+                output=args.output,
+                duration=args.duration,
+                mute=args.mute,
+                exclude=args.exclude,
+            )
+
+        parser.error(f"Unknown command: {args.command}")
+    except SystemExit as exc:
+        return _exit_code_from_system_exit(exc)
+
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

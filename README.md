@@ -17,16 +17,19 @@ Python wrapper for Apple's Core Audio Tap API (macOS 14.2+). Capture audio from 
 
 ## Installation
 
+### From PyPI
+
 ```bash
-# Clone the repository
+pip install catap
+```
+
+### From source
+
+```bash
 git clone https://github.com/sbetko/catap.git
 cd catap
 
-# Install with uv (recommended)
-uv sync
-
-# Or with pip
-pip install -e .
+uv sync --group dev
 ```
 
 ## Usage
@@ -49,8 +52,11 @@ catap record Spotify -d 30 -o ~/song.wav
 # Record with app muted (capture only, no playback)
 catap record Spotify --mute -d 60 -o ~/silent_capture.wav
 
-# Test tap creation (verifies permissions)
-catap test-tap
+# Record system audio
+catap record --system -d 30 -o ~/system_audio.wav
+
+# Record system audio (optionally excluding apps)
+catap record --system -e Music -e Zoom -d 30 -o ~/system_audio.wav
 ```
 
 ### Python API
@@ -126,7 +132,7 @@ If recording fails with permission errors:
 src/catap/
 ├── __init__.py              # Package exports
 ├── __main__.py              # python -m catap entry point
-├── cli.py                   # Click CLI commands
+├── cli.py                   # argparse CLI commands
 ├── bindings/
 │   ├── process.py           # Process enumeration (ctypes)
 │   ├── tap_description.py   # CATapDescription wrapper (PyObjC)
@@ -136,6 +142,19 @@ src/catap/
 ```
 
 ## Development
+
+### Quality checks
+
+```bash
+uv sync --group dev
+uv run --group dev ruff check .
+uv run --group dev ty check --error-on-warning src tests
+uv run --group dev pytest
+uv run --group dev python -m build
+uv run --group dev twine check dist/*
+```
+
+See [`RELEASE.md`](RELEASE.md) for the release checklist.
 
 ### Core Audio Headers
 

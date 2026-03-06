@@ -7,10 +7,11 @@ import struct
 import threading
 import uuid
 import wave
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING
 
-from Foundation import NSDictionary, NSNumber, NSArray
+from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
 # Load CoreAudio framework
 _CoreAudio = ctypes.cdll.LoadLibrary(
@@ -78,8 +79,12 @@ class AudioStreamBasicDescription(ctypes.Structure):
     ]
 
 
-AudioTimeStampPtr = ctypes._Pointer[AudioTimeStamp]
-AudioBufferListPtr = ctypes._Pointer[AudioBufferList]
+if TYPE_CHECKING:
+    type AudioTimeStampPtr = ctypes._Pointer[AudioTimeStamp]
+    type AudioBufferListPtr = ctypes._Pointer[AudioBufferList]
+else:
+    AudioTimeStampPtr = ctypes.c_void_p
+    AudioBufferListPtr = ctypes.c_void_p
 
 
 # Format constants
@@ -240,7 +245,7 @@ def _get_tap_uid(tap_id: int) -> str:
     # Convert CFStringRef to Python string using PyObjC
     import objc
 
-    ns_string = objc.objc_object(c_void_p=cf_string_ref)
+    ns_string = objc.objc_object(c_void_p=cf_string_ref)  # ty: ignore[unresolved-attribute]
     return str(ns_string)
 
 

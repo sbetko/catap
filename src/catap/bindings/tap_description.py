@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import IntEnum
-from typing import Sequence
+from typing import Any
 
 import objc
-from Foundation import NSArray, NSNumber
+from Foundation import NSArray, NSNumber  # ty: ignore[unresolved-import]
 
 try:
-    CATapDescription = objc.lookUpClass("CATapDescription")
-except objc.nosuchclass_error:
+    CATapDescription = objc.lookUpClass("CATapDescription")  # ty: ignore[unresolved-attribute]
+except objc.nosuchclass_error as e:  # ty: ignore[unresolved-attribute]
     raise ImportError(
         "CATapDescription class not found. "
-        "Ensure you're running on macOS 12.0+ with pyobjc-framework-CoreAudio installed."
-    )
+        "Ensure you're running on macOS 12.0+ with "
+        "pyobjc-framework-CoreAudio installed."
+    ) from e
 
 
 class TapMuteBehavior(IntEnum):
@@ -210,7 +212,7 @@ class TapDescription:
             self._desc.setStream_(None)
 
     @property
-    def objc_object(self) -> objc.objc_object:
+    def objc_object(self) -> Any:
         """Get the underlying Objective-C object."""
         return self._desc
 

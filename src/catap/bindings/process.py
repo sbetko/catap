@@ -6,7 +6,7 @@ import ctypes
 import struct
 from dataclasses import dataclass
 
-from AppKit import NSWorkspace, NSRunningApplication
+from AppKit import NSRunningApplication, NSWorkspace  # ty: ignore[unresolved-import]
 
 _CoreAudio = ctypes.cdll.LoadLibrary(
     "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
