@@ -15,11 +15,14 @@ Python wrapper for Apple's Core Audio Tap API (macOS 14.2+). Capture audio from 
 - macOS 14.2 or later (for Core Audio Tap API)
 - Python 3.12+
 
+`catap` is macOS-only. On unsupported platforms, the CLI exits with a clear error instead of failing with a low-level import trace.
+
 ## Installation
 
 ### From PyPI
 
 ```bash
+# On macOS 14.2+ with Python 3.12+
 pip install catap
 ```
 
@@ -114,8 +117,8 @@ uv run catap record Spotify -d 10 -o output.wav
 
 If recording fails with permission errors:
 
-1. Check System Settings > Privacy & Security > Microphone
-2. Ensure your terminal app has permission (Terminal, iTerm, etc.)
+1. Check System Settings > Privacy & Security > Screen & System Audio Recording
+2. Ensure the app launching `catap` has permission (Terminal, iTerm, etc.)
 3. Retry recording from the same terminal app after granting access
 
 ## How It Works
