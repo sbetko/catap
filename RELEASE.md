@@ -2,9 +2,10 @@
 
 ## One-time setup
 
-1. Enable Trusted Publishing for `catap` in PyPI and allow GitHub repository `sbetko/catap`.
-2. In GitHub, create the `pypi` environment and grant approval rules as needed.
-3. Ensure the `Publish` workflow (`.github/workflows/publish.yml`) is enabled.
+1. Make the repository public, or update the project URLs in [`pyproject.toml`](./pyproject.toml) so PyPI will not point users at a private repo.
+2. Enable Trusted Publishing for `catap` in PyPI and allow GitHub repository `sbetko/catap`.
+3. In GitHub, create the `pypi` environment and grant approval rules as needed.
+4. Ensure the `Publish` workflow (`.github/workflows/publish.yml`) is enabled.
 
 ## For each release
 
@@ -34,7 +35,7 @@ git push origin main --tags
 ## Optional smoke checks after publish
 
 ```bash
-python -m venv /tmp/catap-smoke
+python3 -m venv /tmp/catap-smoke
 source /tmp/catap-smoke/bin/activate
 pip install catap
 catap --help

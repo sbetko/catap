@@ -6,6 +6,11 @@ from collections.abc import Sequence
 from enum import IntEnum
 from typing import Any
 
+from catap._runtime import get_runtime_support_error
+
+if _runtime_error := get_runtime_support_error():
+    raise ImportError(_runtime_error)
+
 import objc
 from Foundation import NSArray, NSNumber  # ty: ignore[unresolved-import]
 
@@ -14,7 +19,7 @@ try:
 except objc.nosuchclass_error as e:  # ty: ignore[unresolved-attribute]
     raise ImportError(
         "CATapDescription class not found. "
-        "Ensure you're running on macOS 14.10 or later with "
+        "Ensure you're running on macOS 14.2 or later with "
         "pyobjc-framework-CoreAudio installed."
     ) from e
 

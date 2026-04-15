@@ -8,9 +8,7 @@ from dataclasses import dataclass
 
 from AppKit import NSRunningApplication, NSWorkspace  # ty: ignore[unresolved-import]
 
-_CoreAudio = ctypes.cdll.LoadLibrary(
-    "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
-)
+from catap.bindings._coreaudio import _CoreAudio
 
 # Define C function signatures
 # OSStatus AudioObjectGetPropertyDataSize(

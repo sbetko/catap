@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import sys
-import types
 from dataclasses import dataclass
 
 import pytest
 
+import catap.cli as cli
 from catap.cli import main
 
 
@@ -20,17 +19,21 @@ class _FakeProcess:
     is_outputting: bool
 
 
+def _set_cli_symbols(monkeypatch: pytest.MonkeyPatch, **attrs: object) -> None:
+    for name, value in attrs.items():
+        monkeypatch.setattr(cli, name, value)
+
 def test_list_apps_filters_idle_processes_by_default(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fake_process_module = types.SimpleNamespace(
+    _set_cli_symbols(
+        monkeypatch,
         list_audio_processes=lambda: [
             _FakeProcess(1, 111, "com.apple.Music", "Music", True),
             _FakeProcess(2, 222, "com.tinyspeck.slackmacgap", "Slack", False),
-        ]
+        ],
     )
-    monkeypatch.setitem(sys.modules, "catap.bindings.process", fake_process_module)
 
     exit_code = main(["list-apps"])
     captured = capsys.readouterr()
@@ -44,13 +47,13 @@ def test_list_apps_all_includes_idle_processes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fake_process_module = types.SimpleNamespace(
+    _set_cli_symbols(
+        monkeypatch,
         list_audio_processes=lambda: [
             _FakeProcess(1, 111, "com.apple.Music", "Music", True),
             _FakeProcess(2, 222, "com.tinyspeck.slackmacgap", "Slack", False),
-        ]
+        ],
     )
-    monkeypatch.setitem(sys.modules, "catap.bindings.process", fake_process_module)
 
     exit_code = main(["list-apps", "--all"])
     captured = capsys.readouterr()
@@ -64,13 +67,13 @@ def test_record_returns_error_when_process_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    fake_process_module = types.SimpleNamespace(
+    _set_cli_symbols(
+        monkeypatch,
         find_process_by_name=lambda _: None,
         list_audio_processes=lambda: [
             _FakeProcess(2, 222, "com.tinyspeck.slackmacgap", "Slack", False)
         ],
     )
-    monkeypatch.setitem(sys.modules, "catap.bindings.process", fake_process_module)
 
     exit_code = main(["record", "Music", "-d", "1"])
     captured = capsys.readouterr()

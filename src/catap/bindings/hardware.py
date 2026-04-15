@@ -5,12 +5,10 @@ from __future__ import annotations
 import ctypes
 from typing import TYPE_CHECKING
 
+from catap.bindings._coreaudio import _CoreAudio
+
 if TYPE_CHECKING:
     from catap.bindings.tap_description import TapDescription
-
-_CoreAudio = ctypes.cdll.LoadLibrary(
-    "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
-)
 
 # Define C function signatures
 # OSStatus AudioHardwareCreateProcessTap(

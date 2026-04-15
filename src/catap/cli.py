@@ -9,6 +9,15 @@ import time
 from collections.abc import Sequence
 
 from catap import __version__
+from catap._backend import (
+    AudioRecorder,
+    TapDescription,
+    TapMuteBehavior,
+    create_process_tap,
+    destroy_process_tap,
+    find_process_by_name,
+    list_audio_processes,
+)
 
 _PERMISSION_HINT = [
     "This may be a permissions issue. Try:",
@@ -101,8 +110,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _list_apps(show_all: bool) -> int:
-    from catap.bindings.process import list_audio_processes
-
     try:
         processes = list_audio_processes()
     except Exception as exc:
@@ -143,9 +150,6 @@ def _record(
     mute: bool,
     exclude: list[str],
 ) -> int:
-    from catap.bindings.process import find_process_by_name, list_audio_processes
-    from catap.bindings.tap_description import TapDescription, TapMuteBehavior
-
     if system:
         exclude_ids: list[int] = []
         for excluded_app_name in exclude:
@@ -196,9 +200,6 @@ def _record(
             print("Muting app audio during recording")
         else:
             tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
-
-    from catap.bindings.hardware import create_process_tap, destroy_process_tap
-    from catap.core.recorder import AudioRecorder
 
     try:
         tap_id = create_process_tap(tap_desc)

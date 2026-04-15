@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import queue
 import struct
 import threading
 import uuid
@@ -13,11 +14,7 @@ from typing import TYPE_CHECKING
 
 from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
-# Load CoreAudio framework
-_CoreAudio = ctypes.cdll.LoadLibrary(
-    "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
-)
-
+from catap.bindings._coreaudio import _CoreAudio
 
 # =============================================================================
 # Core Audio Type Definitions
@@ -398,15 +395,19 @@ class AudioRecorder:
         self._io_proc_id: ctypes.c_void_p | None = None
         self._is_recording = False
         self._lock = threading.Lock()
+        self._writer_thread: threading.Thread | None = None
+        self._write_queue: queue.SimpleQueue[bytes | None] | None = None
+        self._writer_error: OSError | None = None
+        self._wav_file: wave.Wave_write | None = None
 
-        # Audio data accumulator
-        self._audio_chunks: list[bytes] = []
         self._total_frames = 0
 
         # Stream format (populated on start)
         self._sample_rate = 44100.0
         self._num_channels = 2
         self._bits_per_sample = 32
+        self._output_bits_per_sample = 32
+        self._convert_float_output = True
         self._is_float = True
 
         # Keep reference to callback to prevent garbage collection
@@ -467,10 +468,10 @@ class AudioRecorder:
                         num_frames = 0
 
                     with self._lock:
-                        # Only accumulate if we have an output path
-                        if self.output_path is not None:
-                            self._audio_chunks.append(data)
                         self._total_frames += num_frames
+
+                    if self._write_queue is not None and self._writer_error is None:
+                        self._write_queue.put(data)
 
                     # Call user callback if provided
                     if self._on_data:
@@ -507,10 +508,24 @@ class AudioRecorder:
             # Use defaults if we can't get format
             pass
 
-        # Create aggregate device containing the tap
-        self._aggregate_device_id = _create_aggregate_device_for_tap(
-            tap_uid, "catap Recording Device"
+        self._output_bits_per_sample = (
+            16
+            if self._is_float and self._bits_per_sample == 32
+            else self._bits_per_sample
         )
+        self._convert_float_output = self._is_float and self._bits_per_sample == 32
+
+        if self.output_path is not None:
+            self._start_writer()
+
+        # Create aggregate device containing the tap
+        try:
+            self._aggregate_device_id = _create_aggregate_device_for_tap(
+                tap_uid, "catap Recording Device"
+            )
+        except Exception:
+            self._stop_writer()
+            raise
 
         # Create IO proc on the aggregate device
         io_proc_id = ctypes.c_void_p()
@@ -527,6 +542,7 @@ class AudioRecorder:
                 _destroy_aggregate_device(self._aggregate_device_id)
             except OSError:
                 pass
+            self._stop_writer()
             self._aggregate_device_id = None
             raise OSError(f"Failed to create IO proc: status {status}")
 
@@ -534,7 +550,6 @@ class AudioRecorder:
 
         # Clear any previous data
         with self._lock:
-            self._audio_chunks.clear()
             self._total_frames = 0
 
         # Start device
@@ -549,12 +564,13 @@ class AudioRecorder:
                 _destroy_aggregate_device(self._aggregate_device_id)
             except OSError:
                 pass
+            self._stop_writer()
             self._aggregate_device_id = None
             raise OSError(f"Failed to start audio device: status {status}")
 
     def stop(self) -> None:
         """
-        Stop recording and write the WAV file.
+        Stop recording and finalize any WAV output.
 
         Raises:
             RuntimeError: If not recording
@@ -578,32 +594,69 @@ class AudioRecorder:
                 pass
             self._aggregate_device_id = None
 
-        # Write WAV file only if output path is set
-        if self.output_path is not None:
-            self._write_wav()
+        self._stop_writer()
 
-    def _write_wav(self) -> None:
-        """Write accumulated audio data to WAV file."""
-        with self._lock:
-            if not self._audio_chunks:
-                # Write empty WAV file
-                audio_data = b""
-            else:
-                audio_data = b"".join(self._audio_chunks)
+    def _start_writer(self) -> None:
+        """Start the background WAV writer when writing to disk."""
+        assert self.output_path is not None
 
-        # Convert float32 to int16 for WAV compatibility
-        if self._is_float and self._bits_per_sample == 32:
-            audio_data = self._float32_to_int16(audio_data)
-            output_bits = 16
-        else:
-            output_bits = self._bits_per_sample
+        self._writer_error = None
 
-        # Write WAV file
-        with wave.open(str(self.output_path), "wb") as wav:
-            wav.setnchannels(self._num_channels)
-            wav.setsampwidth(output_bits // 8)
-            wav.setframerate(int(self._sample_rate))
-            wav.writeframes(audio_data)
+        wav_file = wave.open(str(self.output_path), "wb")
+        wav_file.setnchannels(self._num_channels)
+        wav_file.setsampwidth(self._output_bits_per_sample // 8)
+        wav_file.setframerate(int(self._sample_rate))
+        self._wav_file = wav_file
+        self._write_queue = queue.SimpleQueue()
+
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="catap-wav-writer",
+            daemon=True,
+        )
+        self._writer_thread.start()
+
+    def _stop_writer(self) -> None:
+        """Flush and stop the background WAV writer."""
+        if self._write_queue is not None:
+            self._write_queue.put(None)
+
+        if self._writer_thread is not None:
+            self._writer_thread.join()
+
+        self._write_queue = None
+        self._writer_thread = None
+
+        if self._writer_error is not None:
+            error = self._writer_error
+            self._writer_error = None
+            raise error
+
+    def _writer_loop(self) -> None:
+        """Write audio chunks to disk outside the Core Audio callback."""
+        assert self._write_queue is not None
+        assert self._wav_file is not None
+
+        try:
+            while True:
+                audio_data = self._write_queue.get()
+                if audio_data is None:
+                    break
+
+                if self._convert_float_output:
+                    audio_data = self._float32_to_int16(audio_data)
+
+                self._wav_file.writeframesraw(audio_data)
+        except Exception as exc:
+            self._writer_error = OSError(f"Failed to write WAV data: {exc}")
+        finally:
+            try:
+                self._wav_file.close()
+            except Exception as exc:
+                if self._writer_error is None:
+                    self._writer_error = OSError(f"Failed to finalize WAV file: {exc}")
+            finally:
+                self._wav_file = None
 
     def _float32_to_int16(self, data: bytes) -> bytes:
         """Convert 32-bit float audio to 16-bit integer."""
