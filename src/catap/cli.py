@@ -9,12 +9,10 @@ import time
 from collections.abc import Sequence
 
 from catap import (
-    AudioRecorder,
+    RecordingSession,
     TapDescription,
     TapMuteBehavior,
     __version__,
-    create_process_tap,
-    destroy_process_tap,
     find_process_by_name,
     list_audio_processes,
 )
@@ -201,18 +199,7 @@ def _record(
         else:
             tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
 
-    try:
-        tap_id = create_process_tap(tap_desc)
-    except OSError as exc:
-        print(f"Error creating audio tap: {exc}", file=sys.stderr)
-        print("", file=sys.stderr)
-        for line in _PERMISSION_HINT:
-            print(line, file=sys.stderr)
-        return 1
-
-    print(f"Created tap (ID: {tap_id})")
-
-    recorder = AudioRecorder(tap_id, output)
+    session = RecordingSession(tap_desc, output)
     stop_flag = False
 
     def signal_handler(_sig: int, _frame: object) -> None:
@@ -223,8 +210,23 @@ def _record(
     original_handler = signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        recorder.start()
+        session.start()
+    except OSError as exc:
+        signal.signal(signal.SIGINT, original_handler)
+        try:
+            session.close()
+        except OSError:
+            pass
+        print(f"Error starting recording: {exc}", file=sys.stderr)
+        print("", file=sys.stderr)
+        for line in _PERMISSION_HINT:
+            print(line, file=sys.stderr)
+        return 1
 
+    if session.tap_id is not None:
+        print(f"Created tap (ID: {session.tap_id})")
+
+    try:
         if duration is not None:
             print(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
             start_time = time.time()
@@ -235,8 +237,8 @@ def _record(
             while not stop_flag:
                 time.sleep(0.1)
 
-        recorder.stop()
-        print(f"Recorded {recorder.duration_seconds:.2f} seconds")
+        session.stop()
+        print(f"Recorded {session.duration_seconds:.2f} seconds")
         print(f"Saved to: {output}")
         return 0
     except OSError as exc:
@@ -245,7 +247,7 @@ def _record(
     finally:
         signal.signal(signal.SIGINT, original_handler)
         try:
-            destroy_process_tap(tap_id)
+            session.close()
         except OSError:
             pass
 

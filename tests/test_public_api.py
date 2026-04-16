@@ -19,6 +19,9 @@ def test_module_has_expected_exports() -> None:
 
     assert "TapDescription" in module.__all__
     assert "AudioRecorder" in module.__all__
+    assert "RecordingSession" in module.__all__
+    assert "record_process" in module.__all__
+    assert "record_system_audio" in module.__all__
     assert isinstance(module.__version__, str)
 
 
@@ -28,6 +31,7 @@ def test_public_exports_reference_expected_symbols() -> None:
     tap_module = importlib.import_module("catap.bindings.tap_description")
     process_module = importlib.import_module("catap.bindings.process")
     hardware_module = importlib.import_module("catap.bindings.hardware")
+    session_module = importlib.import_module("catap.session")
 
     assert module.AudioRecorder is recorder_module.AudioRecorder
     assert module.TapDescription is tap_module.TapDescription
@@ -37,6 +41,10 @@ def test_public_exports_reference_expected_symbols() -> None:
     assert module.find_process_by_name is process_module.find_process_by_name
     assert module.create_process_tap is hardware_module.create_process_tap
     assert module.destroy_process_tap is hardware_module.destroy_process_tap
+    assert module.AudioProcessNotFoundError is session_module.AudioProcessNotFoundError
+    assert module.RecordingSession is session_module.RecordingSession
+    assert module.record_process is session_module.record_process
+    assert module.record_system_audio is session_module.record_system_audio
 
 
 def test_unknown_attribute_raises_attribute_error() -> None:

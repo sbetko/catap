@@ -65,38 +65,57 @@ catap record --system -e Music -e Zoom -d 30 -o ~/system_audio.wav
 ### Python API
 
 ```python
+from catap import record_process
+
+# High-level API: catap manages tap creation, startup, shutdown, and cleanup.
+with record_process("Safari", output_path="output.wav", mute=False) as session:
+    import time
+
+    time.sleep(5)
+
+print(f"Recorded {session.duration_seconds:.2f} seconds")
+```
+
+You can also record for a fixed duration without managing the context yourself:
+
+```python
+from catap import record_process
+
+session = record_process("Safari", output_path="output.wav")
+session.record_for(5)
+print(f"Recorded {session.duration_seconds:.2f} seconds")
+```
+
+For advanced use cases, the low-level API is still available:
+
+```python
 from catap import (
+    AudioRecorder,
     TapDescription,
     TapMuteBehavior,
     create_process_tap,
     destroy_process_tap,
     find_process_by_name,
-    list_audio_processes,
-    AudioRecorder,
 )
 
-# Find a process
 process = find_process_by_name("Safari")
 print(f"Found: {process.name} (PID: {process.pid})")
 
-# Create a tap
 tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
 tap_desc.name = "My Recording"
 tap_desc.mute_behavior = TapMuteBehavior.UNMUTED  # or MUTED
 
 tap_id = create_process_tap(tap_desc)
 
-# Record audio
 recorder = AudioRecorder(tap_id, "output.wav")
 recorder.start()
 
 import time
-time.sleep(5)  # Record for 5 seconds
+time.sleep(5)
 
 recorder.stop()
 print(f"Recorded {recorder.duration_seconds:.2f} seconds")
 
-# Clean up
 destroy_process_tap(tap_id)
 ```
 

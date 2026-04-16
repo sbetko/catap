@@ -31,6 +31,12 @@ from catap.bindings.process import (
 )
 from catap.bindings.tap_description import TapDescription, TapMuteBehavior
 from catap.core.recorder import AudioRecorder
+from catap.session import (
+    AudioProcessNotFoundError,
+    RecordingSession,
+    record_process,
+    record_system_audio,
+)
 
 try:
     __version__ = version("catap")
@@ -46,4 +52,8 @@ __all__ = [
     "list_audio_processes",
     "find_process_by_name",
     "AudioRecorder",
+    "AudioProcessNotFoundError",
+    "RecordingSession",
+    "record_process",
+    "record_system_audio",
 ]
