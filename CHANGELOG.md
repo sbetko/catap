@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-04-16
 
 - Initial public release of `catap`.
 - Added a CLI for listing audio processes and recording app or system audio.
