@@ -8,11 +8,11 @@ import sys
 import time
 from collections.abc import Sequence
 
-from catap import __version__
-from catap._backend import (
+from catap import (
     AudioRecorder,
     TapDescription,
     TapMuteBehavior,
+    __version__,
     create_process_tap,
     destroy_process_tap,
     find_process_by_name,

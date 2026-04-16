@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import types
 
 import pytest
 
@@ -16,23 +15,25 @@ def test_module_has_expected_exports() -> None:
     assert isinstance(module.__version__, str)
 
 
-def test_lazy_import_uses_export_map(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_public_exports_reference_expected_symbols() -> None:
     module = importlib.import_module("catap")
-    module.__dict__.pop("AudioRecorder", None)
+    recorder_module = importlib.import_module("catap.core.recorder")
+    tap_module = importlib.import_module("catap.bindings.tap_description")
+    process_module = importlib.import_module("catap.bindings.process")
+    hardware_module = importlib.import_module("catap.bindings.hardware")
 
-    fake_audio_recorder = type("AudioRecorder", (), {})
-
-    def fake_import_module(module_name: str) -> types.SimpleNamespace:
-        assert module_name == "catap.core.recorder"
-        return types.SimpleNamespace(AudioRecorder=fake_audio_recorder)
-
-    monkeypatch.setattr(module, "import_module", fake_import_module)
-
-    assert module.AudioRecorder is fake_audio_recorder
+    assert module.AudioRecorder is recorder_module.AudioRecorder
+    assert module.TapDescription is tap_module.TapDescription
+    assert module.TapMuteBehavior is tap_module.TapMuteBehavior
+    assert module.AudioProcess is process_module.AudioProcess
+    assert module.list_audio_processes is process_module.list_audio_processes
+    assert module.find_process_by_name is process_module.find_process_by_name
+    assert module.create_process_tap is hardware_module.create_process_tap
+    assert module.destroy_process_tap is hardware_module.destroy_process_tap
 
 
 def test_unknown_attribute_raises_attribute_error() -> None:
     module = importlib.import_module("catap")
 
     with pytest.raises(AttributeError):
-        _ = module.this_attribute_does_not_exist
+        module.__getattribute__("this_attribute_does_not_exist")
