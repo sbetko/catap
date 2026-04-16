@@ -6,13 +6,10 @@ from collections.abc import Sequence
 from enum import IntEnum
 from typing import Any
 
-from catap._runtime import get_runtime_support_error
-
-if _runtime_error := get_runtime_support_error():
-    raise ImportError(_runtime_error)
-
 import objc
 from Foundation import NSArray, NSNumber  # ty: ignore[unresolved-import]
+
+from catap.bindings import _coreaudio as _coreaudio  # noqa: F401
 
 try:
     CATapDescription = objc.lookUpClass("CATapDescription")  # ty: ignore[unresolved-attribute]
