@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 import catap.session as session_module
 from catap.bindings.process import AudioProcess
+from catap.bindings.tap_description import TapDescription
 
 
 class _FakeTapDescription:
@@ -160,7 +162,9 @@ def test_recording_session_start_cleans_up_tap_on_failure(
         destroyed_tap_ids=destroyed_tap_ids,
     )
 
-    session = session_module.RecordingSession(_FakeTapDescription([42]))
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42]))
+    )
 
     with pytest.raises(OSError, match="boom"):
         session.start()
