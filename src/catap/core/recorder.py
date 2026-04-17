@@ -16,6 +16,34 @@ from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-
 
 from catap.bindings._coreaudio import _CoreAudio
 
+type _WorkerItem = tuple[bytes, int] | None
+
+_CoreFoundation = ctypes.cdll.LoadLibrary(
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+)
+_CFRelease = _CoreFoundation.CFRelease
+_CFRelease.argtypes = [ctypes.c_void_p]
+_CFRelease.restype = None
+
+
+def _combine_errors(
+    summary: str, errors: list[OSError | RuntimeError]
+) -> OSError | RuntimeError:
+    """Collapse multiple cleanup failures into one exception."""
+    primary = errors[0]
+    combined: OSError | RuntimeError
+
+    if isinstance(primary, RuntimeError):
+        combined = RuntimeError(f"{summary}: {primary}")
+    else:
+        combined = OSError(f"{summary}: {primary}")
+
+    for error in errors[1:]:
+        combined.add_note(str(error))
+
+    return combined
+
+
 # =============================================================================
 # Core Audio Type Definitions
 # =============================================================================
@@ -242,8 +270,11 @@ def _get_tap_uid(tap_id: int) -> str:
     # Convert CFStringRef to Python string using PyObjC
     import objc
 
-    ns_string = objc.objc_object(c_void_p=cf_string_ref)  # ty: ignore[unresolved-attribute]
-    return str(ns_string)
+    try:
+        ns_string = objc.objc_object(c_void_p=cf_string_ref.value)  # ty: ignore[unresolved-attribute]
+        return str(ns_string)
+    finally:
+        _CFRelease(cf_string_ref)
 
 
 def get_tap_format(tap_id: int) -> AudioStreamBasicDescription:
@@ -382,7 +413,9 @@ class AudioRecorder:
         Args:
             tap_id: AudioObjectID of the tap to record from
             output_path: Path to write the WAV file, or None for streaming mode
-            on_data: Optional callback for each audio buffer (bytes, num_frames)
+            on_data: Optional callback for each audio buffer (bytes, num_frames).
+                The callback runs on catap's background worker thread, not on
+                Core Audio's real-time callback thread.
         """
         self.tap_id = tap_id
         self.output_path = Path(output_path) if output_path else None
@@ -395,9 +428,10 @@ class AudioRecorder:
         self._io_proc_id: ctypes.c_void_p | None = None
         self._is_recording = False
         self._lock = threading.Lock()
-        self._writer_thread: threading.Thread | None = None
-        self._write_queue: queue.SimpleQueue[bytes | None] | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._work_queue: queue.SimpleQueue[_WorkerItem] | None = None
         self._writer_error: OSError | None = None
+        self._callback_error: RuntimeError | None = None
         self._wav_file: wave.Wave_write | None = None
 
         self._total_frames = 0
@@ -470,12 +504,8 @@ class AudioRecorder:
                     with self._lock:
                         self._total_frames += num_frames
 
-                    if self._write_queue is not None and self._writer_error is None:
-                        self._write_queue.put(data)
-
-                    # Call user callback if provided
-                    if self._on_data:
-                        self._on_data(data, num_frames)
+                    if self._work_queue is not None:
+                        self._work_queue.put((data, num_frames))
 
         except Exception:
             # Must not raise from callback
@@ -515,8 +545,8 @@ class AudioRecorder:
         )
         self._convert_float_output = self._is_float and self._bits_per_sample == 32
 
-        if self.output_path is not None:
-            self._start_writer()
+        if self.output_path is not None or self._on_data is not None:
+            self._start_worker()
 
         # Create aggregate device containing the tap
         try:
@@ -524,7 +554,7 @@ class AudioRecorder:
                 tap_uid, "catap Recording Device"
             )
         except Exception:
-            self._stop_writer()
+            self._stop_worker()
             raise
 
         # Create IO proc on the aggregate device
@@ -537,14 +567,22 @@ class AudioRecorder:
         )
 
         if status != 0:
-            # Clean up aggregate device
+            cleanup_errors: list[OSError | RuntimeError] = []
             try:
                 _destroy_aggregate_device(self._aggregate_device_id)
-            except OSError:
-                pass
-            self._stop_writer()
+            except OSError as exc:
+                cleanup_errors.append(exc)
+
+            try:
+                self._stop_worker()
+            except (OSError, RuntimeError) as exc:
+                cleanup_errors.append(exc)
+
             self._aggregate_device_id = None
-            raise OSError(f"Failed to create IO proc: status {status}")
+            error = OSError(f"Failed to create IO proc: status {status}")
+            for cleanup_error in cleanup_errors:
+                error.add_note(str(cleanup_error))
+            raise error
 
         self._io_proc_id = io_proc_id
 
@@ -557,106 +595,169 @@ class AudioRecorder:
         status = _AudioDeviceStart(self._aggregate_device_id, self._io_proc_id)
 
         if status != 0:
+            cleanup_errors: list[OSError | RuntimeError] = []
             self._is_recording = False
-            _AudioDeviceDestroyIOProcID(self._aggregate_device_id, self._io_proc_id)
+            destroy_status = _AudioDeviceDestroyIOProcID(
+                self._aggregate_device_id, self._io_proc_id
+            )
+            if destroy_status != 0:
+                cleanup_errors.append(
+                    OSError(f"Failed to destroy IO proc: status {destroy_status}")
+                )
             self._io_proc_id = None
+
             try:
                 _destroy_aggregate_device(self._aggregate_device_id)
-            except OSError:
-                pass
-            self._stop_writer()
+            except OSError as exc:
+                cleanup_errors.append(exc)
+
+            try:
+                self._stop_worker()
+            except (OSError, RuntimeError) as exc:
+                cleanup_errors.append(exc)
+
             self._aggregate_device_id = None
-            raise OSError(f"Failed to start audio device: status {status}")
+            error = OSError(f"Failed to start audio device: status {status}")
+            for cleanup_error in cleanup_errors:
+                error.add_note(str(cleanup_error))
+            raise error
 
     def stop(self) -> None:
         """
         Stop recording and finalize any WAV output.
 
         Raises:
+            OSError: If Core Audio cleanup fails
             RuntimeError: If not recording
         """
         if not self._is_recording:
             raise RuntimeError("Not recording")
 
         self._is_recording = False
+        cleanup_errors: list[OSError | RuntimeError] = []
 
         # Stop device
         if self._io_proc_id and self._aggregate_device_id:
-            _AudioDeviceStop(self._aggregate_device_id, self._io_proc_id)
-            _AudioDeviceDestroyIOProcID(self._aggregate_device_id, self._io_proc_id)
+            stop_status = _AudioDeviceStop(self._aggregate_device_id, self._io_proc_id)
+            if stop_status != 0:
+                cleanup_errors.append(
+                    OSError(f"Failed to stop audio device: status {stop_status}")
+                )
+
+            destroy_status = _AudioDeviceDestroyIOProcID(
+                self._aggregate_device_id, self._io_proc_id
+            )
+            if destroy_status != 0:
+                cleanup_errors.append(
+                    OSError(f"Failed to destroy IO proc: status {destroy_status}")
+                )
+
             self._io_proc_id = None
 
         # Destroy aggregate device
         if self._aggregate_device_id:
             try:
                 _destroy_aggregate_device(self._aggregate_device_id)
-            except OSError:
-                pass
+            except OSError as exc:
+                cleanup_errors.append(exc)
             self._aggregate_device_id = None
 
-        self._stop_writer()
+        try:
+            self._stop_worker()
+        except (OSError, RuntimeError) as exc:
+            cleanup_errors.append(exc)
 
-    def _start_writer(self) -> None:
-        """Start the background WAV writer when writing to disk."""
-        assert self.output_path is not None
+        if cleanup_errors:
+            raise _combine_errors("Failed to stop recording cleanly", cleanup_errors)
+
+    def _start_worker(self) -> None:
+        """Start the background worker for file writes and user callbacks."""
+        if self.output_path is None and self._on_data is None:
+            return
 
         self._writer_error = None
+        self._callback_error = None
 
-        wav_file = wave.open(str(self.output_path), "wb")
-        wav_file.setnchannels(self._num_channels)
-        wav_file.setsampwidth(self._output_bits_per_sample // 8)
-        wav_file.setframerate(int(self._sample_rate))
-        self._wav_file = wav_file
-        self._write_queue = queue.SimpleQueue()
+        if self.output_path is not None:
+            wav_file = wave.open(str(self.output_path), "wb")
+            wav_file.setnchannels(self._num_channels)
+            wav_file.setsampwidth(self._output_bits_per_sample // 8)
+            wav_file.setframerate(int(self._sample_rate))
+            self._wav_file = wav_file
+        else:
+            self._wav_file = None
 
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop,
-            name="catap-wav-writer",
+        self._work_queue = queue.SimpleQueue()
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop,
+            name="catap-audio-worker",
             daemon=True,
         )
-        self._writer_thread.start()
+        self._worker_thread.start()
 
-    def _stop_writer(self) -> None:
-        """Flush and stop the background WAV writer."""
-        if self._write_queue is not None:
-            self._write_queue.put(None)
+    def _stop_worker(self) -> None:
+        """Flush and stop the background worker."""
+        if self._work_queue is not None:
+            self._work_queue.put(None)
 
-        if self._writer_thread is not None:
-            self._writer_thread.join()
+        if self._worker_thread is not None:
+            self._worker_thread.join()
 
-        self._write_queue = None
-        self._writer_thread = None
+        self._work_queue = None
+        self._worker_thread = None
 
+        worker_errors: list[OSError | RuntimeError] = []
         if self._writer_error is not None:
-            error = self._writer_error
+            worker_errors.append(self._writer_error)
             self._writer_error = None
-            raise error
+        if self._callback_error is not None:
+            worker_errors.append(self._callback_error)
+            self._callback_error = None
 
-    def _writer_loop(self) -> None:
-        """Write audio chunks to disk outside the Core Audio callback."""
-        assert self._write_queue is not None
-        assert self._wav_file is not None
+        if worker_errors:
+            raise _combine_errors("Failed to finalize audio worker", worker_errors)
+
+    def _worker_loop(self) -> None:
+        """Drain queued audio outside the Core Audio callback thread."""
+        assert self._work_queue is not None
 
         try:
             while True:
-                audio_data = self._write_queue.get()
-                if audio_data is None:
+                item = self._work_queue.get()
+                if item is None:
                     break
 
-                if self._convert_float_output:
-                    audio_data = self._float32_to_int16(audio_data)
+                audio_data, num_frames = item
 
-                self._wav_file.writeframesraw(audio_data)
-        except Exception as exc:
-            self._writer_error = OSError(f"Failed to write WAV data: {exc}")
+                if self._on_data is not None and self._callback_error is None:
+                    try:
+                        self._on_data(audio_data, num_frames)
+                    except Exception as exc:
+                        self._callback_error = RuntimeError(
+                            f"Audio data callback failed: {exc}"
+                        )
+
+                if self._wav_file is not None and self._writer_error is None:
+                    try:
+                        output_data = (
+                            self._float32_to_int16(audio_data)
+                            if self._convert_float_output
+                            else audio_data
+                        )
+                        self._wav_file.writeframesraw(output_data)
+                    except Exception as exc:
+                        self._writer_error = OSError(f"Failed to write WAV data: {exc}")
         finally:
-            try:
-                self._wav_file.close()
-            except Exception as exc:
-                if self._writer_error is None:
-                    self._writer_error = OSError(f"Failed to finalize WAV file: {exc}")
-            finally:
-                self._wav_file = None
+            if self._wav_file is not None:
+                try:
+                    self._wav_file.close()
+                except Exception as exc:
+                    if self._writer_error is None:
+                        self._writer_error = OSError(
+                            f"Failed to finalize WAV file: {exc}"
+                        )
+                finally:
+                    self._wav_file = None
 
     def _float32_to_int16(self, data: bytes) -> bytes:
         """Convert 32-bit float audio to 16-bit integer."""

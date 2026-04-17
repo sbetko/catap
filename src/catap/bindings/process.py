@@ -10,6 +10,13 @@ from AppKit import NSRunningApplication, NSWorkspace  # ty: ignore[unresolved-im
 
 from catap.bindings._coreaudio import _CoreAudio
 
+_CoreFoundation = ctypes.cdll.LoadLibrary(
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+)
+_CFRelease = _CoreFoundation.CFRelease
+_CFRelease.argtypes = [ctypes.c_void_p]
+_CFRelease.restype = None
+
 # Define C function signatures
 # OSStatus AudioObjectGetPropertyDataSize(
 #     AudioObjectID inObjectID,
@@ -134,6 +141,62 @@ def _get_audio_object_property(
     return buffer.raw[: actual_size.value]
 
 
+def _get_audio_object_cfstring_property(
+    object_id: int,
+    selector: int,
+    scope: int = kAudioObjectPropertyScopeGlobal,
+    element: int = kAudioObjectPropertyElementMain,
+) -> str | None:
+    """
+    Get a retained CFString property from an audio object.
+
+    Returns None when the property is empty.
+    """
+    address = (ctypes.c_uint32 * 3)(selector, scope, element)
+    data_size = ctypes.c_uint32(0)
+    status = _AudioObjectGetPropertyDataSize(
+        object_id,
+        ctypes.byref(address),
+        0,
+        None,
+        ctypes.byref(data_size),
+    )
+
+    if status != 0:
+        raise OSError(
+            f"Failed to get property size for selector {selector:08x}: status {status}"
+        )
+
+    if data_size.value == 0:
+        return None
+
+    cf_string_ref = ctypes.c_void_p()
+    actual_size = ctypes.c_uint32(ctypes.sizeof(cf_string_ref))
+    status = _AudioObjectGetPropertyData(
+        object_id,
+        ctypes.byref(address),
+        0,
+        None,
+        ctypes.byref(actual_size),
+        ctypes.byref(cf_string_ref),
+    )
+
+    if status != 0:
+        raise OSError(
+            f"Failed to get property data for selector {selector:08x}: status {status}"
+        )
+
+    if not cf_string_ref.value:
+        return None
+
+    import objc
+
+    try:
+        return str(objc.objc_object(c_void_p=cf_string_ref.value))  # ty: ignore[unresolved-attribute]
+    finally:
+        _CFRelease(cf_string_ref)
+
+
 def list_audio_processes() -> list[AudioProcess]:
     """
     List all processes currently registered with Core Audio.
@@ -179,18 +242,9 @@ def list_audio_processes() -> list[AudioProcess]:
             # Get bundle ID (CFString)
             bundle_id = None
             try:
-                bundle_data = _get_audio_object_property(
+                bundle_id = _get_audio_object_cfstring_property(
                     audio_id, kAudioProcessPropertyBundleID
                 )
-                if bundle_data:
-                    # Bundle ID is returned as a CFString reference
-                    # PyObjC should give us an NSString
-                    if isinstance(bundle_data, bytes):
-                        # If we got bytes, it's likely a pointer we need to dereference
-                        # For now, skip it
-                        pass
-                    else:
-                        bundle_id = str(bundle_data)
             except OSError:
                 pass
 

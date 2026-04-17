@@ -56,7 +56,8 @@ class RecordingSession:
         Args:
             tap_description: Tap description to create when recording starts
             output_path: Path to write a WAV file, or None for streaming mode
-            on_data: Optional callback for each audio buffer (bytes, num_frames)
+            on_data: Optional callback for each audio buffer (bytes, num_frames).
+                The callback runs on a background worker thread.
         """
         self.tap_description = tap_description
         self.output_path = Path(output_path) if output_path else None
@@ -84,7 +85,8 @@ class RecordingSession:
             process: Application name or AudioProcess to record
             output_path: Path to write a WAV file, or None for streaming mode
             mute: Mute app playback while still capturing audio
-            on_data: Optional callback for each audio buffer (bytes, num_frames)
+            on_data: Optional callback for each audio buffer (bytes, num_frames).
+                The callback runs on a background worker thread.
 
         Raises:
             AudioProcessNotFoundError: If the named app cannot be found
@@ -118,7 +120,8 @@ class RecordingSession:
         Args:
             output_path: Path to write a WAV file, or None for streaming mode
             exclude: Apps to exclude from the system capture
-            on_data: Optional callback for each audio buffer (bytes, num_frames)
+            on_data: Optional callback for each audio buffer (bytes, num_frames).
+                The callback runs on a background worker thread.
 
         Raises:
             AudioProcessNotFoundError: If an excluded app name cannot be found

@@ -15,7 +15,8 @@ Python wrapper for Apple's Core Audio Tap API (macOS 14.2+). Capture audio from 
 - macOS 14.2 or later (for Core Audio Tap API)
 - Python 3.12+
 
-`catap` is macOS-only. On unsupported platforms, the CLI exits with a clear error instead of failing with a low-level import trace.
+`catap` is macOS-only. On unsupported platforms, imports fail with a clear
+`ImportError` before touching the low-level macOS bindings.
 
 ## Installation
 
@@ -75,6 +76,9 @@ with record_process("Safari", output_path="output.wav", mute=False) as session:
 
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
+
+If you use `on_data=...`, the callback runs on catap's background worker
+thread so the Core Audio callback can stay lightweight.
 
 You can also record for a fixed duration without managing the context yourself:
 
@@ -175,6 +179,15 @@ uv run --group dev pytest
 uv run --group dev python -m build
 uv run --group dev twine check dist/*
 ```
+
+### Optional integration smoke test
+
+```bash
+CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
+```
+
+This opt-in smoke test exercises the real macOS Core Audio bridge without
+making the default test suite flaky.
 
 See [`RELEASE.md`](RELEASE.md) for the release checklist.
 
