@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from AppKit import NSRunningApplication, NSWorkspace  # ty: ignore[unresolved-import]
@@ -32,14 +33,35 @@ class AudioProcess:
     is_outputting: bool
 
 
+class AmbiguousAudioProcessError(LookupError):
+    """Raised when a process query matches more than one audio process."""
+
+    def __init__(self, query: str, matches: Iterable[AudioProcess]) -> None:
+        self.query = query
+        self.matches = tuple(matches)
+
+        formatted_matches = ", ".join(
+            (
+                f"{process.name} "
+                f"(PID: {process.pid}, Bundle ID: {process.bundle_id or 'N/A'})"
+            )
+            for process in self.matches[:5]
+        )
+        if len(self.matches) > 5:
+            formatted_matches = (
+                f"{formatted_matches}, and {len(self.matches) - 5} more"
+            )
+
+        super().__init__(
+            f"Multiple audio processes match '{query}': {formatted_matches}"
+        )
+
+
 def list_audio_processes() -> list[AudioProcess]:
     """List all processes currently registered with Core Audio."""
-    try:
-        data = _get_audio_object_property(
-            kAudioObjectSystemObject, kAudioHardwarePropertyProcessObjectList
-        )
-    except OSError:
-        return []
+    data = _get_audio_object_property(
+        kAudioObjectSystemObject, kAudioHardwarePropertyProcessObjectList
+    )
 
     if not data:
         return []
@@ -100,18 +122,46 @@ def list_audio_processes() -> list[AudioProcess]:
         except (OSError, struct.error):
             continue
 
-    return processes
+    return sorted(processes, key=lambda process: (process.name.casefold(), process.pid))
 
 
 def find_process_by_name(name: str) -> AudioProcess | None:
-    """Find an audio process by app name (case-insensitive partial match).
+    """Find an audio process by exact or uniquely partial name match.
 
-    Returns None for an empty query; otherwise every process would match.
+    Exact application-name matches win over bundle ID matches, which win over
+    partial name matches. Raises AmbiguousAudioProcessError when the query
+    matches more than one process at the same precedence level. Returns None for
+    an empty query; otherwise every process would match.
     """
     if not name:
         return None
-    name_lower = name.lower()
-    for process in list_audio_processes():
-        if name_lower in process.name.lower():
-            return process
+
+    query = name.casefold()
+    processes = list_audio_processes()
+
+    exact_name_matches = [
+        process for process in processes if process.name.casefold() == query
+    ]
+    if exact_name_matches:
+        if len(exact_name_matches) > 1:
+            raise AmbiguousAudioProcessError(name, exact_name_matches)
+        return exact_name_matches[0]
+
+    exact_bundle_matches = [
+        process
+        for process in processes
+        if process.bundle_id and process.bundle_id.casefold() == query
+    ]
+    if exact_bundle_matches:
+        if len(exact_bundle_matches) > 1:
+            raise AmbiguousAudioProcessError(name, exact_bundle_matches)
+        return exact_bundle_matches[0]
+
+    partial_name_matches = [
+        process for process in processes if query in process.name.casefold()
+    ]
+    if len(partial_name_matches) > 1:
+        raise AmbiguousAudioProcessError(name, partial_name_matches)
+    if partial_name_matches:
+        return partial_name_matches[0]
     return None

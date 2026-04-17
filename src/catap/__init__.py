@@ -25,6 +25,7 @@ if _macos_version_tuple < (14, 2):
 
 from catap.bindings.hardware import create_process_tap, destroy_process_tap
 from catap.bindings.process import (
+    AmbiguousAudioProcessError,
     AudioProcess,
     find_process_by_name,
     list_audio_processes,
@@ -44,6 +45,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0"
 
 __all__ = [
+    "AmbiguousAudioProcessError",
     "AudioProcess",
     "AudioProcessNotFoundError",
     "AudioRecorder",

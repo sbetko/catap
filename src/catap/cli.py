@@ -8,8 +8,10 @@ import signal
 import sys
 import threading
 from collections.abc import Sequence
+from typing import Protocol
 
 from catap import (
+    AmbiguousAudioProcessError,
     RecordingSession,
     TapDescription,
     TapMuteBehavior,
@@ -23,6 +25,18 @@ _PERMISSION_HINT = [
     "  1. Check System Settings > Privacy & Security > Screen & System Audio Recording",
     "  2. Ensure your terminal app has permission",
 ]
+_OUTPUT_HINT = [
+    "This looks like an output file problem. Try:",
+    "  1. Ensure the destination directory exists",
+    "  2. Ensure you can write to the output path",
+]
+
+
+class _DisplayProcess(Protocol):
+    name: str
+    pid: int
+    bundle_id: str | None
+    is_outputting: bool
 
 
 def _positive_float(value: str) -> float:
@@ -120,43 +134,81 @@ def _list_apps(show_all: bool) -> int:
 
     if not processes:
         if show_all:
-            print("No audio processes found.")
+            print("No audio processes found.", flush=True)
         else:
-            print("No applications currently outputting audio.")
-            print("Use --all to see all registered audio processes.")
+            print("No applications currently outputting audio.", flush=True)
+            print("Use --all to see all registered audio processes.", flush=True)
         return 0
 
-    print(f"{'Status':<2} {'Name':<30} {'Bundle ID':<40} {'Audio ID':<10} {'PID':<8}")
-    print("-" * 92)
+    print(
+        f"{'Status':<2} {'Name':<30} {'Bundle ID':<40} {'Audio ID':<10} {'PID':<8}",
+        flush=True,
+    )
+    print("-" * 92, flush=True)
 
     for process in processes:
         bundle = process.bundle_id or "N/A"
         status = "♪" if process.is_outputting else " "
         print(
             f"{status:<2} {process.name:<30} {bundle:<40} "
-            f"{process.audio_object_id:<10} {process.pid:<8}"
+            f"{process.audio_object_id:<10} {process.pid:<8}",
+            flush=True,
         )
 
     return 0
 
 
+def _describe_process(process: _DisplayProcess) -> str:
+    bundle = process.bundle_id or "N/A"
+    status = "outputting" if process.is_outputting else "idle"
+    return f"{process.name} (PID: {process.pid}, Bundle ID: {bundle}, {status})"
+
+
+def _print_ambiguous_process_error(
+    query: str, exc: AmbiguousAudioProcessError
+) -> None:
+    message_lines = [f"Multiple audio processes match '{query}':"]
+    message_lines.extend(
+        f"  - {_describe_process(process)}" for process in exc.matches[:10]
+    )
+    if len(exc.matches) > 10:
+        message_lines.append(f"  ... and {len(exc.matches) - 10} more")
+    print("\n".join(message_lines), file=sys.stderr)
+
+
 def _build_app_tap(app_name: str, mute: bool) -> TapDescription | None:
-    process = find_process_by_name(app_name)
+    try:
+        process = find_process_by_name(app_name)
+    except AmbiguousAudioProcessError as exc:
+        _print_ambiguous_process_error(app_name, exc)
+        return None
+    except OSError as exc:
+        print(f"Error looking up audio processes: {exc}", file=sys.stderr)
+        return None
+
     if not process:
-        all_processes = list_audio_processes()
+        try:
+            all_processes = list_audio_processes()
+        except OSError as exc:
+            print(f"No audio process found matching '{app_name}'", file=sys.stderr)
+            print("", file=sys.stderr)
+            print(f"Error listing audio processes: {exc}", file=sys.stderr)
+            return None
+
         message_lines = [f"No audio process found matching '{app_name}'"]
         if all_processes:
             message_lines.append("")
             message_lines.append("Available audio processes:")
-            for listed_process in all_processes[:10]:
-                status = "outputting" if listed_process.is_outputting else "idle"
-                message_lines.append(f"  - {listed_process.name} ({status})")
+            message_lines.extend(
+                f"  - {_describe_process(listed_process)}"
+                for listed_process in all_processes[:10]
+            )
             if len(all_processes) > 10:
                 message_lines.append(f"  ... and {len(all_processes) - 10} more")
         print("\n".join(message_lines), file=sys.stderr)
         return None
 
-    print(f"Recording from: {process.name} (PID: {process.pid})")
+    print(f"Recording from: {process.name} (PID: {process.pid})", flush=True)
 
     tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
     tap_desc.name = f"catap recording {process.name}"
@@ -164,27 +216,35 @@ def _build_app_tap(app_name: str, mute: bool) -> TapDescription | None:
 
     if mute:
         tap_desc.mute_behavior = TapMuteBehavior.MUTED
-        print("Muting app audio during recording")
+        print("Muting app audio during recording", flush=True)
     else:
         tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
 
     return tap_desc
 
 
-def _build_system_tap(exclude: list[str]) -> TapDescription:
+def _build_system_tap(exclude: list[str]) -> TapDescription | None:
     exclude_ids: list[int] = []
     for excluded_app_name in exclude:
-        process = find_process_by_name(excluded_app_name)
+        try:
+            process = find_process_by_name(excluded_app_name)
+        except AmbiguousAudioProcessError as exc:
+            _print_ambiguous_process_error(excluded_app_name, exc)
+            return None
+        except OSError as exc:
+            print(f"Error looking up audio processes: {exc}", file=sys.stderr)
+            return None
+
         if process:
             exclude_ids.append(process.audio_object_id)
-            print(f"Excluding: {process.name} (PID: {process.pid})")
+            print(f"Excluding: {process.name} (PID: {process.pid})", flush=True)
         else:
             print(
                 f"Warning: No audio process found matching '{excluded_app_name}'",
                 file=sys.stderr,
             )
 
-    print("Recording all system audio")
+    print("Recording all system audio", flush=True)
     tap_desc = TapDescription.stereo_global_tap_excluding(exclude_ids)
     tap_desc.name = "catap system recording"
     tap_desc.is_private = True
@@ -192,19 +252,28 @@ def _build_system_tap(exclude: list[str]) -> TapDescription:
     return tap_desc
 
 
+def _print_recording_start_error(exc: OSError) -> None:
+    print(f"Error starting recording: {exc}", file=sys.stderr)
+    print("", file=sys.stderr)
+
+    hint_lines = _OUTPUT_HINT if exc.errno is not None else _PERMISSION_HINT
+    for line in hint_lines:
+        print(line, file=sys.stderr)
+
+
 def _run_recording_session(
     tap_desc: TapDescription,
     output: str,
     duration: float | None,
 ) -> int:
-    print(f"Output: {output}")
+    print(f"Output: {output}", flush=True)
     session = RecordingSession(tap_desc, output)
 
     stop_event = threading.Event()
 
     def signal_handler(_sig: int, _frame: object) -> None:
         stop_event.set()
-        print("\nStopping recording...")
+        print("\nStopping recording...", flush=True)
 
     original_handler = signal.signal(signal.SIGINT, signal_handler)
 
@@ -214,26 +283,26 @@ def _run_recording_session(
         except OSError as exc:
             with contextlib.suppress(OSError):
                 session.close()
-            print(f"Error starting recording: {exc}", file=sys.stderr)
-            print("", file=sys.stderr)
-            for line in _PERMISSION_HINT:
-                print(line, file=sys.stderr)
+            _print_recording_start_error(exc)
             return 1
 
         if session.tap_id is not None:
-            print(f"Created tap (ID: {session.tap_id})")
+            print(f"Created tap (ID: {session.tap_id})", flush=True)
 
         try:
             if duration is not None:
-                print(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
+                print(
+                    f"Recording for {duration} seconds... (Ctrl+C to stop early)",
+                    flush=True,
+                )
                 stop_event.wait(duration)
             else:
-                print("Recording... (Ctrl+C to stop)")
+                print("Recording... (Ctrl+C to stop)", flush=True)
                 stop_event.wait()
 
             session.stop()
-            print(f"Recorded {session.duration_seconds:.2f} seconds")
-            print(f"Saved to: {output}")
+            print(f"Recorded {session.duration_seconds:.2f} seconds", flush=True)
+            print(f"Saved to: {output}", flush=True)
             return 0
         except OSError as exc:
             print(f"Recording error: {exc}", file=sys.stderr)
@@ -268,6 +337,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "record: --mute can only be used when recording a single app"
                     )
                 tap_desc = _build_system_tap(args.exclude)
+                if tap_desc is None:
+                    return 1
             else:
                 if not args.app_name:
                     parser.error("record: APP_NAME is required unless --system is set")

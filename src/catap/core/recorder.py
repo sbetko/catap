@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import contextlib
 import ctypes
 import queue
 import threading
@@ -10,7 +11,7 @@ import uuid
 import wave
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 
 from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
@@ -23,6 +24,8 @@ from catap.bindings._coreaudio import (
 )
 
 type _WorkerItem = tuple[bytes, int] | None
+
+_DEFAULT_MAX_PENDING_BUFFERS = 256
 
 
 def _combine_errors(
@@ -291,13 +294,17 @@ class AudioRecorder:
         self._io_proc_id: ctypes.c_void_p | None = None
         self._is_recording = False
         self._lock = threading.Lock()
+        self._max_pending_buffers = _DEFAULT_MAX_PENDING_BUFFERS
         self._worker_thread: threading.Thread | None = None
-        self._work_queue: queue.SimpleQueue[_WorkerItem] | None = None
+        self._work_queue: queue.Queue[_WorkerItem] | None = None
         self._writer_error: OSError | None = None
         self._callback_error: RuntimeError | None = None
+        self._output_file: BinaryIO | None = None
         self._wav_file: wave.Wave_write | None = None
 
         self._total_frames = 0
+        self._dropped_buffers = 0
+        self._dropped_frames = 0
 
         # Stream format (populated on start).
         self._sample_rate = 44100.0
@@ -355,11 +362,9 @@ class AudioRecorder:
                     else:
                         num_frames = 0
 
-                    with self._lock:
-                        self._total_frames += num_frames
-
-                    if self._work_queue is not None:
-                        self._work_queue.put((data, num_frames))
+                    if self._enqueue_audio_data(data, num_frames):
+                        with self._lock:
+                            self._total_frames += num_frames
 
         except Exception:
             # Must not raise from a Core Audio callback.
@@ -521,25 +526,54 @@ class AudioRecorder:
 
         self._writer_error = None
         self._callback_error = None
+        with self._lock:
+            self._dropped_buffers = 0
+            self._dropped_frames = 0
 
         if self.output_path is not None:
-            # The wave file outlives this function; it is closed by the
-            # worker thread's finally block in _worker_loop.
-            wav_file = wave.open(str(self.output_path), "wb")  # noqa: SIM115
-            wav_file.setnchannels(self._num_channels)
-            wav_file.setsampwidth(self._output_bits_per_sample // 8)
-            wav_file.setframerate(int(self._sample_rate))
+            output_file = self.output_path.open("wb")
+            wav_file: wave.Wave_write | None = None
+            try:
+                # The wave file outlives this function; it is closed by the
+                # worker thread's finally block in _worker_loop.
+                wav_file = wave.open(output_file, "wb")  # noqa: SIM115
+                wav_file.setnchannels(self._num_channels)
+                wav_file.setsampwidth(self._output_bits_per_sample // 8)
+                wav_file.setframerate(int(self._sample_rate))
+            except Exception:
+                if wav_file is not None:
+                    with contextlib.suppress(Exception):
+                        wav_file.close()
+                output_file.close()
+                raise
+            self._output_file = output_file
             self._wav_file = wav_file
         else:
+            self._output_file = None
             self._wav_file = None
 
-        self._work_queue = queue.SimpleQueue()
+        self._work_queue = queue.Queue(maxsize=self._max_pending_buffers)
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
             name="catap-audio-worker",
             daemon=True,
         )
         self._worker_thread.start()
+
+    def _enqueue_audio_data(self, audio_data: bytes, num_frames: int) -> bool:
+        """Queue audio work without blocking the Core Audio callback thread."""
+        if self._work_queue is None:
+            return True
+
+        try:
+            self._work_queue.put_nowait((audio_data, num_frames))
+        except queue.Full:
+            with self._lock:
+                self._dropped_buffers += 1
+                self._dropped_frames += num_frames
+            return False
+
+        return True
 
     def _stop_worker(self) -> None:
         """Flush and stop the background worker."""
@@ -559,6 +593,21 @@ class AudioRecorder:
         if self._callback_error is not None:
             worker_errors.append(self._callback_error)
             self._callback_error = None
+        with self._lock:
+            dropped_buffers = self._dropped_buffers
+            dropped_frames = self._dropped_frames
+            self._dropped_buffers = 0
+            self._dropped_frames = 0
+        if dropped_buffers > 0:
+            worker_errors.append(
+                RuntimeError(
+                    "Dropped "
+                    f"{dropped_buffers} audio buffer(s) "
+                    f"({dropped_frames} frame(s)) because the background worker "
+                    "fell behind. Try a faster output path or a lighter on_data "
+                    "callback."
+                )
+            )
 
         if worker_errors:
             raise _combine_errors("Failed to finalize audio worker", worker_errors)
@@ -604,6 +653,16 @@ class AudioRecorder:
                         )
                 finally:
                     self._wav_file = None
+            if self._output_file is not None:
+                try:
+                    self._output_file.close()
+                except Exception as exc:
+                    if self._writer_error is None:
+                        self._writer_error = OSError(
+                            f"Failed to close output file: {exc}"
+                        )
+                finally:
+                    self._output_file = None
 
     @property
     def is_recording(self) -> bool:

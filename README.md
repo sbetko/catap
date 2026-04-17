@@ -47,7 +47,7 @@ catap list-apps
 # List all audio processes (including idle ones)
 catap list-apps --all
 
-# Record from an application (partial name match, case-insensitive)
+# Record from an application (exact or uniquely partial name match, case-insensitive)
 catap record Safari -o ~/safari_audio.wav
 
 # Record for a specific duration
@@ -89,6 +89,9 @@ session = record_process("Safari", output_path="output.wav")
 session.record_for(5)
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
+
+If a process query matches more than one audio process, `catap` now reports the
+candidate processes instead of picking one arbitrarily.
 
 For advanced use cases, the low-level API is still available:
 

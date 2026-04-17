@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 import catap.session as session_module
-from catap.bindings.process import AudioProcess
+from catap.bindings.process import AmbiguousAudioProcessError, AudioProcess
 from catap.bindings.tap_description import TapDescription
 
 
@@ -150,6 +150,21 @@ def test_record_process_raises_for_missing_process_name(
         match="No audio process found matching 'Missing'",
     ):
         session_module.record_process("Missing")
+
+
+def test_record_process_propagates_ambiguous_process_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    _patch_session_symbols(monkeypatch)
+
+    def _raise_ambiguous(name: str) -> AudioProcess | None:
+        raise AmbiguousAudioProcessError(name, [process, process])
+
+    monkeypatch.setattr(session_module, "find_process_by_name", _raise_ambiguous)
+
+    with pytest.raises(AmbiguousAudioProcessError, match="Multiple audio processes"):
+        session_module.record_process("Music")
 
 
 def test_recording_session_start_cleans_up_tap_on_failure(

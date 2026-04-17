@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import queue
 import struct
 import threading
 import wave
@@ -61,6 +62,17 @@ def test_writer_preserves_int16_audio(tmp_path) -> None:
     assert samples == (100, -200, 300)
 
 
+def test_start_worker_raises_cleanly_for_missing_output_directory(tmp_path) -> None:
+    output_path = tmp_path / "missing" / "recording.wav"
+    recorder = AudioRecorder(123, output_path)
+
+    with pytest.raises(FileNotFoundError):
+        recorder._start_worker()
+
+    assert recorder._wav_file is None
+    assert recorder._output_file is None
+
+
 def test_worker_invokes_callback_off_thread() -> None:
     callback_threads: list[str] = []
     callback_event = threading.Event()
@@ -81,6 +93,39 @@ def test_worker_invokes_callback_off_thread() -> None:
     recorder._stop_worker()
 
     assert callback_threads == ["catap-audio-worker"]
+
+
+def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
+    callback_started = threading.Event()
+    allow_callback_to_finish = threading.Event()
+
+    def on_data(data: bytes, num_frames: int) -> None:
+        del data, num_frames
+        callback_started.set()
+        assert allow_callback_to_finish.wait(timeout=1)
+
+    recorder = AudioRecorder(123, on_data=on_data)
+    recorder._max_pending_buffers = 1
+    recorder._is_recording = True
+    recorder._work_queue = queue.Queue(maxsize=recorder._max_pending_buffers)
+    recorder._worker_thread = threading.Thread(
+        target=recorder._worker_loop,
+        name="catap-audio-worker",
+        daemon=True,
+    )
+    recorder._worker_thread.start()
+
+    assert recorder._enqueue_audio_data(b"\x00\x01", 1) is True
+    assert callback_started.wait(timeout=1)
+    assert recorder._enqueue_audio_data(b"\x02\x03", 1) is True
+    assert recorder._enqueue_audio_data(b"\x04\x05", 2) is False
+
+    allow_callback_to_finish.set()
+
+    with pytest.raises(RuntimeError, match="Dropped 1 audio buffer") as exc_info:
+        recorder._stop_worker()
+
+    assert "2 frame(s)" in str(exc_info.value)
 
 
 def test_stop_reports_core_audio_cleanup_failures(

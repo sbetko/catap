@@ -17,6 +17,7 @@ def _purge_catap_modules() -> None:
 def test_module_has_expected_exports() -> None:
     module = importlib.import_module("catap")
 
+    assert "AmbiguousAudioProcessError" in module.__all__
     assert "TapDescription" in module.__all__
     assert "AudioRecorder" in module.__all__
     assert "RecordingSession" in module.__all__
@@ -36,6 +37,10 @@ def test_public_exports_reference_expected_symbols() -> None:
     assert module.AudioRecorder is recorder_module.AudioRecorder
     assert module.TapDescription is tap_module.TapDescription
     assert module.TapMuteBehavior is tap_module.TapMuteBehavior
+    assert (
+        module.AmbiguousAudioProcessError
+        is process_module.AmbiguousAudioProcessError
+    )
     assert module.AudioProcess is process_module.AudioProcess
     assert module.list_audio_processes is process_module.list_audio_processes
     assert module.find_process_by_name is process_module.find_process_by_name

@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Self
 
 from catap.bindings.hardware import create_process_tap, destroy_process_tap
-from catap.bindings.process import AudioProcess, find_process_by_name
+from catap.bindings.process import (
+    AmbiguousAudioProcessError,
+    AudioProcess,
+    find_process_by_name,
+)
 from catap.bindings.tap_description import TapDescription, TapMuteBehavior
 from catap.core.recorder import AudioRecorder
 
@@ -374,6 +378,7 @@ def record_system_audio(
 
 
 __all__ = [
+    "AmbiguousAudioProcessError",
     "AudioProcessNotFoundError",
     "RecordingSession",
     "record_process",
