@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -56,8 +57,12 @@ class RecordingSession:
         Args:
             tap_description: Tap description to create when recording starts
             output_path: Path to write a WAV file, or None for streaming mode
-            on_data: Optional callback for each audio buffer (bytes, num_frames).
-                The callback runs on a background worker thread.
+            on_data: Optional callback invoked with ``(raw_bytes, num_frames)``
+                for each captured buffer. The bytes are the tap's native
+                format (typically 32-bit float, little-endian, interleaved);
+                inspect the session's ``sample_rate``, ``num_channels``, and
+                ``is_float`` to interpret them. Runs on catap's background
+                worker thread, not on Core Audio's real-time callback thread.
         """
         self.tap_description = tap_description
         self.output_path = Path(output_path) if output_path else None
@@ -77,7 +82,7 @@ class RecordingSession:
         *,
         mute: bool = False,
         on_data: Callable[[bytes, int], None] | None = None,
-    ) -> RecordingSession:
+    ) -> Self:
         """
         Create a managed session for recording one application's audio.
 
@@ -85,8 +90,12 @@ class RecordingSession:
             process: Application name or AudioProcess to record
             output_path: Path to write a WAV file, or None for streaming mode
             mute: Mute app playback while still capturing audio
-            on_data: Optional callback for each audio buffer (bytes, num_frames).
-                The callback runs on a background worker thread.
+            on_data: Optional callback invoked with ``(raw_bytes, num_frames)``
+                for each captured buffer. The bytes are the tap's native
+                format (typically 32-bit float, little-endian, interleaved);
+                inspect the session's ``sample_rate``, ``num_channels``, and
+                ``is_float`` to interpret them. Runs on catap's background
+                worker thread, not on Core Audio's real-time callback thread.
 
         Raises:
             AudioProcessNotFoundError: If the named app cannot be found
@@ -113,15 +122,19 @@ class RecordingSession:
         *,
         exclude: Sequence[str | AudioProcess] = (),
         on_data: Callable[[bytes, int], None] | None = None,
-    ) -> RecordingSession:
+    ) -> Self:
         """
         Create a managed session for recording system audio.
 
         Args:
             output_path: Path to write a WAV file, or None for streaming mode
             exclude: Apps to exclude from the system capture
-            on_data: Optional callback for each audio buffer (bytes, num_frames).
-                The callback runs on a background worker thread.
+            on_data: Optional callback invoked with ``(raw_bytes, num_frames)``
+                for each captured buffer. The bytes are the tap's native
+                format (typically 32-bit float, little-endian, interleaved);
+                inspect the session's ``sample_rate``, ``num_channels``, and
+                ``is_float`` to interpret them. Runs on catap's background
+                worker thread, not on Core Audio's real-time callback thread.
 
         Raises:
             AudioProcessNotFoundError: If an excluded app name cannot be found
@@ -207,10 +220,8 @@ class RecordingSession:
             self._recorder = recorder
             recorder.start()
         except Exception:
-            try:
+            with contextlib.suppress(OSError):
                 destroy_process_tap(tap_id)
-            except OSError:
-                pass
             self._tap_id = None
             self._recorder = None
             raise
@@ -298,7 +309,7 @@ class RecordingSession:
 
         return None
 
-    def __enter__(self) -> RecordingSession:
+    def __enter__(self) -> Self:
         """Start recording when entering a context manager."""
         self.start()
         return self
@@ -309,15 +320,16 @@ class RecordingSession:
         exc: BaseException | None,
         traceback: object | None,
     ) -> bool:
-        """Always close the session when leaving a context manager."""
-        if exc_type is None:
-            self.close()
-        else:
-            try:
-                self.close()
-            except Exception:
-                pass
+        """Always close the session when leaving a context manager.
 
+        If the ``with`` block raised, we suppress close() errors so the
+        original exception isn't masked.
+        """
+        try:
+            self.close()
+        except Exception:
+            if exc_type is None:
+                raise
         return False
 
 

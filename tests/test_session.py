@@ -218,3 +218,36 @@ def test_record_for_starts_and_closes_session(
     assert session.is_recording is False
     assert slept == [2.5]
     assert destroyed_tap_ids == [77]
+
+
+def test_record_for_propagates_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed_tap_ids: list[int] = []
+    slept: list[float] = []
+    _patch_session_symbols(
+        monkeypatch,
+        recorder_cls=_StartFailingRecorder,
+        destroyed_tap_ids=destroyed_tap_ids,
+    )
+    monkeypatch.setattr(session_module.time, "sleep", slept.append)
+
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42]))
+    )
+
+    with pytest.raises(OSError, match="boom"):
+        session.record_for(1.5)
+
+    assert slept == []
+    assert session.tap_id is None
+    assert session.recorder is None
+    assert destroyed_tap_ids == [77]
+
+
+def test_record_for_rejects_non_positive_duration() -> None:
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42]))
+    )
+    with pytest.raises(ValueError, match="duration must be greater than 0"):
+        session.record_for(0)

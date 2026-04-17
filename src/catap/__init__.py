@@ -44,16 +44,16 @@ except PackageNotFoundError:
     __version__ = "0.0.0"
 
 __all__ = [
+    "AudioProcess",
+    "AudioProcessNotFoundError",
+    "AudioRecorder",
+    "RecordingSession",
     "TapDescription",
     "TapMuteBehavior",
     "create_process_tap",
     "destroy_process_tap",
-    "AudioProcess",
-    "list_audio_processes",
     "find_process_by_name",
-    "AudioRecorder",
-    "AudioProcessNotFoundError",
-    "RecordingSession",
+    "list_audio_processes",
     "record_process",
     "record_system_audio",
 ]

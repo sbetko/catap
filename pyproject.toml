@@ -50,11 +50,17 @@ catap = "catap.cli:main"
 requires = ["uv_build>=0.10.8,<0.11.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+source-include = ["CHANGELOG.md", "RELEASE.md"]
+
 [tool.ruff]
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "PERF"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
 
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"

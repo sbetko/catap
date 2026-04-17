@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import array
 import ctypes
 import queue
-import struct
 import threading
 import uuid
 import wave
@@ -14,16 +14,15 @@ from typing import TYPE_CHECKING
 
 from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
-from catap.bindings._coreaudio import _CoreAudio
+from catap.bindings._coreaudio import (
+    _CoreAudio,
+    get_property_cfstring,
+    get_property_struct,
+    kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal,
+)
 
 type _WorkerItem = tuple[bytes, int] | None
-
-_CoreFoundation = ctypes.cdll.LoadLibrary(
-    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-)
-_CFRelease = _CoreFoundation.CFRelease
-_CFRelease.argtypes = [ctypes.c_void_p]
-_CFRelease.restype = None
 
 
 def _combine_errors(
@@ -44,11 +43,6 @@ def _combine_errors(
     return combined
 
 
-# =============================================================================
-# Core Audio Type Definitions
-# =============================================================================
-
-
 class AudioTimeStamp(ctypes.Structure):
     """Core Audio AudioTimeStamp structure."""
 
@@ -57,7 +51,7 @@ class AudioTimeStamp(ctypes.Structure):
         ("mHostTime", ctypes.c_uint64),
         ("mRateScalar", ctypes.c_double),
         ("mWordClockTime", ctypes.c_uint64),
-        ("mSMPTETime", ctypes.c_uint8 * 24),  # SMPTETime structure
+        ("mSMPTETime", ctypes.c_uint8 * 24),
         ("mFlags", ctypes.c_uint32),
         ("mReserved", ctypes.c_uint32),
     ]
@@ -74,17 +68,16 @@ class AudioBuffer(ctypes.Structure):
 
 
 class AudioBufferList(ctypes.Structure):
-    """
-    Core Audio AudioBufferList structure.
+    """Core Audio AudioBufferList.
 
-    Note: This is a variable-length structure. The mBuffers array
-    contains mNumberBuffers elements, but we define it with 1 for
-    the base structure size.
+    The trailing ``mBuffers`` array is variable-length; the struct is defined
+    with one slot so its base size is correct, and extra buffers are reached
+    via pointer arithmetic from ``_io_proc``.
     """
 
     _fields_ = [
         ("mNumberBuffers", ctypes.c_uint32),
-        ("mBuffers", AudioBuffer * 1),  # Variable length array
+        ("mBuffers", AudioBuffer * 1),
     ]
 
 
@@ -112,27 +105,13 @@ else:
     AudioBufferListPtr = ctypes.c_void_p
 
 
-# Format constants
-kAudioFormatLinearPCM = int.from_bytes(b"lpcm", "big")
+# Format flags
 kAudioFormatFlagIsFloat = 1 << 0
-kAudioFormatFlagIsBigEndian = 1 << 1
-kAudioFormatFlagIsPacked = 1 << 3
-kAudioFormatFlagIsNonInterleaved = 1 << 5
 
-# Property constants
-kAudioObjectPropertyScopeGlobal = int.from_bytes(b"glob", "big")
-kAudioObjectPropertyScopeInput = int.from_bytes(b"inpt", "big")
-kAudioObjectPropertyElementMain = 0
-kAudioDevicePropertyStreamFormat = int.from_bytes(b"sfmt", "big")
-
-# Tap property constants
+# Tap property selectors
 kAudioTapPropertyUID = int.from_bytes(b"tuid", "big")
 kAudioTapPropertyFormat = int.from_bytes(b"tfmt", "big")
 
-
-# =============================================================================
-# AudioDeviceIOProc callback type
-# =============================================================================
 
 AudioDeviceIOProcType = ctypes.CFUNCTYPE(
     ctypes.c_int32,  # OSStatus return
@@ -146,187 +125,70 @@ AudioDeviceIOProcType = ctypes.CFUNCTYPE(
 )
 
 
-# =============================================================================
-# Core Audio Function Bindings
-# =============================================================================
-
-# Property access functions
-_AudioObjectGetPropertyDataSize = _CoreAudio.AudioObjectGetPropertyDataSize
-_AudioObjectGetPropertyDataSize.argtypes = [
-    ctypes.c_uint32,  # inObjectID
-    ctypes.POINTER(ctypes.c_uint32 * 3),  # inAddress
-    ctypes.c_uint32,  # inQualifierDataSize
-    ctypes.c_void_p,  # inQualifierData
-    ctypes.POINTER(ctypes.c_uint32),  # outDataSize
-]
-_AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
-
-_AudioObjectGetPropertyData = _CoreAudio.AudioObjectGetPropertyData
-_AudioObjectGetPropertyData.argtypes = [
-    ctypes.c_uint32,  # inObjectID
-    ctypes.POINTER(ctypes.c_uint32 * 3),  # inAddress
-    ctypes.c_uint32,  # inQualifierDataSize
-    ctypes.c_void_p,  # inQualifierData
-    ctypes.POINTER(ctypes.c_uint32),  # ioDataSize
-    ctypes.c_void_p,  # outData
-]
-_AudioObjectGetPropertyData.restype = ctypes.c_int32
-
-# Aggregate device functions
 _AudioHardwareCreateAggregateDevice = _CoreAudio.AudioHardwareCreateAggregateDevice
 _AudioHardwareCreateAggregateDevice.argtypes = [
-    ctypes.c_void_p,  # CFDictionaryRef
-    ctypes.POINTER(ctypes.c_uint32),  # AudioObjectID*
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_uint32),
 ]
 _AudioHardwareCreateAggregateDevice.restype = ctypes.c_int32
 
 _AudioHardwareDestroyAggregateDevice = _CoreAudio.AudioHardwareDestroyAggregateDevice
-_AudioHardwareDestroyAggregateDevice.argtypes = [
-    ctypes.c_uint32,  # AudioObjectID
-]
+_AudioHardwareDestroyAggregateDevice.argtypes = [ctypes.c_uint32]
 _AudioHardwareDestroyAggregateDevice.restype = ctypes.c_int32
 
-# IO Proc functions
 _AudioDeviceCreateIOProcID = _CoreAudio.AudioDeviceCreateIOProcID
 _AudioDeviceCreateIOProcID.argtypes = [
-    ctypes.c_uint32,  # AudioObjectID
-    AudioDeviceIOProcType,  # AudioDeviceIOProc
-    ctypes.c_void_p,  # void* inClientData
-    ctypes.POINTER(ctypes.c_void_p),  # AudioDeviceIOProcID*
+    ctypes.c_uint32,
+    AudioDeviceIOProcType,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_void_p),
 ]
 _AudioDeviceCreateIOProcID.restype = ctypes.c_int32
 
 _AudioDeviceDestroyIOProcID = _CoreAudio.AudioDeviceDestroyIOProcID
-_AudioDeviceDestroyIOProcID.argtypes = [
-    ctypes.c_uint32,  # AudioObjectID
-    ctypes.c_void_p,  # AudioDeviceIOProcID
-]
+_AudioDeviceDestroyIOProcID.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
 _AudioDeviceDestroyIOProcID.restype = ctypes.c_int32
 
 _AudioDeviceStart = _CoreAudio.AudioDeviceStart
-_AudioDeviceStart.argtypes = [
-    ctypes.c_uint32,  # AudioObjectID
-    ctypes.c_void_p,  # AudioDeviceIOProcID
-]
+_AudioDeviceStart.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
 _AudioDeviceStart.restype = ctypes.c_int32
 
 _AudioDeviceStop = _CoreAudio.AudioDeviceStop
-_AudioDeviceStop.argtypes = [
-    ctypes.c_uint32,  # AudioObjectID
-    ctypes.c_void_p,  # AudioDeviceIOProcID
-]
+_AudioDeviceStop.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
 _AudioDeviceStop.restype = ctypes.c_int32
 
 
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
-
 def _get_tap_uid(tap_id: int) -> str:
-    """
-    Get the UID string for a tap.
-
-    Args:
-        tap_id: AudioObjectID of the tap
-
-    Returns:
-        UID string for the tap
-
-    Raises:
-        OSError: If UID cannot be retrieved
-    """
-    address = (ctypes.c_uint32 * 3)(
+    """Return the UID string for a tap."""
+    uid = get_property_cfstring(
+        tap_id,
         kAudioTapPropertyUID,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain,
     )
-
-    # Get size - should be pointer size for CFStringRef
-    size = ctypes.c_uint32(0)
-    status = _AudioObjectGetPropertyDataSize(
-        tap_id, ctypes.byref(address), 0, None, ctypes.byref(size)
-    )
-
-    if status != 0:
-        raise OSError(f"Failed to get tap UID size: status {status}")
-
-    # Get the CFStringRef
-    cf_string_ref = ctypes.c_void_p()
-    actual_size = ctypes.c_uint32(ctypes.sizeof(cf_string_ref))
-
-    status = _AudioObjectGetPropertyData(
-        tap_id,
-        ctypes.byref(address),
-        0,
-        None,
-        ctypes.byref(actual_size),
-        ctypes.byref(cf_string_ref),
-    )
-
-    if status != 0:
-        raise OSError(f"Failed to get tap UID: status {status}")
-
-    # Convert CFStringRef to Python string using PyObjC
-    import objc
-
-    try:
-        ns_string = objc.objc_object(c_void_p=cf_string_ref.value)  # ty: ignore[unresolved-attribute]
-        return str(ns_string)
-    finally:
-        _CFRelease(cf_string_ref)
+    if uid is None:
+        raise OSError(f"Tap {tap_id} reported an empty UID")
+    return uid
 
 
 def get_tap_format(tap_id: int) -> AudioStreamBasicDescription:
-    """
-    Get the audio format for a tap.
-
-    Args:
-        tap_id: AudioObjectID of the tap
-
-    Returns:
-        AudioStreamBasicDescription with format info
-
-    Raises:
-        OSError: If format cannot be retrieved
-    """
-    address = (ctypes.c_uint32 * 3)(
+    """Return the audio format for a tap."""
+    result = get_property_struct(
+        tap_id,
         kAudioTapPropertyFormat,
+        AudioStreamBasicDescription,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain,
     )
-
-    asbd = AudioStreamBasicDescription()
-    size = ctypes.c_uint32(ctypes.sizeof(asbd))
-
-    status = _AudioObjectGetPropertyData(
-        tap_id, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(asbd)
-    )
-
-    if status != 0:
-        raise OSError(f"Failed to get tap format: status {status}")
-
-    return asbd
+    # get_property_struct returns ctypes.Structure; narrow for callers.
+    assert isinstance(result, AudioStreamBasicDescription)
+    return result
 
 
 def _create_aggregate_device_for_tap(tap_uid: str, name: str) -> int:
-    """
-    Create an aggregate device that includes the specified tap.
-
-    Args:
-        tap_uid: UID of the tap to include
-        name: Name for the aggregate device
-
-    Returns:
-        AudioObjectID of the created aggregate device
-
-    Raises:
-        OSError: If device creation fails
-    """
-    # Create unique UID for aggregate device
+    """Create an aggregate device that includes the specified tap."""
     agg_uid = f"io.github.catap.aggregate.{uuid.uuid4()}"
 
-    # Build the tap list with the tap UID
     tap_entry = NSDictionary.dictionaryWithDictionary_(
         {
             "uid": tap_uid,
@@ -335,7 +197,6 @@ def _create_aggregate_device_for_tap(tap_uid: str, name: str) -> int:
     )
     tap_list = NSArray.arrayWithObject_(tap_entry)
 
-    # Build aggregate device description
     description = NSDictionary.dictionaryWithDictionary_(
         {
             "name": name,
@@ -346,14 +207,9 @@ def _create_aggregate_device_for_tap(tap_uid: str, name: str) -> int:
         }
     )
 
-    # Get the CFDictionary pointer
-
     cf_dict_ptr = description.__c_void_p__()
-
-    # Create the aggregate device
     device_id = ctypes.c_uint32(0)
     status = _AudioHardwareCreateAggregateDevice(cf_dict_ptr, ctypes.byref(device_id))
-
     if status != 0:
         raise OSError(f"Failed to create aggregate device: status {status}")
 
@@ -361,28 +217,35 @@ def _create_aggregate_device_for_tap(tap_uid: str, name: str) -> int:
 
 
 def _destroy_aggregate_device(device_id: int) -> None:
-    """
-    Destroy an aggregate device.
-
-    Args:
-        device_id: AudioObjectID of the device to destroy
-
-    Raises:
-        OSError: If destruction fails
-    """
+    """Destroy an aggregate device."""
     status = _AudioHardwareDestroyAggregateDevice(device_id)
     if status != 0:
         raise OSError(f"Failed to destroy aggregate device: status {status}")
 
 
-# =============================================================================
-# AudioRecorder Class
-# =============================================================================
+def _float32_to_int16(data: bytes) -> bytes:
+    """Convert 32-bit float audio samples to 16-bit signed integer samples.
+
+    Uses ``array`` for bulk unpack/pack rather than per-sample ``struct``
+    calls. Samples outside [-1.0, 1.0] are clipped symmetrically to
+    [-32767, 32767].
+    """
+    floats = array.array("f")
+    floats.frombytes(data)
+    ints = array.array(
+        "h",
+        (
+            32767
+            if f >= 1.0
+            else (-32767 if f <= -1.0 else int(f * 32767))
+            for f in floats
+        ),
+    )
+    return ints.tobytes()
 
 
 class AudioRecorder:
-    """
-    Records audio from a Core Audio tap to a WAV file.
+    """Records audio from a Core Audio tap to a WAV file.
 
     This recorder creates an aggregate device containing the tap,
     which is required by Core Audio to read audio data from taps.
@@ -407,24 +270,24 @@ class AudioRecorder:
         output_path: str | Path | None = None,
         on_data: Callable[[bytes, int], None] | None = None,
     ) -> None:
-        """
-        Initialize the recorder.
+        """Initialize the recorder.
 
         Args:
             tap_id: AudioObjectID of the tap to record from
             output_path: Path to write the WAV file, or None for streaming mode
-            on_data: Optional callback for each audio buffer (bytes, num_frames).
-                The callback runs on catap's background worker thread, not on
-                Core Audio's real-time callback thread.
+            on_data: Optional callback invoked with ``(raw_bytes, num_frames)``
+                for each captured buffer. The bytes are the tap's native format
+                (typically 32-bit float, little-endian, interleaved); inspect
+                ``sample_rate``, ``num_channels``, and ``is_float`` to interpret
+                them. The callback runs on catap's background worker thread, so
+                Core Audio's real-time callback stays lightweight.
         """
         self.tap_id = tap_id
         self.output_path = Path(output_path) if output_path else None
         self._on_data = on_data
 
-        # Aggregate device (created on start)
         self._aggregate_device_id: int | None = None
 
-        # Recording state
         self._io_proc_id: ctypes.c_void_p | None = None
         self._is_recording = False
         self._lock = threading.Lock()
@@ -436,7 +299,7 @@ class AudioRecorder:
 
         self._total_frames = 0
 
-        # Stream format (populated on start)
+        # Stream format (populated on start).
         self._sample_rate = 44100.0
         self._num_channels = 2
         self._bits_per_sample = 32
@@ -444,7 +307,7 @@ class AudioRecorder:
         self._convert_float_output = True
         self._is_float = True
 
-        # Keep reference to callback to prevent garbage collection
+        # Keep reference to callback to prevent garbage collection.
         self._callback = AudioDeviceIOProcType(self._io_proc)
 
     def _io_proc(
@@ -457,12 +320,7 @@ class AudioRecorder:
         output_time: AudioTimeStampPtr,
         client_data: ctypes.c_void_p,
     ) -> int:
-        """
-        Audio I/O callback - called on the audio thread.
-
-        This is called by Core Audio when audio data is available.
-        We copy the input data and return immediately to avoid blocking.
-        """
+        """Audio I/O callback - called on the Core Audio real-time thread."""
         if not self._is_recording:
             return 0
 
@@ -476,11 +334,9 @@ class AudioRecorder:
             if num_buffers == 0:
                 return 0
 
-            # Process all buffers (usually just one for stereo mixdown)
             for i in range(num_buffers):
-                # Access buffer at index i
-                # The AudioBufferList has a variable-length array, so we need
-                # to calculate the offset manually
+                # AudioBufferList has a variable-length mBuffers array; index
+                # past the first slot via pointer arithmetic.
                 buffer_offset = ctypes.sizeof(AudioBuffer) * i
                 buffer_ptr = ctypes.cast(
                     ctypes.addressof(buffer_list.mBuffers) + buffer_offset,
@@ -489,10 +345,8 @@ class AudioRecorder:
                 buffer = buffer_ptr.contents
 
                 if buffer.mData and buffer.mDataByteSize > 0:
-                    # Copy audio data from the buffer
                     data = ctypes.string_at(buffer.mData, buffer.mDataByteSize)
 
-                    # Calculate number of frames
                     bytes_per_frame = buffer.mNumberChannels * (
                         self._bits_per_sample // 8
                     )
@@ -508,14 +362,13 @@ class AudioRecorder:
                         self._work_queue.put((data, num_frames))
 
         except Exception:
-            # Must not raise from callback
+            # Must not raise from a Core Audio callback.
             pass
 
         return 0  # noErr
 
     def start(self) -> None:
-        """
-        Start recording audio.
+        """Start recording audio.
 
         Raises:
             OSError: If recording cannot be started
@@ -524,10 +377,8 @@ class AudioRecorder:
         if self._is_recording:
             raise RuntimeError("Already recording")
 
-        # Get tap UID
         tap_uid = _get_tap_uid(self.tap_id)
 
-        # Get stream format from tap
         try:
             asbd = get_tap_format(self.tap_id)
             self._sample_rate = asbd.mSampleRate
@@ -535,7 +386,7 @@ class AudioRecorder:
             self._bits_per_sample = asbd.mBitsPerChannel
             self._is_float = bool(asbd.mFormatFlags & kAudioFormatFlagIsFloat)
         except OSError:
-            # Use defaults if we can't get format
+            # Use defaults if we can't get format.
             pass
 
         self._output_bits_per_sample = (
@@ -548,7 +399,6 @@ class AudioRecorder:
         if self.output_path is not None or self._on_data is not None:
             self._start_worker()
 
-        # Create aggregate device containing the tap
         try:
             self._aggregate_device_id = _create_aggregate_device_for_tap(
                 tap_uid, "catap Recording Device"
@@ -557,12 +407,11 @@ class AudioRecorder:
             self._stop_worker()
             raise
 
-        # Create IO proc on the aggregate device
         io_proc_id = ctypes.c_void_p()
         status = _AudioDeviceCreateIOProcID(
             self._aggregate_device_id,
             self._callback,
-            None,  # client data
+            None,
             ctypes.byref(io_proc_id),
         )
 
@@ -586,11 +435,9 @@ class AudioRecorder:
 
         self._io_proc_id = io_proc_id
 
-        # Clear any previous data
         with self._lock:
             self._total_frames = 0
 
-        # Start device
         self._is_recording = True
         status = _AudioDeviceStart(self._aggregate_device_id, self._io_proc_id)
 
@@ -623,8 +470,7 @@ class AudioRecorder:
             raise error
 
     def stop(self) -> None:
-        """
-        Stop recording and finalize any WAV output.
+        """Stop recording and finalize any WAV output.
 
         Raises:
             OSError: If Core Audio cleanup fails
@@ -636,7 +482,6 @@ class AudioRecorder:
         self._is_recording = False
         cleanup_errors: list[OSError | RuntimeError] = []
 
-        # Stop device
         if self._io_proc_id and self._aggregate_device_id:
             stop_status = _AudioDeviceStop(self._aggregate_device_id, self._io_proc_id)
             if stop_status != 0:
@@ -654,7 +499,6 @@ class AudioRecorder:
 
             self._io_proc_id = None
 
-        # Destroy aggregate device
         if self._aggregate_device_id:
             try:
                 _destroy_aggregate_device(self._aggregate_device_id)
@@ -679,7 +523,9 @@ class AudioRecorder:
         self._callback_error = None
 
         if self.output_path is not None:
-            wav_file = wave.open(str(self.output_path), "wb")
+            # The wave file outlives this function; it is closed by the
+            # worker thread's finally block in _worker_loop.
+            wav_file = wave.open(str(self.output_path), "wb")  # noqa: SIM115
             wav_file.setnchannels(self._num_channels)
             wav_file.setsampwidth(self._output_bits_per_sample // 8)
             wav_file.setframerate(int(self._sample_rate))
@@ -740,7 +586,7 @@ class AudioRecorder:
                 if self._wav_file is not None and self._writer_error is None:
                     try:
                         output_data = (
-                            self._float32_to_int16(audio_data)
+                            _float32_to_int16(audio_data)
                             if self._convert_float_output
                             else audio_data
                         )
@@ -758,22 +604,6 @@ class AudioRecorder:
                         )
                 finally:
                     self._wav_file = None
-
-    def _float32_to_int16(self, data: bytes) -> bytes:
-        """Convert 32-bit float audio to 16-bit integer."""
-        # Parse as floats
-        num_samples = len(data) // 4
-        floats = struct.unpack(f"<{num_samples}f", data)
-
-        # Convert to int16 with clipping
-        int16_samples = []
-        for f in floats:
-            # Clip to [-1.0, 1.0]
-            f = max(-1.0, min(1.0, f))
-            # Scale to int16 range
-            int16_samples.append(int(f * 32767))
-
-        return struct.pack(f"<{num_samples}h", *int16_samples)
 
     @property
     def is_recording(self) -> bool:

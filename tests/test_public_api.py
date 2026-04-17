@@ -60,7 +60,7 @@ def test_import_raises_on_non_macos(monkeypatch: pytest.MonkeyPatch) -> None:
 
     try:
         with pytest.raises(
-            ImportError, match="catap only supports macOS 14.2 or later."
+            ImportError, match=r"catap only supports macOS 14\.2 or later\."
         ):
             importlib.import_module("catap")
     finally:
@@ -78,7 +78,7 @@ def test_import_raises_on_old_macos(monkeypatch: pytest.MonkeyPatch) -> None:
     try:
         with pytest.raises(
             ImportError,
-            match=r"catap requires macOS 14.2 or later. Detected macOS 13.6.7.",
+            match=r"catap requires macOS 14\.2 or later\. Detected macOS 13\.6\.7\.",
         ):
             importlib.import_module("catap")
     finally:

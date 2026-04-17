@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import signal
 import sys
-import time
+import threading
 from collections.abc import Sequence
 
 from catap import (
@@ -139,117 +140,109 @@ def _list_apps(show_all: bool) -> int:
     return 0
 
 
-def _record(
-    app_name: str | None,
-    *,
-    system: bool,
+def _build_app_tap(app_name: str, mute: bool) -> TapDescription | None:
+    process = find_process_by_name(app_name)
+    if not process:
+        all_processes = list_audio_processes()
+        message_lines = [f"No audio process found matching '{app_name}'"]
+        if all_processes:
+            message_lines.append("")
+            message_lines.append("Available audio processes:")
+            for listed_process in all_processes[:10]:
+                status = "outputting" if listed_process.is_outputting else "idle"
+                message_lines.append(f"  - {listed_process.name} ({status})")
+            if len(all_processes) > 10:
+                message_lines.append(f"  ... and {len(all_processes) - 10} more")
+        print("\n".join(message_lines), file=sys.stderr)
+        return None
+
+    print(f"Recording from: {process.name} (PID: {process.pid})")
+
+    tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
+    tap_desc.name = f"catap recording {process.name}"
+    tap_desc.is_private = True
+
+    if mute:
+        tap_desc.mute_behavior = TapMuteBehavior.MUTED
+        print("Muting app audio during recording")
+    else:
+        tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
+
+    return tap_desc
+
+
+def _build_system_tap(exclude: list[str]) -> TapDescription:
+    exclude_ids: list[int] = []
+    for excluded_app_name in exclude:
+        process = find_process_by_name(excluded_app_name)
+        if process:
+            exclude_ids.append(process.audio_object_id)
+            print(f"Excluding: {process.name} (PID: {process.pid})")
+        else:
+            print(
+                f"Warning: No audio process found matching '{excluded_app_name}'",
+                file=sys.stderr,
+            )
+
+    print("Recording all system audio")
+    tap_desc = TapDescription.stereo_global_tap_excluding(exclude_ids)
+    tap_desc.name = "catap system recording"
+    tap_desc.is_private = True
+    tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
+    return tap_desc
+
+
+def _run_recording_session(
+    tap_desc: TapDescription,
     output: str,
     duration: float | None,
-    mute: bool,
-    exclude: list[str],
 ) -> int:
-    if system:
-        exclude_ids: list[int] = []
-        for excluded_app_name in exclude:
-            process = find_process_by_name(excluded_app_name)
-            if process:
-                exclude_ids.append(process.audio_object_id)
-                print(f"Excluding: {process.name} (PID: {process.pid})")
-            else:
-                print(
-                    f"Warning: No audio process found matching '{excluded_app_name}'",
-                    file=sys.stderr,
-                )
-
-        print("Recording all system audio")
-        print(f"Output: {output}")
-
-        tap_desc = TapDescription.stereo_global_tap_excluding(exclude_ids)
-        tap_desc.name = "catap system recording"
-        tap_desc.is_private = True
-        tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
-    else:
-        assert app_name is not None
-
-        process = find_process_by_name(app_name)
-        if not process:
-            all_processes = list_audio_processes()
-            message_lines = [f"No audio process found matching '{app_name}'"]
-            if all_processes:
-                message_lines.append("")
-                message_lines.append("Available audio processes:")
-                for listed_process in all_processes[:10]:
-                    status = "outputting" if listed_process.is_outputting else "idle"
-                    message_lines.append(f"  - {listed_process.name} ({status})")
-                if len(all_processes) > 10:
-                    message_lines.append(f"  ... and {len(all_processes) - 10} more")
-            print("\n".join(message_lines), file=sys.stderr)
-            return 1
-
-        print(f"Recording from: {process.name} (PID: {process.pid})")
-        print(f"Output: {output}")
-
-        tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
-        tap_desc.name = f"catap recording {process.name}"
-        tap_desc.is_private = True
-
-        if mute:
-            tap_desc.mute_behavior = TapMuteBehavior.MUTED
-            print("Muting app audio during recording")
-        else:
-            tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
-
+    print(f"Output: {output}")
     session = RecordingSession(tap_desc, output)
-    stop_flag = False
+
+    stop_event = threading.Event()
 
     def signal_handler(_sig: int, _frame: object) -> None:
-        nonlocal stop_flag
-        stop_flag = True
+        stop_event.set()
         print("\nStopping recording...")
 
     original_handler = signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        session.start()
-    except OSError as exc:
-        signal.signal(signal.SIGINT, original_handler)
         try:
-            session.close()
-        except OSError:
-            pass
-        print(f"Error starting recording: {exc}", file=sys.stderr)
-        print("", file=sys.stderr)
-        for line in _PERMISSION_HINT:
-            print(line, file=sys.stderr)
-        return 1
+            session.start()
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                session.close()
+            print(f"Error starting recording: {exc}", file=sys.stderr)
+            print("", file=sys.stderr)
+            for line in _PERMISSION_HINT:
+                print(line, file=sys.stderr)
+            return 1
 
-    if session.tap_id is not None:
-        print(f"Created tap (ID: {session.tap_id})")
+        if session.tap_id is not None:
+            print(f"Created tap (ID: {session.tap_id})")
 
-    try:
-        if duration is not None:
-            print(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
-            start_time = time.time()
-            while time.time() - start_time < duration and not stop_flag:
-                time.sleep(0.1)
-        else:
-            print("Recording... (Ctrl+C to stop)")
-            while not stop_flag:
-                time.sleep(0.1)
+        try:
+            if duration is not None:
+                print(f"Recording for {duration} seconds... (Ctrl+C to stop early)")
+                stop_event.wait(duration)
+            else:
+                print("Recording... (Ctrl+C to stop)")
+                stop_event.wait()
 
-        session.stop()
-        print(f"Recorded {session.duration_seconds:.2f} seconds")
-        print(f"Saved to: {output}")
-        return 0
-    except OSError as exc:
-        print(f"Recording error: {exc}", file=sys.stderr)
-        return 1
+            session.stop()
+            print(f"Recorded {session.duration_seconds:.2f} seconds")
+            print(f"Saved to: {output}")
+            return 0
+        except OSError as exc:
+            print(f"Recording error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            with contextlib.suppress(OSError):
+                session.close()
     finally:
         signal.signal(signal.SIGINT, original_handler)
-        try:
-            session.close()
-        except OSError:
-            pass
 
 
 def _exit_code_from_system_exit(exc: SystemExit) -> int:
@@ -267,24 +260,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _list_apps(show_all=args.show_all)
 
         if args.command == "record":
-            if args.system and args.app_name:
-                parser.error("record: APP_NAME cannot be used with --system")
-            if not args.system and not args.app_name:
-                parser.error("record: APP_NAME is required unless --system is set")
-            if args.exclude and not args.system:
-                parser.error("record: --exclude requires --system")
-            if args.mute and args.system:
-                parser.error(
-                    "record: --mute can only be used when recording a single app"
-                )
+            if args.system:
+                if args.app_name:
+                    parser.error("record: APP_NAME cannot be used with --system")
+                if args.mute:
+                    parser.error(
+                        "record: --mute can only be used when recording a single app"
+                    )
+                tap_desc = _build_system_tap(args.exclude)
+            else:
+                if not args.app_name:
+                    parser.error("record: APP_NAME is required unless --system is set")
+                if args.exclude:
+                    parser.error("record: --exclude requires --system")
+                tap_desc = _build_app_tap(args.app_name, args.mute)
+                if tap_desc is None:
+                    return 1
 
-            return _record(
-                args.app_name,
-                system=args.system,
+            return _run_recording_session(
+                tap_desc,
                 output=args.output,
                 duration=args.duration,
-                mute=args.mute,
-                exclude=args.exclude,
             )
 
         parser.error(f"Unknown command: {args.command}")
