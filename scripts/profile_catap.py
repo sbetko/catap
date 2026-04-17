@@ -7,6 +7,7 @@ import argparse
 import array
 import cProfile
 import ctypes
+import gc
 import io
 import json
 import math
@@ -14,24 +15,26 @@ import os
 import platform
 import pstats
 import queue
+import resource
 import statistics
 import sys
 import tempfile
 import time
+import tracemalloc
 import wave
-from collections import Counter
-from collections.abc import Sequence
+from collections import Counter, deque
+from collections.abc import Callable, Sequence
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 from catap import record_system_audio
+from catap.bindings._accelerate import float32_to_int16 as _float32_to_int16
 from catap.bindings.process import list_audio_processes
 from catap.recorder import (
     AudioBuffer,
     AudioBufferList,
     AudioRecorder,
-    _float32_to_int16,
 )
 
 
@@ -50,6 +53,118 @@ def _percentile(values: Sequence[float], percentile: float) -> float:
     return ordered[index]
 
 
+def _rusage_peak_rss_bytes() -> int:
+    """Return the peak RSS high-water mark for this process, in bytes.
+
+    Darwin reports ``ru_maxrss`` in bytes; Linux reports KiB.
+    """
+    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(max_rss)
+    return int(max_rss) * 1024
+
+
+def _cpu_time_seconds() -> float:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return usage.ru_utime + usage.ru_stime
+
+
+def _gc_collections_total() -> int:
+    return sum(generation["collections"] for generation in gc.get_stats())
+
+
+def _summarize_durations_us(times_ns: Sequence[int]) -> dict[str, float]:
+    """Summarize a list of per-call durations (in ns) as microseconds."""
+    if not times_ns:
+        return {
+            "iterations": 0,
+            "mean_us": 0.0,
+            "median_us": 0.0,
+            "p95_us": 0.0,
+            "p99_us": 0.0,
+            "max_us": 0.0,
+        }
+    times_us = [t / 1000.0 for t in times_ns]
+    return {
+        "iterations": len(times_us),
+        "mean_us": round(statistics.mean(times_us), 3),
+        "median_us": round(statistics.median(times_us), 3),
+        "p95_us": round(_percentile(times_us, 0.95), 3),
+        "p99_us": round(_percentile(times_us, 0.99), 3),
+        "max_us": round(max(times_us), 3),
+    }
+
+
+def _measure_timing_distribution(
+    fn: Callable[[], Any], iterations: int
+) -> dict[str, float]:
+    """Time each call individually to expose jitter (p95/p99/max)."""
+    gc.collect()
+    times_ns: list[int] = [0] * iterations
+    perf = time.perf_counter_ns
+    for i in range(iterations):
+        start = perf()
+        fn()
+        times_ns[i] = perf() - start
+    return _summarize_durations_us(times_ns)
+
+
+def _measure_allocations(
+    fn: Callable[[], Any], iterations: int
+) -> dict[str, float | int]:
+    """Measure Python-tracked allocations over ``iterations`` calls.
+
+    tracemalloc perturbs timing, so this pass is kept separate from the
+    timing-distribution pass; call counts are reliable, wall time is not.
+    """
+    gc.collect()
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        current_before, _ = tracemalloc.get_traced_memory()
+        for _ in range(iterations):
+            fn()
+        current_after, peak_after = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    retained = current_after - current_before
+    return {
+        "iterations": iterations,
+        "retained_bytes": int(retained),
+        "retained_bytes_per_call": round(retained / iterations, 3),
+        "peak_tracked_bytes": int(peak_after),
+    }
+
+
+def _measure_resource_usage(
+    fn: Callable[[], Any],
+) -> dict[str, float | int]:
+    """Capture CPU time, wall time, and GC-collection delta for a single run."""
+    gc.collect()
+    gc_before = _gc_collections_total()
+    cpu_before = _cpu_time_seconds()
+    wall_before = time.perf_counter()
+    rss_before = _rusage_peak_rss_bytes()
+
+    fn()
+
+    wall_elapsed = time.perf_counter() - wall_before
+    cpu_elapsed = _cpu_time_seconds() - cpu_before
+    rss_after = _rusage_peak_rss_bytes()
+    gc_delta = _gc_collections_total() - gc_before
+
+    return {
+        "wall_s": round(wall_elapsed, 4),
+        "cpu_s": round(cpu_elapsed, 4),
+        "cpu_utilization_pct": round(
+            (cpu_elapsed / wall_elapsed * 100.0) if wall_elapsed > 0 else 0.0, 1
+        ),
+        "peak_rss_bytes": int(rss_after),
+        "peak_rss_delta_bytes": int(rss_after - rss_before),
+        "gc_collections": int(gc_delta),
+    }
+
+
 def _make_float_buffer(num_frames: int, num_channels: int = 2) -> bytes:
     samples = array.array("f")
     for index in range(num_frames * num_channels):
@@ -66,26 +181,70 @@ def _configure_synthetic_recorder(recorder: AudioRecorder) -> None:
     recorder._convert_float_output = True
 
 
+def _install_pool(
+    recorder: AudioRecorder, depth: int, buffer_bytes: int = 4096
+) -> None:
+    """Populate ``recorder._buffer_pool`` for synthetic io_proc runs.
+
+    Mirrors the production ``_start_worker`` setup so the hot path measures
+    the steady-state ``pool.pop`` / ``memmove`` / enqueue path rather than the
+    drop-on-exhausted path.
+    """
+    pool_type = ctypes.c_char * buffer_bytes
+    recorder._buffer_pool = deque(pool_type() for _ in range(depth))
+
+
+def _make_pool_buffer(data: bytes) -> ctypes.Array[ctypes.c_char]:
+    """Wrap ``data`` in a ctypes array that matches the worker's pool item type."""
+    return (ctypes.c_char * len(data)).from_buffer_copy(data)
+
+
 def _profile_float_conversion() -> dict[str, Any]:
     results: dict[str, Any] = {}
 
     for frames, iterations in ((512, 20_000), (4_096, 3_000)):
         data = _make_float_buffer(frames)
-        start = time.perf_counter()
-        total_output_bytes = 0
-        for _ in range(iterations):
-            total_output_bytes += len(_float32_to_int16(data))
-        elapsed = time.perf_counter() - start
+        captured_total: list[int] = []
+
+        def _run_and_collect(
+            data: bytes = data,
+            iterations: int = iterations,
+            captured_total: list[int] = captured_total,
+        ) -> None:
+            total = 0
+            for _ in range(iterations):
+                total += len(_float32_to_int16(data))
+            captured_total.append(total)
+
+        usage = _measure_resource_usage(_run_and_collect)
+        total_output_bytes = captured_total[0]
         input_megabytes = (len(data) * iterations) / (1024 * 1024)
         audio_seconds = (frames * iterations) / 48_000
+
+        per_call = _measure_timing_distribution(
+            lambda data=data: _float32_to_int16(data),
+            iterations=min(iterations, 5_000),
+        )
+        allocations = _measure_allocations(
+            lambda data=data: _float32_to_int16(data),
+            iterations=min(iterations, 2_000),
+        )
+
         results[f"{frames}_frame_buffers"] = {
             "frames_per_buffer": frames,
             "iterations": iterations,
-            "elapsed_s": round(elapsed, 4),
+            "elapsed_s": usage["wall_s"],
             "input_mb": round(input_megabytes, 2),
-            "throughput_mb_s": round(input_megabytes / elapsed, 2),
-            "realtime_factor": round(audio_seconds / elapsed, 1),
+            "throughput_mb_s": round(input_megabytes / usage["wall_s"], 2)
+            if usage["wall_s"] > 0
+            else 0.0,
+            "realtime_factor": round(audio_seconds / usage["wall_s"], 1)
+            if usage["wall_s"] > 0
+            else 0.0,
             "output_mb": round(total_output_bytes / (1024 * 1024), 2),
+            "resource": usage,
+            "per_call": per_call,
+            "allocations": allocations,
         }
 
     profile = cProfile.Profile()
@@ -117,9 +276,12 @@ def _make_callback_buffer_list(
 def _profile_io_proc() -> dict[str, Any]:
     _, buffer_ptr, _ = _make_callback_buffer_list(512)
 
+    # no_queue path recycles the one pool buffer back on every call via
+    # ``_enqueue_audio_data``'s no-queue short-circuit. A tiny pool is fine.
     recorder = AudioRecorder(1)
     recorder._bits_per_sample = 32
     recorder._is_recording = True
+    _install_pool(recorder, depth=recorder.max_pending_buffers)
 
     iterations = 20_000
     start = time.perf_counter()
@@ -128,22 +290,60 @@ def _profile_io_proc() -> dict[str, Any]:
     elapsed = time.perf_counter() - start
     callback_budget_ms = (512 / 48_000) * 1000
 
+    no_queue_distribution = _measure_timing_distribution(
+        lambda: recorder._io_proc(1, None, buffer_ptr, None, None, None, None),
+        iterations=5_000,
+    )
+    no_queue_allocs = _measure_allocations(
+        lambda: recorder._io_proc(1, None, buffer_ptr, None, None, None, None),
+        iterations=2_000,
+    )
+
     profile = cProfile.Profile()
     profile.enable()
     for _ in range(5_000):
         recorder._io_proc(1, None, buffer_ptr, None, None, None, None)
     profile.disable()
 
+    # with_queue path doesn't recycle: items accumulate in the queue, so the
+    # pool drains by ``queue_iterations`` entries. Size accordingly.
+    queue_iterations = 5_000
     queued = AudioRecorder(1, max_pending_buffers=6_000)
     queued._bits_per_sample = 32
     queued._is_recording = True
     queued._work_queue = queue.Queue(maxsize=6_000)
+    _install_pool(queued, depth=queued.max_pending_buffers)
 
-    queue_iterations = 5_000
     start = time.perf_counter()
     for _ in range(queue_iterations):
         queued._io_proc(1, None, buffer_ptr, None, None, None, None)
     queue_elapsed = time.perf_counter() - start
+    assert queued._work_queue is not None
+    queued_item_count = queued._work_queue.qsize()
+
+    queued_refill = AudioRecorder(1, max_pending_buffers=6_000)
+    queued_refill._bits_per_sample = 32
+    queued_refill._is_recording = True
+    queued_refill._work_queue = queue.Queue(maxsize=6_000)
+    _install_pool(queued_refill, depth=queued_refill.max_pending_buffers)
+    with_queue_distribution = _measure_timing_distribution(
+        lambda: queued_refill._io_proc(
+            1, None, buffer_ptr, None, None, None, None
+        ),
+        iterations=5_000,
+    )
+
+    queued_allocs = AudioRecorder(1, max_pending_buffers=6_000)
+    queued_allocs._bits_per_sample = 32
+    queued_allocs._is_recording = True
+    queued_allocs._work_queue = queue.Queue(maxsize=6_000)
+    _install_pool(queued_allocs, depth=queued_allocs.max_pending_buffers)
+    with_queue_allocs = _measure_allocations(
+        lambda: queued_allocs._io_proc(
+            1, None, buffer_ptr, None, None, None, None
+        ),
+        iterations=2_000,
+    )
 
     return {
         "no_queue": {
@@ -154,6 +354,8 @@ def _profile_io_proc() -> dict[str, Any]:
             "pct_of_budget": round(
                 (((elapsed / iterations) * 1000) / callback_budget_ms) * 100, 3
             ),
+            "per_call": no_queue_distribution,
+            "allocations": no_queue_allocs,
         },
         "with_queue": {
             "iterations": queue_iterations,
@@ -161,7 +363,9 @@ def _profile_io_proc() -> dict[str, Any]:
             "us_per_callback": round(
                 (queue_elapsed / queue_iterations) * 1_000_000, 2
             ),
-            "queued_items": queued._work_queue.qsize(),
+            "queued_items": queued_item_count,
+            "per_call": with_queue_distribution,
+            "allocations": with_queue_allocs,
         },
         "profile": _profile_summary(profile),
     }
@@ -175,31 +379,42 @@ def _profile_worker_wav() -> dict[str, Any]:
     os.close(fd)
     os.unlink(temp_path)
 
-    try:
+    def _run_worker_once() -> None:
         recorder = AudioRecorder(1, temp_path)
         _configure_synthetic_recorder(recorder)
-
-        start = time.perf_counter()
         recorder._start_worker()
         assert recorder._work_queue is not None
+        # Pre-build one ctypes buffer and reuse the reference for every queue
+        # item. The worker's ``_release_pool_buffer`` appends back to the pool;
+        # since there's no io_proc consumer, the pool grows, but the underlying
+        # storage is shared so we aren't allocating per item.
+        shared_buf = _make_pool_buffer(data)
+        byte_count = len(data)
         for _ in range(num_buffers):
-            recorder._work_queue.put((data, frames))
+            recorder._work_queue.put((shared_buf, frames, byte_count))
         recorder._stop_worker()
-        elapsed = time.perf_counter() - start
 
-        input_megabytes = (len(data) * num_buffers) / (1024 * 1024)
-        audio_seconds = (frames * num_buffers) / 48_000
-        thread_results = {
-            "buffers": num_buffers,
-            "audio_s_equivalent": round(audio_seconds, 2),
-            "elapsed_s": round(elapsed, 4),
-            "input_mb_s": round(input_megabytes / elapsed, 2),
-            "realtime_factor": round(audio_seconds / elapsed, 1),
-            "wav_size_mb": round(Path(temp_path).stat().st_size / (1024 * 1024), 2),
-        }
+    try:
+        usage = _measure_resource_usage(_run_worker_once)
+        wav_size_bytes = (
+            Path(temp_path).stat().st_size if os.path.exists(temp_path) else 0
+        )
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+    elapsed = usage["wall_s"]
+    input_megabytes = (len(data) * num_buffers) / (1024 * 1024)
+    audio_seconds = (frames * num_buffers) / 48_000
+    thread_results = {
+        "buffers": num_buffers,
+        "audio_s_equivalent": round(audio_seconds, 2),
+        "elapsed_s": elapsed,
+        "input_mb_s": round(input_megabytes / elapsed, 2) if elapsed > 0 else 0.0,
+        "realtime_factor": round(audio_seconds / elapsed, 1) if elapsed > 0 else 0.0,
+        "wav_size_mb": round(wav_size_bytes / (1024 * 1024), 2),
+        "resource": usage,
+    }
 
     fd, temp_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
@@ -214,8 +429,10 @@ def _profile_worker_wav() -> dict[str, Any]:
         recorder._wav_file.setsampwidth(recorder._output_bits_per_sample // 8)
         recorder._wav_file.setframerate(int(recorder._sample_rate))
         recorder._work_queue = queue.Queue()
+        shared_buf = _make_pool_buffer(data)
+        byte_count = len(data)
         for _ in range(5_000):
-            recorder._work_queue.put((data, frames))
+            recorder._work_queue.put((shared_buf, frames, byte_count))
         recorder._work_queue.put(None)
 
         profile = cProfile.Profile()
@@ -227,8 +444,43 @@ def _profile_worker_wav() -> dict[str, Any]:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+    fd, alloc_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    os.unlink(alloc_path)
+
+    try:
+        alloc_recorder = AudioRecorder(1, alloc_path)
+        _configure_synthetic_recorder(alloc_recorder)
+        alloc_recorder._output_file = Path(alloc_path).open("wb")  # noqa: SIM115
+        alloc_recorder._wav_file = wave.open(alloc_recorder._output_file, "wb")  # noqa: SIM115
+        alloc_recorder._wav_file.setnchannels(alloc_recorder._num_channels)
+        alloc_recorder._wav_file.setsampwidth(
+            alloc_recorder._output_bits_per_sample // 8
+        )
+        alloc_recorder._wav_file.setframerate(int(alloc_recorder._sample_rate))
+        alloc_recorder._work_queue = queue.Queue()
+        buffers_for_alloc = 2_000
+        shared_buf = _make_pool_buffer(data)
+        byte_count = len(data)
+        for _ in range(buffers_for_alloc):
+            alloc_recorder._work_queue.put((shared_buf, frames, byte_count))
+        alloc_recorder._work_queue.put(None)
+
+        def _drain_once() -> None:
+            alloc_recorder._worker_loop()
+
+        allocations = _measure_allocations(_drain_once, iterations=1)
+        allocations["buffers_processed"] = buffers_for_alloc
+        allocations["retained_bytes_per_buffer"] = round(
+            allocations["retained_bytes"] / buffers_for_alloc, 3
+        )
+    finally:
+        if os.path.exists(alloc_path):
+            os.remove(alloc_path)
+
     return {
         "threaded_wav": thread_results,
+        "allocations": allocations,
         "profile": profile_output,
     }
 

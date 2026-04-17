@@ -26,7 +26,9 @@ def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
 
     recorder._start_worker()
     assert recorder._work_queue is not None
-    recorder._work_queue.put((struct.pack("<4f", 0.5, -0.5, 1.0, -1.0), 2))
+    data = struct.pack("<4f", 0.5, -0.5, 1.0, -1.0)
+    buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+    recorder._work_queue.put((buf, 2, len(data)))
     recorder._stop_worker()
 
     with wave.open(str(output_path), "rb") as wav_file:
@@ -50,7 +52,9 @@ def test_writer_preserves_int16_audio(tmp_path) -> None:
 
     recorder._start_worker()
     assert recorder._work_queue is not None
-    recorder._work_queue.put((struct.pack("<3h", 100, -200, 300), 3))
+    data = struct.pack("<3h", 100, -200, 300)
+    buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+    recorder._work_queue.put((buf, 3, len(data)))
     recorder._stop_worker()
 
     with wave.open(str(output_path), "rb") as wav_file:
@@ -92,7 +96,8 @@ def test_worker_invokes_callback_off_thread() -> None:
     recorder._start_worker()
 
     assert recorder._work_queue is not None
-    recorder._work_queue.put((b"\x01\x02", 1))
+    buf = (ctypes.c_char * 2).from_buffer_copy(b"\x01\x02")
+    recorder._work_queue.put((buf, 1, 2))
     assert callback_event.wait(timeout=1)
 
     recorder._stop_worker()
@@ -119,10 +124,20 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
     )
     recorder._worker_thread.start()
 
-    assert recorder._enqueue_audio_data(b"\x00\x01", 1) is True
+    buf_type = ctypes.c_char * 2
+    assert (
+        recorder._enqueue_audio_data(buf_type.from_buffer_copy(b"\x00\x01"), 1, 2)
+        is True
+    )
     assert callback_started.wait(timeout=1)
-    assert recorder._enqueue_audio_data(b"\x02\x03", 1) is True
-    assert recorder._enqueue_audio_data(b"\x04\x05", 2) is False
+    assert (
+        recorder._enqueue_audio_data(buf_type.from_buffer_copy(b"\x02\x03"), 1, 2)
+        is True
+    )
+    assert (
+        recorder._enqueue_audio_data(buf_type.from_buffer_copy(b"\x04\x05"), 2, 2)
+        is False
+    )
 
     allow_callback_to_finish.set()
 

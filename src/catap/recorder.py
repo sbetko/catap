@@ -8,6 +8,7 @@ import queue
 import threading
 import uuid
 import wave
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
@@ -23,9 +24,15 @@ from catap.bindings._coreaudio import (
     kAudioObjectPropertyScopeGlobal,
 )
 
-type _WorkerItem = tuple[bytes, int] | None
+# Pool buffers are ctypes char arrays rather than bytearrays because
+# ``ctypes.memmove`` rejects bytearray/memoryview as source or destination -
+# both the RT-thread ingest memmove and the vDSP conversion's memmove need a
+# ctypes-native buffer.
+type _PoolBuffer = ctypes.Array  # ctypes.c_char * N instance
+type _WorkerItem = tuple[_PoolBuffer, int, int] | None
 
 _DEFAULT_MAX_PENDING_BUFFERS = 256
+_DEFAULT_POOL_BUFFER_SIZE = 4096
 
 
 def _validate_max_pending_buffers(value: int) -> int:
@@ -285,10 +292,13 @@ class AudioRecorder:
 
         self._io_proc_id: ctypes.c_void_p | None = None
         self._is_recording = False
-        self._lock = threading.Lock()
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
         self._worker_thread: threading.Thread | None = None
         self._work_queue: queue.Queue[_WorkerItem] | None = None
+        # Buffer pool recycled between the Core Audio callback and the worker.
+        # RT thread pops; worker appends. CPython's deque makes single-item ops
+        # atomic, so the SPSC path needs no explicit lock.
+        self._buffer_pool: deque[_PoolBuffer] | None = None
         self._writer_error: OSError | None = None
         self._callback_error: RuntimeError | None = None
         self._output_file: BinaryIO | None = None
@@ -344,19 +354,30 @@ class AudioRecorder:
                 buffer = buffer_ptr.contents
 
                 if buffer.mData and buffer.mDataByteSize > 0:
-                    data = ctypes.string_at(buffer.mData, buffer.mDataByteSize)
+                    byte_count = buffer.mDataByteSize
 
                     bytes_per_frame = buffer.mNumberChannels * (
                         self._bits_per_sample // 8
                     )
                     if bytes_per_frame > 0:
-                        num_frames = buffer.mDataByteSize // bytes_per_frame
+                        num_frames = byte_count // bytes_per_frame
                     else:
                         num_frames = 0
 
-                    if self._enqueue_audio_data(data, num_frames):
-                        with self._lock:
-                            self._total_frames += num_frames
+                    buf = self._acquire_pool_buffer(byte_count)
+                    if buf is None:
+                        # Only this RT thread writes these counters, and the
+                        # ``frames_recorded`` reader tolerates a momentary
+                        # stale value, so the increments skip the mutex the
+                        # old code used.
+                        self._dropped_buffers += 1
+                        self._dropped_frames += num_frames
+                        continue
+
+                    ctypes.memmove(buf, buffer.mData, byte_count)
+
+                    if self._enqueue_audio_data(buf, num_frames, byte_count):
+                        self._total_frames += num_frames
 
         except Exception:
             # Must not raise from a Core Audio callback.
@@ -432,8 +453,7 @@ class AudioRecorder:
 
         self._io_proc_id = io_proc_id
 
-        with self._lock:
-            self._total_frames = 0
+        self._total_frames = 0
 
         self._is_recording = True
         status = _AudioDeviceStart(self._aggregate_device_id, self._io_proc_id)
@@ -518,9 +538,8 @@ class AudioRecorder:
 
         self._writer_error = None
         self._callback_error = None
-        with self._lock:
-            self._dropped_buffers = 0
-            self._dropped_frames = 0
+        self._dropped_buffers = 0
+        self._dropped_frames = 0
 
         if self.output_path is not None:
             output_file = self.output_path.open("wb")
@@ -544,6 +563,15 @@ class AudioRecorder:
             self._output_file = None
             self._wav_file = None
 
+        bytes_per_frame = max(
+            1, self._num_channels * (self._bits_per_sample // 8)
+        )
+        pool_buffer_size = max(_DEFAULT_POOL_BUFFER_SIZE, bytes_per_frame * 1024)
+        pool_type = ctypes.c_char * pool_buffer_size
+        self._buffer_pool = deque(
+            pool_type() for _ in range(self._max_pending_buffers)
+        )
+
         self._work_queue = queue.Queue(maxsize=self._max_pending_buffers)
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -552,17 +580,46 @@ class AudioRecorder:
         )
         self._worker_thread.start()
 
-    def _enqueue_audio_data(self, audio_data: bytes, num_frames: int) -> bool:
+    def _acquire_pool_buffer(self, needed: int) -> _PoolBuffer | None:
+        """Return a ctypes buffer sized for ``needed`` bytes, or None if exhausted.
+
+        Called from the Core Audio real-time thread. In steady state the pool
+        is non-empty and buffers are already large enough, so the hot path
+        skips both the allocator and any lock.
+        """
+        pool = self._buffer_pool
+        if pool is None:
+            return None
+        try:
+            buf = pool.pop()
+        except IndexError:
+            return None
+        if len(buf) < needed:
+            # Resize is rare (only on buffer-size change). Still technically an
+            # allocation on the RT thread, but bounded to a few occurrences.
+            buf = (ctypes.c_char * needed)()
+        return buf
+
+    def _release_pool_buffer(self, buf: _PoolBuffer) -> None:
+        """Return a buffer to the pool. Safe to call after _stop_worker."""
+        pool = self._buffer_pool
+        if pool is not None:
+            pool.append(buf)
+
+    def _enqueue_audio_data(
+        self, buf: _PoolBuffer, num_frames: int, byte_count: int
+    ) -> bool:
         """Queue audio work without blocking the Core Audio callback thread."""
         if self._work_queue is None:
+            self._release_pool_buffer(buf)
             return True
 
         try:
-            self._work_queue.put_nowait((audio_data, num_frames))
+            self._work_queue.put_nowait((buf, num_frames, byte_count))
         except queue.Full:
-            with self._lock:
-                self._dropped_buffers += 1
-                self._dropped_frames += num_frames
+            self._dropped_buffers += 1
+            self._dropped_frames += num_frames
+            self._release_pool_buffer(buf)
             return False
 
         return True
@@ -577,6 +634,7 @@ class AudioRecorder:
 
         self._work_queue = None
         self._worker_thread = None
+        self._buffer_pool = None
 
         worker_errors: list[OSError | RuntimeError] = []
         if self._writer_error is not None:
@@ -585,11 +643,13 @@ class AudioRecorder:
         if self._callback_error is not None:
             worker_errors.append(self._callback_error)
             self._callback_error = None
-        with self._lock:
-            dropped_buffers = self._dropped_buffers
-            dropped_frames = self._dropped_frames
-            self._dropped_buffers = 0
-            self._dropped_frames = 0
+        # The RT thread has already been stopped via ``_AudioDeviceStop`` by
+        # the time this runs, so the dropped counters are no longer mutated
+        # concurrently.
+        dropped_buffers = self._dropped_buffers
+        dropped_frames = self._dropped_frames
+        self._dropped_buffers = 0
+        self._dropped_frames = 0
         if dropped_buffers > 0:
             worker_errors.append(
                 RuntimeError(
@@ -614,26 +674,34 @@ class AudioRecorder:
                 if item is None:
                     break
 
-                audio_data, num_frames = item
+                buf, num_frames, byte_count = item
 
-                if self._on_data is not None and self._callback_error is None:
-                    try:
-                        self._on_data(audio_data, num_frames)
-                    except Exception as exc:
-                        self._callback_error = RuntimeError(
-                            f"Audio data callback failed: {exc}"
-                        )
+                try:
+                    if self._on_data is not None and self._callback_error is None:
+                        # User may stash the buffer, so hand them a private copy
+                        # rather than a pool-owned view.
+                        try:
+                            self._on_data(
+                                bytes(memoryview(buf)[:byte_count]), num_frames
+                            )
+                        except Exception as exc:
+                            self._callback_error = RuntimeError(
+                                f"Audio data callback failed: {exc}"
+                            )
 
-                if self._wav_file is not None and self._writer_error is None:
-                    try:
-                        output_data = (
-                            _float32_to_int16(audio_data)
-                            if self._convert_float_output
-                            else audio_data
-                        )
-                        self._wav_file.writeframesraw(output_data)
-                    except Exception as exc:
-                        self._writer_error = OSError(f"Failed to write WAV data: {exc}")
+                    if self._wav_file is not None and self._writer_error is None:
+                        try:
+                            if self._convert_float_output:
+                                output_data = _float32_to_int16(buf, byte_count)
+                            else:
+                                output_data = memoryview(buf)[:byte_count]
+                            self._wav_file.writeframesraw(output_data)
+                        except Exception as exc:
+                            self._writer_error = OSError(
+                                f"Failed to write WAV data: {exc}"
+                            )
+                finally:
+                    self._release_pool_buffer(buf)
         finally:
             if self._wav_file is not None:
                 try:
@@ -663,9 +731,12 @@ class AudioRecorder:
 
     @property
     def frames_recorded(self) -> int:
-        """Number of audio frames recorded so far."""
-        with self._lock:
-            return self._total_frames
+        """Number of audio frames recorded so far.
+
+        A single attribute load is atomic under CPython's GIL, so no mutex is
+        needed to read the counter the RT callback increments.
+        """
+        return self._total_frames
 
     @property
     def duration_seconds(self) -> float:
