@@ -38,10 +38,13 @@ class _FakeRecorder:
         tap_id: int,
         output_path: Path | None,
         on_data: object = None,
+        *,
+        max_pending_buffers: int = 256,
     ) -> None:
         self.tap_id = tap_id
         self.output_path = output_path
         self.on_data = on_data
+        self.max_pending_buffers = max_pending_buffers
         self.is_recording = False
         self.start_calls = 0
         self.stop_calls = 0
@@ -133,6 +136,7 @@ def test_record_process_context_manager_manages_lifecycle(
         assert active_session.is_recording is True
         assert active_session.recorder is not None
         assert active_session.recorder.output_path == Path("recording.wav")
+        assert active_session.recorder.max_pending_buffers == 256
 
     assert session.tap_id is None
     assert session.is_recording is False
@@ -266,3 +270,35 @@ def test_record_for_rejects_non_positive_duration() -> None:
     )
     with pytest.raises(ValueError, match="duration must be greater than 0"):
         session.record_for(0)
+
+
+def test_record_process_forwards_max_pending_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    _patch_session_symbols(monkeypatch, process_lookup={"Music": process})
+
+    session = session_module.record_process(
+        "Music",
+        output_path="recording.wav",
+        max_pending_buffers=32,
+    )
+
+    assert session.max_pending_buffers == 32
+
+    with session:
+        assert session.recorder is not None
+        assert session.recorder.max_pending_buffers == 32
+
+
+def test_record_process_rejects_non_positive_max_pending_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    _patch_session_symbols(monkeypatch, process_lookup={"Music": process})
+
+    with pytest.raises(
+        ValueError,
+        match="max_pending_buffers must be greater than 0",
+    ):
+        session_module.record_process("Music", max_pending_buffers=0)

@@ -90,6 +90,11 @@ session.record_for(5)
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
 
+By default, `catap` queues up to 256 pending audio buffers before treating a
+slow writer or callback as a capture failure. You can tune this with
+`max_pending_buffers=...` on `record_process`, `record_system_audio`,
+`RecordingSession`, or `AudioRecorder`.
+
 If a process query matches more than one audio process, `catap` now reports the
 candidate processes instead of picking one arbitrarily.
 
@@ -162,12 +167,11 @@ src/catap/
 ├── __init__.py              # Package exports
 ├── __main__.py              # python -m catap entry point
 ├── cli.py                   # argparse CLI commands
+├── recorder.py              # AudioRecorder class
 ├── bindings/
 │   ├── process.py           # Process enumeration (ctypes)
 │   ├── tap_description.py   # CATapDescription wrapper (PyObjC)
 │   └── hardware.py          # Tap create/destroy (ctypes)
-├── core/
-│   └── recorder.py          # AudioRecorder class
 ```
 
 ## Development
@@ -190,7 +194,8 @@ CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
 ```
 
 This opt-in smoke test exercises the real macOS Core Audio bridge without
-making the default test suite flaky.
+making the default test suite flaky. It covers both process enumeration and a
+short real recording that verifies tap startup, shutdown, and WAV finalization.
 
 See [`RELEASE.md`](RELEASE.md) for the release checklist.
 

@@ -28,6 +28,13 @@ type _WorkerItem = tuple[bytes, int] | None
 _DEFAULT_MAX_PENDING_BUFFERS = 256
 
 
+def _validate_max_pending_buffers(value: int) -> int:
+    """Validate and normalize the recorder queue bound."""
+    if value <= 0:
+        raise ValueError("max_pending_buffers must be greater than 0")
+    return value
+
+
 def _combine_errors(
     summary: str, errors: list[OSError | RuntimeError]
 ) -> OSError | RuntimeError:
@@ -272,6 +279,8 @@ class AudioRecorder:
         tap_id: int,
         output_path: str | Path | None = None,
         on_data: Callable[[bytes, int], None] | None = None,
+        *,
+        max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> None:
         """Initialize the recorder.
 
@@ -284,6 +293,10 @@ class AudioRecorder:
                 ``sample_rate``, ``num_channels``, and ``is_float`` to interpret
                 them. The callback runs on catap's background worker thread, so
                 Core Audio's real-time callback stays lightweight.
+            max_pending_buffers: Maximum number of audio buffers to queue for
+                the background worker before new buffers are dropped and the
+                capture fails on stop. Higher values trade memory for tolerance
+                of slow disk writes or ``on_data`` callbacks.
         """
         self.tap_id = tap_id
         self.output_path = Path(output_path) if output_path else None
@@ -294,7 +307,7 @@ class AudioRecorder:
         self._io_proc_id: ctypes.c_void_p | None = None
         self._is_recording = False
         self._lock = threading.Lock()
-        self._max_pending_buffers = _DEFAULT_MAX_PENDING_BUFFERS
+        self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
         self._worker_thread: threading.Thread | None = None
         self._work_queue: queue.Queue[_WorkerItem] | None = None
         self._writer_error: OSError | None = None
@@ -684,6 +697,11 @@ class AudioRecorder:
     def sample_rate(self) -> float:
         """Sample rate in Hz."""
         return self._sample_rate
+
+    @property
+    def max_pending_buffers(self) -> int:
+        """Maximum number of queued audio buffers before overflow."""
+        return self._max_pending_buffers
 
     @property
     def num_channels(self) -> int:

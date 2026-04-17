@@ -31,7 +31,7 @@ from catap.bindings.process import (
     list_audio_processes,
 )
 from catap.bindings.tap_description import TapDescription, TapMuteBehavior
-from catap.core.recorder import AudioRecorder
+from catap.recorder import AudioRecorder
 from catap.session import (
     AudioProcessNotFoundError,
     RecordingSession,

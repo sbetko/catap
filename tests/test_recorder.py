@@ -10,8 +10,8 @@ import wave
 
 import pytest
 
-import catap.core.recorder as recorder_module
-from catap.core.recorder import AudioRecorder
+import catap.recorder as recorder_module
+from catap.recorder import AudioRecorder
 
 
 def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
@@ -73,6 +73,11 @@ def test_start_worker_raises_cleanly_for_missing_output_directory(tmp_path) -> N
     assert recorder._output_file is None
 
 
+def test_recorder_rejects_non_positive_max_pending_buffers() -> None:
+    with pytest.raises(ValueError, match="max_pending_buffers must be greater than 0"):
+        AudioRecorder(123, max_pending_buffers=0)
+
+
 def test_worker_invokes_callback_off_thread() -> None:
     callback_threads: list[str] = []
     callback_event = threading.Event()
@@ -104,10 +109,9 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
         callback_started.set()
         assert allow_callback_to_finish.wait(timeout=1)
 
-    recorder = AudioRecorder(123, on_data=on_data)
-    recorder._max_pending_buffers = 1
+    recorder = AudioRecorder(123, on_data=on_data, max_pending_buffers=1)
     recorder._is_recording = True
-    recorder._work_queue = queue.Queue(maxsize=recorder._max_pending_buffers)
+    recorder._work_queue = queue.Queue(maxsize=recorder.max_pending_buffers)
     recorder._worker_thread = threading.Thread(
         target=recorder._worker_loop,
         name="catap-audio-worker",
@@ -126,6 +130,7 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
         recorder._stop_worker()
 
     assert "2 frame(s)" in str(exc_info.value)
+    assert recorder.max_pending_buffers == 1
 
 
 def test_stop_reports_core_audio_cleanup_failures(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import wave
 
 import pytest
 
@@ -32,3 +33,28 @@ def test_list_audio_processes_smoke() -> None:
         assert isinstance(process.name, str)
         assert process.name
         assert isinstance(process.is_outputting, bool)
+
+
+def test_record_system_audio_smoke(tmp_path) -> None:
+    if not RUN_INTEGRATION:
+        pytest.skip("set CATAP_RUN_INTEGRATION=1 to run integration smoke tests")
+
+    from catap import record_system_audio
+
+    output_path = tmp_path / "integration-recording.wav"
+    session = record_system_audio(
+        output_path=output_path,
+        max_pending_buffers=64,
+    )
+    session.record_for(0.2)
+
+    assert output_path.exists()
+    assert session.sample_rate is not None
+    assert session.num_channels is not None
+    assert session.duration_seconds >= 0.0
+
+    with wave.open(str(output_path), "rb") as wav_file:
+        assert wav_file.getnchannels() > 0
+        assert wav_file.getframerate() > 0
+        assert wav_file.getsampwidth() > 0
+        assert wav_file.getnframes() >= 0

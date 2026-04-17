@@ -24,6 +24,13 @@ uv run --group dev python -m build
 uv run --group dev twine check dist/*
 ```
 
+If the current Mac has already granted system-audio permission to your
+terminal app, also run the opt-in integration smoke tests:
+
+```bash
+CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
+```
+
 4. Commit and tag:
 
 ```bash

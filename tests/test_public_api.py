@@ -28,7 +28,7 @@ def test_module_has_expected_exports() -> None:
 
 def test_public_exports_reference_expected_symbols() -> None:
     module = importlib.import_module("catap")
-    recorder_module = importlib.import_module("catap.core.recorder")
+    recorder_module = importlib.import_module("catap.recorder")
     tap_module = importlib.import_module("catap.bindings.tap_description")
     process_module = importlib.import_module("catap.bindings.process")
     hardware_module = importlib.import_module("catap.bindings.hardware")

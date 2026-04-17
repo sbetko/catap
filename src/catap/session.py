@@ -15,7 +15,11 @@ from catap.bindings.process import (
     find_process_by_name,
 )
 from catap.bindings.tap_description import TapDescription, TapMuteBehavior
-from catap.core.recorder import AudioRecorder
+from catap.recorder import (
+    _DEFAULT_MAX_PENDING_BUFFERS,
+    AudioRecorder,
+    _validate_max_pending_buffers,
+)
 
 
 class AudioProcessNotFoundError(LookupError):
@@ -54,6 +58,8 @@ class RecordingSession:
         tap_description: TapDescription,
         output_path: str | Path | None = None,
         on_data: Callable[[bytes, int], None] | None = None,
+        *,
+        max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> None:
         """
         Create a managed recording session.
@@ -67,10 +73,15 @@ class RecordingSession:
                 inspect the session's ``sample_rate``, ``num_channels``, and
                 ``is_float`` to interpret them. Runs on catap's background
                 worker thread, not on Core Audio's real-time callback thread.
+            max_pending_buffers: Maximum number of audio buffers to queue for
+                the background worker before new buffers are dropped and the
+                capture fails on stop. Higher values trade memory for tolerance
+                of slow disk writes or ``on_data`` callbacks.
         """
         self.tap_description = tap_description
         self.output_path = Path(output_path) if output_path else None
         self._on_data = on_data
+        self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
 
         self.source_process: AudioProcess | None = None
         self.excluded_processes: tuple[AudioProcess, ...] = ()
@@ -86,6 +97,7 @@ class RecordingSession:
         *,
         mute: bool = False,
         on_data: Callable[[bytes, int], None] | None = None,
+        max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """
         Create a managed session for recording one application's audio.
@@ -100,6 +112,9 @@ class RecordingSession:
                 inspect the session's ``sample_rate``, ``num_channels``, and
                 ``is_float`` to interpret them. Runs on catap's background
                 worker thread, not on Core Audio's real-time callback thread.
+            max_pending_buffers: Maximum number of audio buffers to queue for
+                the background worker before new buffers are dropped and the
+                capture fails on stop.
 
         Raises:
             AudioProcessNotFoundError: If the named app cannot be found
@@ -115,7 +130,12 @@ class RecordingSession:
             TapMuteBehavior.MUTED if mute else TapMuteBehavior.UNMUTED
         )
 
-        session = cls(tap_description, output_path=output_path, on_data=on_data)
+        session = cls(
+            tap_description,
+            output_path=output_path,
+            on_data=on_data,
+            max_pending_buffers=max_pending_buffers,
+        )
         session.source_process = resolved_process
         return session
 
@@ -126,6 +146,7 @@ class RecordingSession:
         *,
         exclude: Sequence[str | AudioProcess] = (),
         on_data: Callable[[bytes, int], None] | None = None,
+        max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """
         Create a managed session for recording system audio.
@@ -139,6 +160,9 @@ class RecordingSession:
                 inspect the session's ``sample_rate``, ``num_channels``, and
                 ``is_float`` to interpret them. Runs on catap's background
                 worker thread, not on Core Audio's real-time callback thread.
+            max_pending_buffers: Maximum number of audio buffers to queue for
+                the background worker before new buffers are dropped and the
+                capture fails on stop.
 
         Raises:
             AudioProcessNotFoundError: If an excluded app name cannot be found
@@ -151,7 +175,12 @@ class RecordingSession:
         tap_description.is_private = True
         tap_description.mute_behavior = TapMuteBehavior.UNMUTED
 
-        session = cls(tap_description, output_path=output_path, on_data=on_data)
+        session = cls(
+            tap_description,
+            output_path=output_path,
+            on_data=on_data,
+            max_pending_buffers=max_pending_buffers,
+        )
         session.excluded_processes = tuple(excluded_processes)
         return session
 
@@ -192,6 +221,11 @@ class RecordingSession:
         return self._recorder.sample_rate
 
     @property
+    def max_pending_buffers(self) -> int:
+        """Maximum number of queued audio buffers before overflow."""
+        return self._max_pending_buffers
+
+    @property
     def num_channels(self) -> int | None:
         """Number of channels, once known."""
         if self._recorder is None:
@@ -219,7 +253,12 @@ class RecordingSession:
         tap_id = create_process_tap(self.tap_description)
 
         try:
-            recorder = AudioRecorder(tap_id, self.output_path, on_data=self._on_data)
+            recorder = AudioRecorder(
+                tap_id,
+                self.output_path,
+                on_data=self._on_data,
+                max_pending_buffers=self._max_pending_buffers,
+            )
             self._tap_id = tap_id
             self._recorder = recorder
             recorder.start()
@@ -343,18 +382,21 @@ def record_process(
     *,
     mute: bool = False,
     on_data: Callable[[bytes, int], None] | None = None,
+    max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
     Create a managed session for recording one application's audio.
 
     This is the quickest way to capture a single app without manually creating
-    a tap or cleaning it up afterward.
+    a tap or cleaning it up afterward. Pass ``max_pending_buffers`` to tune how
+    much audio can be queued while the background worker catches up.
     """
     return RecordingSession.from_process(
         process,
         output_path=output_path,
         mute=mute,
         on_data=on_data,
+        max_pending_buffers=max_pending_buffers,
     )
 
 
@@ -363,17 +405,20 @@ def record_system_audio(
     *,
     exclude: Sequence[str | AudioProcess] = (),
     on_data: Callable[[bytes, int], None] | None = None,
+    max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
     Create a managed session for recording system audio.
 
     This is the quickest way to capture the system mix without manually
-    building a global tap description.
+    building a global tap description. Pass ``max_pending_buffers`` to tune how
+    much audio can be queued while the background worker catches up.
     """
     return RecordingSession.from_system_audio(
         output_path=output_path,
         exclude=exclude,
         on_data=on_data,
+        max_pending_buffers=max_pending_buffers,
     )
 
 
