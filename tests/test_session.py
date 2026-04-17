@@ -124,6 +124,7 @@ def test_record_process_context_manager_manages_lifecycle(
         output_path="recording.wav",
         mute=True,
     )
+    recorder = session.recorder
 
     assert session.source_process == process
     assert session.tap_description.name == "catap recording Music"
@@ -137,10 +138,14 @@ def test_record_process_context_manager_manages_lifecycle(
         assert active_session.recorder is not None
         assert active_session.recorder.output_path == Path("recording.wav")
         assert active_session.recorder.max_pending_buffers == 256
+        recorder = active_session.recorder
 
     assert session.tap_id is None
     assert session.is_recording is False
     assert session.duration_seconds == 0.5
+    fake_recorder = cast(_FakeRecorder, recorder)
+    assert fake_recorder.start_calls == 1
+    assert fake_recorder.stop_calls == 1
     assert destroyed_tap_ids == [77]
 
 
@@ -236,6 +241,10 @@ def test_record_for_starts_and_closes_session(
     assert session.tap_id is None
     assert session.is_recording is False
     assert slept == [2.5]
+    assert session.recorder is not None
+    fake_recorder = cast(_FakeRecorder, session.recorder)
+    assert fake_recorder.start_calls == 1
+    assert fake_recorder.stop_calls == 1
     assert destroyed_tap_ids == [77]
 
 

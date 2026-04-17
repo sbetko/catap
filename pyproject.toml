@@ -68,3 +68,16 @@ testpaths = ["tests"]
 markers = [
     "integration: opt-in tests that exercise the real macOS Core Audio bridge",
 ]
+
+[tool.vulture]
+paths = ["src", "tests", "scripts"]
+sort_by_size = true
+ignore_names = [
+    "client_data",
+    "device",
+    "input_time",
+    "now",
+    "output_time",
+    "pytestmark",
+    "traceback",
+]

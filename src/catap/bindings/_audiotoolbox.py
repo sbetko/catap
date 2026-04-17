@@ -228,11 +228,6 @@ class PcmAudioConverter:
         """Return the most recent conversion output as an owned bytes object."""
         return self.output_view().tobytes()
 
-    @property
-    def last_output_size(self) -> int:
-        """Size in bytes of the most recent conversion output."""
-        return self._last_output_size
-
     def close(self) -> None:
         """Dispose the underlying converter."""
         if self._converter is not None:
