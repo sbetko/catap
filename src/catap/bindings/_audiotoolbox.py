@@ -146,20 +146,19 @@ def make_linear_pcm_asbd(
     )
 
 
-def _coerce_input_buffer(
-    data: Any, byte_count: int
-) -> tuple[Any, ctypes.Array[ctypes.c_char] | None]:
-    """Return a ctypes-friendly buffer plus an optional temporary owner."""
+def _coerce_input_buffer(data: Any, byte_count: int) -> Any:
+    """Return a ctypes-friendly buffer for ``AudioConverter`` / ``ExtAudioFile``.
+
+    ctypes arrays pass through untouched; bytes/bytearray/memoryview are copied
+    into a fresh ``c_char`` array the caller's local holds alive for the C call.
+    """
     if isinstance(data, bytes):
-        temp = (ctypes.c_char * byte_count).from_buffer_copy(data[:byte_count])
-        return temp, temp
+        return (ctypes.c_char * byte_count).from_buffer_copy(data[:byte_count])
     if isinstance(data, bytearray):
-        temp = (ctypes.c_char * byte_count).from_buffer_copy(bytes(data[:byte_count]))
-        return temp, temp
+        return (ctypes.c_char * byte_count).from_buffer_copy(bytes(data[:byte_count]))
     if isinstance(data, memoryview):
-        temp = (ctypes.c_char * byte_count).from_buffer_copy(data[:byte_count])
-        return temp, temp
-    return data, None
+        return (ctypes.c_char * byte_count).from_buffer_copy(data[:byte_count])
+    return data
 
 
 class PcmAudioConverter:
@@ -203,16 +202,16 @@ class PcmAudioConverter:
         input_frames = byte_count // self._source_bytes_per_frame
         output_capacity = input_frames * self._destination_bytes_per_frame
         output_buffer = self._ensure_output_capacity(output_capacity)
-        input_buffer, _ = _coerce_input_buffer(data, byte_count)
+        input_buffer = _coerce_input_buffer(data, byte_count)
         output_size = ctypes.c_uint32(output_capacity)
 
         _check_status(
             _AudioConverterConvertBuffer(
                 self._converter,
                 byte_count,
-                ctypes.cast(input_buffer, ctypes.c_void_p),
+                input_buffer,
                 ctypes.byref(output_size),
-                ctypes.cast(output_buffer, ctypes.c_void_p),
+                output_buffer,
             ),
             "Failed to convert PCM buffer",
         )
@@ -312,7 +311,7 @@ class ExtAudioFileWavWriter:
         if byte_count <= 0 or num_frames <= 0:
             return
 
-        input_buffer, _ = _coerce_input_buffer(data, byte_count)
+        input_buffer = _coerce_input_buffer(data, byte_count)
         buffer = self._buffer_list.mBuffers[0]
         buffer.mDataByteSize = byte_count
         buffer.mData = ctypes.cast(input_buffer, ctypes.c_void_p)
