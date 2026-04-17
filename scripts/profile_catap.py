@@ -17,6 +17,7 @@ import pstats
 import queue
 import resource
 import statistics
+import struct
 import sys
 import tempfile
 import time
@@ -30,6 +31,11 @@ from typing import Any
 
 from catap import record_system_audio
 from catap.bindings._accelerate import float32_to_int16 as _float32_to_int16
+from catap.bindings._audiotoolbox import (
+    ExtAudioFileWavWriter,
+    PcmAudioConverter,
+    make_linear_pcm_asbd,
+)
 from catap.bindings.process import list_audio_processes
 from catap.recorder import (
     AudioBuffer,
@@ -199,6 +205,50 @@ def _make_pool_buffer(data: bytes) -> ctypes.Array[ctypes.c_char]:
     return (ctypes.c_char * len(data)).from_buffer_copy(data)
 
 
+def _sample_delta_summary(reference: bytes, candidate: bytes) -> dict[str, Any]:
+    """Summarize per-sample deltas between two little-endian int16 buffers."""
+    if len(reference) != len(candidate):
+        return {
+            "byte_identical": False,
+            "reference_bytes": len(reference),
+            "candidate_bytes": len(candidate),
+            "error": "buffer length mismatch",
+        }
+
+    sample_count = len(reference) // 2
+    if sample_count == 0:
+        return {
+            "byte_identical": True,
+            "sample_count": 0,
+            "nonzero_sample_deltas": 0,
+            "nonzero_pct": 0.0,
+            "max_abs_sample_delta": 0,
+            "most_common_sample_deltas": [(0, 0)],
+        }
+
+    reference_samples = struct.unpack(f"<{sample_count}h", reference)
+    candidate_samples = struct.unpack(f"<{sample_count}h", candidate)
+    deltas = [
+        candidate - baseline
+        for candidate, baseline in zip(
+            candidate_samples,
+            reference_samples,
+            strict=True,
+        )
+    ]
+    delta_counts = Counter(deltas)
+    nonzero = sample_count - delta_counts.get(0, 0)
+
+    return {
+        "byte_identical": reference == candidate,
+        "sample_count": sample_count,
+        "nonzero_sample_deltas": nonzero,
+        "nonzero_pct": round((nonzero / sample_count) * 100.0, 3),
+        "max_abs_sample_delta": max(abs(delta) for delta in deltas),
+        "most_common_sample_deltas": delta_counts.most_common(5),
+    }
+
+
 def _profile_float_conversion() -> dict[str, Any]:
     results: dict[str, Any] = {}
 
@@ -254,6 +304,403 @@ def _profile_float_conversion() -> dict[str, Any]:
         _float32_to_int16(data)
     profile.disable()
     results["profile"] = _profile_summary(profile)
+    return results
+
+
+def _profile_core_audio_candidate() -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    source_format = make_linear_pcm_asbd(48_000, 2, 32, is_float=True)
+    destination_format = make_linear_pcm_asbd(48_000, 2, 16, is_float=False)
+
+    for frames, iterations in ((512, 20_000), (4_096, 3_000)):
+        data = _make_float_buffer(frames)
+        input_buffer = _make_pool_buffer(data)
+        byte_count = len(data)
+        captured_total: list[int] = []
+
+        with PcmAudioConverter(source_format, destination_format) as converter:
+            def _convert_once(
+                input_buffer: ctypes.Array[ctypes.c_char] = input_buffer,
+                byte_count: int = byte_count,
+            ) -> int:
+                return converter.convert(input_buffer, byte_count)
+
+            def _run_and_collect(
+                converter: PcmAudioConverter = converter,
+                input_buffer: ctypes.Array[ctypes.c_char] = input_buffer,
+                byte_count: int = byte_count,
+                iterations: int = iterations,
+                captured_total: list[int] = captured_total,
+            ) -> None:
+                total = 0
+                for _ in range(iterations):
+                    total += converter.convert(input_buffer, byte_count)
+                captured_total.append(total)
+
+            usage = _measure_resource_usage(_run_and_collect)
+            per_call = _measure_timing_distribution(
+                _convert_once,
+                iterations=min(iterations, 5_000),
+            )
+            allocations = _measure_allocations(
+                _convert_once,
+                iterations=min(iterations, 2_000),
+            )
+            converter.convert(input_buffer, byte_count)
+            sample_delta = _sample_delta_summary(
+                _float32_to_int16(data),
+                converter.output_bytes(),
+            )
+
+        total_output_bytes = captured_total[0]
+        input_megabytes = (len(data) * iterations) / (1024 * 1024)
+        audio_seconds = (frames * iterations) / 48_000
+
+        results[f"{frames}_frame_buffers"] = {
+            "frames_per_buffer": frames,
+            "iterations": iterations,
+            "elapsed_s": usage["wall_s"],
+            "input_mb": round(input_megabytes, 2),
+            "throughput_mb_s": round(input_megabytes / usage["wall_s"], 2)
+            if usage["wall_s"] > 0
+            else 0.0,
+            "realtime_factor": round(audio_seconds / usage["wall_s"], 1)
+            if usage["wall_s"] > 0
+            else 0.0,
+            "output_mb": round(total_output_bytes / (1024 * 1024), 2),
+            "resource": usage,
+            "per_call": per_call,
+            "allocations": allocations,
+            "sample_delta_vs_vdsp": sample_delta,
+        }
+
+    profile = cProfile.Profile()
+    data = _make_float_buffer(512)
+    input_buffer = _make_pool_buffer(data)
+    with PcmAudioConverter(source_format, destination_format) as converter:
+        profile.enable()
+        for _ in range(5_000):
+            converter.convert(input_buffer, len(data))
+        profile.disable()
+    results["profile"] = _profile_summary(profile)
+
+    frames = 512
+    num_buffers = 12_000
+    data = _make_float_buffer(frames)
+    input_buffer = _make_pool_buffer(data)
+    byte_count = len(data)
+
+    wav_sizes: list[int] = []
+
+    def _run_vdsp_wave_direct_once() -> None:
+        fd, temp_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        os.unlink(temp_path)
+        try:
+            with Path(temp_path).open("wb") as output_file:
+                wav_file = wave.open(output_file, "wb")  # noqa: SIM115
+                wav_file.setnchannels(2)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(48_000)
+                try:
+                    for _ in range(num_buffers):
+                        wav_file.writeframesraw(
+                            _float32_to_int16(input_buffer, byte_count)
+                        )
+                finally:
+                    wav_file.close()
+            wav_sizes.append(Path(temp_path).stat().st_size)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    usage = _measure_resource_usage(_run_vdsp_wave_direct_once)
+
+    fd, temp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    os.unlink(temp_path)
+    try:
+        with Path(temp_path).open("wb") as output_file:
+            wav_file = wave.open(output_file, "wb")  # noqa: SIM115
+            wav_file.setnchannels(2)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(48_000)
+            try:
+                profile = cProfile.Profile()
+                profile.enable()
+                for _ in range(5_000):
+                    wav_file.writeframesraw(_float32_to_int16(input_buffer, byte_count))
+                profile.disable()
+            finally:
+                wav_file.close()
+        profile_output = _profile_summary(profile)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    fd, alloc_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    os.unlink(alloc_path)
+    try:
+
+        def _drain_vdsp_wave_direct_once() -> None:
+            with Path(alloc_path).open("wb") as output_file:
+                wav_file = wave.open(output_file, "wb")  # noqa: SIM115
+                wav_file.setnchannels(2)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(48_000)
+                try:
+                    for _ in range(2_000):
+                        wav_file.writeframesraw(
+                            _float32_to_int16(input_buffer, byte_count)
+                        )
+                finally:
+                    wav_file.close()
+
+        vdsp_wave_direct_allocations = _measure_allocations(
+            _drain_vdsp_wave_direct_once,
+            iterations=1,
+        )
+        vdsp_wave_direct_allocations["buffers_processed"] = 2_000
+        vdsp_wave_direct_allocations["retained_bytes_per_buffer"] = round(
+            vdsp_wave_direct_allocations["retained_bytes"] / 2_000, 3
+        )
+    finally:
+        if os.path.exists(alloc_path):
+            os.remove(alloc_path)
+
+    input_megabytes = (len(data) * num_buffers) / (1024 * 1024)
+    audio_seconds = (frames * num_buffers) / 48_000
+    results["vdsp_wave_direct"] = {
+        "buffers": num_buffers,
+        "audio_s_equivalent": round(audio_seconds, 2),
+        "elapsed_s": usage["wall_s"],
+        "input_mb_s": round(input_megabytes / usage["wall_s"], 2)
+        if usage["wall_s"] > 0
+        else 0.0,
+        "realtime_factor": round(audio_seconds / usage["wall_s"], 1)
+        if usage["wall_s"] > 0
+        else 0.0,
+        "wav_size_mb": round(wav_sizes[0] / (1024 * 1024), 2),
+        "resource": usage,
+        "allocations": vdsp_wave_direct_allocations,
+        "profile": profile_output,
+    }
+
+    wav_sizes: list[int] = []
+
+    def _run_audio_converter_wave_once() -> None:
+        fd, temp_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        os.unlink(temp_path)
+        try:
+            with PcmAudioConverter(
+                source_format, destination_format
+            ) as converter, Path(temp_path).open("wb") as output_file:
+                wav_file = wave.open(output_file, "wb")  # noqa: SIM115
+                wav_file.setnchannels(2)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(48_000)
+                try:
+                    for _ in range(num_buffers):
+                        converter.convert(input_buffer, byte_count)
+                        wav_file.writeframesraw(converter.output_view())
+                finally:
+                    wav_file.close()
+            wav_sizes.append(Path(temp_path).stat().st_size)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    usage = _measure_resource_usage(_run_audio_converter_wave_once)
+
+    fd, temp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    os.unlink(temp_path)
+    try:
+        with PcmAudioConverter(
+            source_format, destination_format
+        ) as converter, Path(temp_path).open("wb") as output_file:
+            wav_file = wave.open(output_file, "wb")  # noqa: SIM115
+            wav_file.setnchannels(2)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(48_000)
+            try:
+                profile = cProfile.Profile()
+                profile.enable()
+                for _ in range(5_000):
+                    converter.convert(input_buffer, byte_count)
+                    wav_file.writeframesraw(converter.output_view())
+                profile.disable()
+            finally:
+                wav_file.close()
+        profile_output = _profile_summary(profile)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    fd, alloc_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    os.unlink(alloc_path)
+    try:
+
+        def _drain_audio_converter_wave_once() -> None:
+            with PcmAudioConverter(
+                source_format, destination_format
+            ) as converter, Path(alloc_path).open("wb") as output_file:
+                wav_file = wave.open(output_file, "wb")  # noqa: SIM115
+                wav_file.setnchannels(2)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(48_000)
+                try:
+                    for _ in range(2_000):
+                        converter.convert(input_buffer, byte_count)
+                        wav_file.writeframesraw(converter.output_view())
+                finally:
+                    wav_file.close()
+
+        audio_converter_wave_allocations = _measure_allocations(
+            _drain_audio_converter_wave_once,
+            iterations=1,
+        )
+        audio_converter_wave_allocations["buffers_processed"] = 2_000
+        audio_converter_wave_allocations["retained_bytes_per_buffer"] = round(
+            audio_converter_wave_allocations["retained_bytes"] / 2_000, 3
+        )
+    finally:
+        if os.path.exists(alloc_path):
+            os.remove(alloc_path)
+
+    input_megabytes = (len(data) * num_buffers) / (1024 * 1024)
+    results["audio_converter_wave"] = {
+        "buffers": num_buffers,
+        "audio_s_equivalent": round(audio_seconds, 2),
+        "elapsed_s": usage["wall_s"],
+        "input_mb_s": round(input_megabytes / usage["wall_s"], 2)
+        if usage["wall_s"] > 0
+        else 0.0,
+        "realtime_factor": round(audio_seconds / usage["wall_s"], 1)
+        if usage["wall_s"] > 0
+        else 0.0,
+        "wav_size_mb": round(wav_sizes[0] / (1024 * 1024), 2),
+        "resource": usage,
+        "allocations": audio_converter_wave_allocations,
+        "profile": profile_output,
+    }
+
+    wav_sizes = []
+
+    def _run_ext_audio_file_once() -> None:
+        fd, temp_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        os.unlink(temp_path)
+        try:
+            with ExtAudioFileWavWriter(
+                temp_path,
+                sample_rate=48_000,
+                num_channels=2,
+                client_bits_per_sample=32,
+                client_is_float=True,
+            ) as writer:
+                for _ in range(num_buffers):
+                    writer.write(input_buffer, frames, byte_count)
+            wav_sizes.append(Path(temp_path).stat().st_size)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    usage = _measure_resource_usage(_run_ext_audio_file_once)
+
+    fd, temp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    os.unlink(temp_path)
+    try:
+        writer = ExtAudioFileWavWriter(
+            temp_path,
+            sample_rate=48_000,
+            num_channels=2,
+            client_bits_per_sample=32,
+            client_is_float=True,
+        )
+        try:
+            profile = cProfile.Profile()
+            profile.enable()
+            for _ in range(5_000):
+                writer.write(input_buffer, frames, byte_count)
+            profile.disable()
+        finally:
+            writer.close()
+        profile_output = _profile_summary(profile)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    fd, alloc_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    os.unlink(alloc_path)
+    try:
+
+        def _drain_ext_audio_file_once() -> None:
+            with ExtAudioFileWavWriter(
+                alloc_path,
+                sample_rate=48_000,
+                num_channels=2,
+                client_bits_per_sample=32,
+                client_is_float=True,
+            ) as writer:
+                for _ in range(2_000):
+                    writer.write(input_buffer, frames, byte_count)
+
+        ext_audio_file_allocations = _measure_allocations(
+            _drain_ext_audio_file_once,
+            iterations=1,
+        )
+        ext_audio_file_allocations["buffers_processed"] = 2_000
+        ext_audio_file_allocations["retained_bytes_per_buffer"] = round(
+            ext_audio_file_allocations["retained_bytes"] / 2_000, 3
+        )
+    finally:
+        if os.path.exists(alloc_path):
+            os.remove(alloc_path)
+
+    fd, temp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    os.unlink(temp_path)
+    try:
+        with ExtAudioFileWavWriter(
+            temp_path,
+            sample_rate=48_000,
+            num_channels=2,
+            client_bits_per_sample=32,
+            client_is_float=True,
+        ) as writer:
+            writer.write(input_buffer, frames, byte_count)
+        with wave.open(temp_path, "rb") as wav_file:
+            ext_audio_bytes = wav_file.readframes(frames)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    results["ext_audio_file_wav"] = {
+        "buffers": num_buffers,
+        "audio_s_equivalent": round(audio_seconds, 2),
+        "elapsed_s": usage["wall_s"],
+        "input_mb_s": round(input_megabytes / usage["wall_s"], 2)
+        if usage["wall_s"] > 0
+        else 0.0,
+        "realtime_factor": round(audio_seconds / usage["wall_s"], 1)
+        if usage["wall_s"] > 0
+        else 0.0,
+        "wav_size_mb": round(wav_sizes[0] / (1024 * 1024), 2),
+        "resource": usage,
+        "allocations": ext_audio_file_allocations,
+        "profile": profile_output,
+        "sample_delta_vs_vdsp": _sample_delta_summary(
+            _float32_to_int16(data),
+            ext_audio_bytes,
+        ),
+    }
+
     return results
 
 
@@ -639,6 +1086,7 @@ def _collect_results(
         },
         "synthetic": {
             "float32_to_int16": _profile_float_conversion(),
+            "core_audio_candidate": _profile_core_audio_candidate(),
             "io_proc": _profile_io_proc(),
             "worker_wav": _profile_worker_wav(),
         },

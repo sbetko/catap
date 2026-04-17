@@ -1,10 +1,13 @@
 # Profiling Notes
 
-This project was profiled on April 17, 2026 on `Darwin 25.2.0 arm64` with
+This project was profiled on April 17, 2026 on `macOS-26.2-arm64-arm-64bit` with
 `Python 3.12.12`. These numbers reflect the current implementation after the
-Accelerate/vDSP conversion, the scratch-buffer reuse inside `_float32_to_int16`,
-the ctypes buffer pool shared between the Core Audio callback and the worker
-thread, and the removal of the hot-path mutex.
+AudioConverter-backed float32 -> int16 WAV conversion, the retained standalone
+Accelerate/vDSP helper for comparison, the ctypes buffer pool shared between
+the Core Audio callback and the worker thread, and the removal of the hot-path
+mutex. The synthetic sections below were refreshed after the AudioConverter
+integration; the live sections later in the document were not re-run because
+the change did not affect startup, callback shape, or process enumeration.
 
 Reproduce the measurements with:
 
@@ -25,20 +28,21 @@ uv run python scripts/profile_catap.py --skip-live
 
 ## Current Results
 
-### 1. Float conversion throughput on the worker thread
+### 1. AudioConverter is now the active float conversion path
 
 Synthetic conversion of the current 48 kHz stereo float32 buffers measured:
 
-| Workload | Input throughput | Realtime factor | p99 per call |
+| Workload | `AudioConverter` throughput | Historical vDSP throughput | `AudioConverter` p99 |
 | --- | ---: | ---: | ---: |
-| 512-frame buffers x 20,000 | ~2,540 MB/s | ~6,900x | ~1.7 us |
-| 4096-frame buffers x 3,000 | ~9,000 MB/s | ~24,600x | ~5.4 us |
+| 512-frame buffers x 20,000 | ~3,870 MB/s | ~2,570 MB/s | ~1.2 us |
+| 4096-frame buffers x 3,000 | ~24,000 MB/s | ~12,200 MB/s | ~1.5 us |
 
-Allocations per call are under 1 byte on average because the Accelerate
-scratch float buffer and the per-size int16 output buffer are both reused
-across calls. `cProfile` attributes essentially all of the remaining time to
-`_float32_to_int16` itself (`ctypes.memmove` + three vDSP routines + a
-`bytes(ints)` copy of the int16 output).
+The standalone `AudioConverter` wrapper retains under 0.2 B per call on
+average and roughly doubles throughput versus the old vDSP helper on large
+buffers. One compatibility caveat remains: the converter is not byte-identical
+to `_float32_to_int16`; around 88-90% of samples differ by 1-2 LSBs because
+Core Audio rounds to the full int16 range (`0.5 -> 16384`, `-1.0 -> -32768`)
+instead of the legacy truncate-toward-zero mapping.
 
 ### 2. The real-time callback is well under budget
 
@@ -50,26 +54,30 @@ The synthetic `_io_proc` benchmark measured:
 | Path | Mean per callback | p99 | Peak tracked bytes over 2,000 calls |
 | --- | ---: | ---: | ---: |
 | Pool acquire + memmove, no queue | ~0.8 us | ~0.9 us | ~1,000 B |
-| Pool acquire + memmove + queue put | ~1.1 us | ~1.9 us | ~265 KB |
+| Pool acquire + memmove + queue put | ~1.1 us | ~2.0 us | ~265 KB |
 
 Both paths are well under 1% of the 10.66 ms callback budget. The
 `with_queue` peak is dominated by the 5,000 `(buf, num_frames, byte_count)`
 tuples the queue retains during the benchmark; the per-callback retained cost
 is about 132 B, versus about 4.2 KB before the buffer pool was introduced.
 
-### 3. Worker pipeline is still CPU-bound in conversion
+### 3. Worker pipeline is much faster, and conversion is no longer the main Python hotspot
 
 Feeding the worker 12,000 synthetic 512-frame buffers (128 seconds of audio)
-completed in about 0.10 seconds, or roughly 1,330x realtime. The worker ran at
-about 124% CPU utilization, indicating it is bottlenecked on the Python-side
-conversion rather than on disk I/O.
+now completes in about 0.054 seconds, or roughly 2,370x realtime. The worker
+ran at about 128% CPU utilization, but the end-to-end path is now about 75%
+faster than the previous vDSP-backed worker measurement (~0.10 s).
 
-Per-buffer retained memory is now 0.25 B (down from ~3.5 B), and `cProfile`
-attributes cumulative time to:
+Per-buffer retained memory is now 0.12 B. In `cProfile`, the visible Python
+time is dominated by:
 
-- `wave.writeframesraw` (WAV writer + buffered file write): ~35-40%
-- `_float32_to_int16`: ~30-35%
-- queue bookkeeping + worker loop: single-digit percentages
+- `wave.writeframesraw` + buffered `file.write`: most of the measured time
+- queue bookkeeping / `queue.get`: the next largest Python cost
+- worker-loop overhead: small
+
+The converter itself no longer shows up as a Python hotspot because it runs
+inside one C call; the resource-usage delta is the more trustworthy signal for
+this path.
 
 ### 4. Process listing is fast once the interpreter is warm
 
@@ -112,29 +120,47 @@ This is expected for the current architecture: startup creates the tap wrapper
 aggregate device, queries format, registers the IO proc, pre-allocates the
 buffer pool, and starts the device.
 
+### 7. `ExtAudioFileWrite` still does not beat the new current path
+
+The worker now uses `AudioConverter` behind the existing `wave` writer. In a
+matched direct synthetic write loop over 12,000 x 512-frame buffers (128
+seconds of audio), the measured write paths were:
+
+| Path | Elapsed | Realtime factor |
+| --- | ---: | ---: |
+| Current `AudioConverter` + `wave.writeframesraw` | ~33 ms | ~3,930x |
+| Legacy vDSP + `wave.writeframesraw` | ~37 ms | ~3,470x |
+| `ExtAudioFileWrite` | ~40 ms | ~3,210x |
+
+So integrating `AudioConverter` paid off, but synchronous `ExtAudioFileWrite`
+still does not beat the simpler direct WAV writer on this machine.
+
+Historical note: the vDSP path is still kept in-tree in this commit only so
+these before/after comparisons remain directly reproducible.
+
 ## Optimization Candidates
 
-1. Explore Core Audio `AudioConverter` / `ExtAudioFile` for the
-   float32 -> int16 + WAV path.
-   The Python-side conversion is already fast (tens of GB/s on large buffers),
-   but handing the whole path off to Core Audio could drop CPU further and
-   would move the WAV writer work out of the GIL-serialized path.
-
-2. Reduce cold import overhead for CLI use cases.
+1. Reduce cold import overhead for CLI use cases.
    `catap.__init__` eagerly imports process, tap, recorder, and session
    modules, pulling AppKit, Foundation, and objc before every CLI subcommand.
    Lazy imports would improve short-lived command latency. Likely gain is only
    a few tens of milliseconds, so this is a nice-to-have.
 
-3. Leave `_io_proc` alone unless regression data says otherwise.
+2. Leave `_io_proc` alone unless regression data says otherwise.
    After the buffer pool and mutex removal, the callback runs at about 1.1 us
    with the worker queue attached - roughly 1/10,000 of the 10.66 ms budget.
    Further changes there are higher risk than reward.
 
-4. Treat process-list optimization as optional.
+3. Treat process-list optimization as optional.
    Once warm, the library already lists audio processes in single-digit
    milliseconds. Any improvement here is secondary to conversion and import
    costs.
+
+4. If we revisit the write path, prefer batching or `ExtAudioFileWriteAsync`
+   experiments over synchronous `ExtAudioFileWrite`.
+   The synchronous API was slower than the new current path in matched
+   synthetic runs, so any further AudioToolbox work should target a different
+   shape of optimization.
 
 ## Memory Notes
 

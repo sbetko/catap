@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, BinaryIO
 
 from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
-from catap.bindings._accelerate import float32_to_int16 as _float32_to_int16
+from catap.bindings._audiotoolbox import PcmAudioConverter, make_linear_pcm_asbd
 from catap.bindings._coreaudio import (
     _CoreAudio,
     get_property_cfstring,
@@ -25,9 +25,9 @@ from catap.bindings._coreaudio import (
 )
 
 # Pool buffers are ctypes char arrays rather than bytearrays because
-# ``ctypes.memmove`` rejects bytearray/memoryview as source or destination -
-# both the RT-thread ingest memmove and the vDSP conversion's memmove need a
-# ctypes-native buffer.
+# ``ctypes.memmove`` rejects bytearray/memoryview as source or destination,
+# and the worker's AudioConverter path can consume the ctypes buffers directly
+# without an extra copy.
 type _PoolBuffer = ctypes.Array  # ctypes.c_char * N instance
 type _WorkerItem = tuple[_PoolBuffer, int, int] | None
 
@@ -303,6 +303,7 @@ class AudioRecorder:
         self._callback_error: RuntimeError | None = None
         self._output_file: BinaryIO | None = None
         self._wav_file: wave.Wave_write | None = None
+        self._pcm_converter: PcmAudioConverter | None = None
 
         self._total_frames = 0
         self._dropped_buffers = 0
@@ -540,10 +541,12 @@ class AudioRecorder:
         self._callback_error = None
         self._dropped_buffers = 0
         self._dropped_frames = 0
+        self._pcm_converter = None
 
         if self.output_path is not None:
             output_file = self.output_path.open("wb")
             wav_file: wave.Wave_write | None = None
+            pcm_converter: PcmAudioConverter | None = None
             try:
                 # The wave file outlives this function; it is closed by the
                 # worker thread's finally block in _worker_loop.
@@ -551,7 +554,25 @@ class AudioRecorder:
                 wav_file.setnchannels(self._num_channels)
                 wav_file.setsampwidth(self._output_bits_per_sample // 8)
                 wav_file.setframerate(int(self._sample_rate))
+                if self._convert_float_output:
+                    pcm_converter = PcmAudioConverter(
+                        make_linear_pcm_asbd(
+                            self._sample_rate,
+                            self._num_channels,
+                            self._bits_per_sample,
+                            is_float=True,
+                        ),
+                        make_linear_pcm_asbd(
+                            self._sample_rate,
+                            self._num_channels,
+                            self._output_bits_per_sample,
+                            is_float=False,
+                        ),
+                    )
             except Exception:
+                if pcm_converter is not None:
+                    with contextlib.suppress(Exception):
+                        pcm_converter.close()
                 if wav_file is not None:
                     with contextlib.suppress(Exception):
                         wav_file.close()
@@ -559,6 +580,7 @@ class AudioRecorder:
                 raise
             self._output_file = output_file
             self._wav_file = wav_file
+            self._pcm_converter = pcm_converter
         else:
             self._output_file = None
             self._wav_file = None
@@ -691,8 +713,9 @@ class AudioRecorder:
 
                     if self._wav_file is not None and self._writer_error is None:
                         try:
-                            if self._convert_float_output:
-                                output_data = _float32_to_int16(buf, byte_count)
+                            if self._pcm_converter is not None:
+                                self._pcm_converter.convert(buf, byte_count)
+                                output_data = self._pcm_converter.output_view()
                             else:
                                 output_data = memoryview(buf)[:byte_count]
                             self._wav_file.writeframesraw(output_data)
@@ -723,6 +746,16 @@ class AudioRecorder:
                         )
                 finally:
                     self._output_file = None
+            if self._pcm_converter is not None:
+                try:
+                    self._pcm_converter.close()
+                except Exception as exc:
+                    if self._writer_error is None:
+                        self._writer_error = OSError(
+                            f"Failed to dispose PCM converter: {exc}"
+                        )
+                finally:
+                    self._pcm_converter = None
 
     @property
     def is_recording(self) -> bool:

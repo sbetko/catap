@@ -37,7 +37,7 @@ def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
         assert wav_file.getsampwidth() == 2
         samples = struct.unpack("<4h", wav_file.readframes(2))
 
-    assert samples == (16383, -16383, 32767, -32767)
+    assert samples == (16384, -16384, 32767, -32768)
 
 
 def test_writer_preserves_int16_audio(tmp_path) -> None:
