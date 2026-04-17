@@ -57,7 +57,7 @@ source-include = ["CHANGELOG.md"]
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "PERF"]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "PERF", "PT"]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
