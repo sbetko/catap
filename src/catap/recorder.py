@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import array
 import contextlib
 import ctypes
 import queue
@@ -15,6 +14,7 @@ from typing import TYPE_CHECKING, BinaryIO
 
 from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
+from catap.bindings._accelerate import float32_to_int16 as _float32_to_int16
 from catap.bindings._coreaudio import (
     _CoreAudio,
     get_property_cfstring,
@@ -231,27 +231,6 @@ def _destroy_aggregate_device(device_id: int) -> None:
     status = _AudioHardwareDestroyAggregateDevice(device_id)
     if status != 0:
         raise OSError(f"Failed to destroy aggregate device: status {status}")
-
-
-def _float32_to_int16(data: bytes) -> bytes:
-    """Convert 32-bit float audio samples to 16-bit signed integer samples.
-
-    Uses a zero-copy ``memoryview`` over the input bytes and converts samples
-    with a single list comprehension before packing them into an ``array``.
-    Samples outside [-1.0, 1.0] are clipped symmetrically to [-32767, 32767].
-    """
-    scale = 32767
-    floats = memoryview(data).cast("f")
-    ints = array.array(
-        "h",
-        [
-            scale
-            if sample >= 1.0
-            else (-scale if sample <= -1.0 else int(sample * scale))
-            for sample in floats
-        ],
-    )
-    return ints.tobytes()
 
 
 class AudioRecorder:
