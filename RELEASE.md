@@ -48,7 +48,7 @@ gh run watch
 6. Smoke-test the TestPyPI upload:
 
 ```bash
-python3.12 -m venv /tmp/catap-testpypi
+uv venv --seed --python 3.12 /tmp/catap-testpypi
 source /tmp/catap-testpypi/bin/activate
 pip install \
   --index-url https://test.pypi.org/simple/ \
@@ -67,7 +67,7 @@ the `pyobjc-*` runtime dependencies.)
 ## Optional smoke checks after publish
 
 ```bash
-python3 -m venv /tmp/catap-smoke
+uv venv --seed --python 3.12 /tmp/catap-smoke
 source /tmp/catap-smoke/bin/activate
 pip install catap
 catap --help
