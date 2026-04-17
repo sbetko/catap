@@ -2,12 +2,12 @@
 
 This project was profiled on April 17, 2026 on `macOS-26.2-arm64-arm-64bit` with
 `Python 3.12.12`. These numbers reflect the current implementation after the
-AudioConverter-backed float32 -> int16 WAV conversion, the retained standalone
-Accelerate/vDSP helper for comparison, the ctypes buffer pool shared between
-the Core Audio callback and the worker thread, and the removal of the hot-path
-mutex. The synthetic sections below were refreshed after the AudioConverter
-integration; the live sections later in the document were not re-run because
-the change did not affect startup, callback shape, or process enumeration.
+AudioConverter-backed float32 -> int16 WAV conversion, the ctypes buffer pool
+shared between the Core Audio callback and the worker thread, and the removal
+of the hot-path mutex. The synthetic sections below were refreshed after the
+AudioConverter integration; the live sections later in the document were not
+re-run because the change did not affect startup, callback shape, or process
+enumeration.
 
 Reproduce the measurements with:
 
@@ -32,17 +32,19 @@ uv run python scripts/profile_catap.py --skip-live
 
 Synthetic conversion of the current 48 kHz stereo float32 buffers measured:
 
-| Workload | `AudioConverter` throughput | Historical vDSP throughput | `AudioConverter` p99 |
-| --- | ---: | ---: | ---: |
-| 512-frame buffers x 20,000 | ~3,870 MB/s | ~2,570 MB/s | ~1.2 us |
-| 4096-frame buffers x 3,000 | ~24,000 MB/s | ~12,200 MB/s | ~1.5 us |
+| Workload | `AudioConverter` throughput | `AudioConverter` p99 |
+| --- | ---: | ---: |
+| 512-frame buffers x 20,000 | ~3,870 MB/s | ~1.2 us |
+| 4096-frame buffers x 3,000 | ~24,000 MB/s | ~1.5 us |
 
 The standalone `AudioConverter` wrapper retains under 0.2 B per call on
-average and roughly doubles throughput versus the old vDSP helper on large
-buffers. One compatibility caveat remains: the converter is not byte-identical
-to `_float32_to_int16`; around 88-90% of samples differ by 1-2 LSBs because
+average. One compatibility caveat remains: the converter is not byte-identical
+to the previous vDSP path; around 88-90% of samples differ by 1-2 LSBs because
 Core Audio rounds to the full int16 range (`0.5 -> 16384`, `-1.0 -> -32768`)
-instead of the legacy truncate-toward-zero mapping.
+instead of the old truncate-toward-zero mapping.
+
+Historical note: the final vDSP-only run before removal measured about
+`~2,570 MB/s` on 512-frame buffers and `~12,200 MB/s` on 4096-frame buffers.
 
 ### 2. The real-time callback is well under budget
 
@@ -129,14 +131,13 @@ seconds of audio), the measured write paths were:
 | Path | Elapsed | Realtime factor |
 | --- | ---: | ---: |
 | Current `AudioConverter` + `wave.writeframesraw` | ~33 ms | ~3,930x |
-| Legacy vDSP + `wave.writeframesraw` | ~37 ms | ~3,470x |
 | `ExtAudioFileWrite` | ~40 ms | ~3,210x |
 
 So integrating `AudioConverter` paid off, but synchronous `ExtAudioFileWrite`
 still does not beat the simpler direct WAV writer on this machine.
 
-Historical note: the vDSP path is still kept in-tree in this commit only so
-these before/after comparisons remain directly reproducible.
+Historical note: the final vDSP-backed direct write-loop run before removal was
+about `~37 ms` (`~3,470x` realtime) on this same synthetic workload.
 
 ## Optimization Candidates
 

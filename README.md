@@ -158,7 +158,7 @@ If recording fails with permission errors:
 2. **Tap Creation**: Creates a `CATapDescription` via PyObjC and calls `AudioHardwareCreateProcessTap`
 3. **Aggregate Device**: Wraps the tap in an aggregate device (required by Core Audio to read audio data)
 4. **Audio Capture**: Registers an `AudioDeviceIOProc` callback to receive audio buffers
-5. **WAV Output**: Converts float32 audio to 16-bit PCM and writes to WAV format
+5. **WAV Output**: Uses Core Audio `AudioConverter` to convert float32 audio to 16-bit PCM before writing WAV output
 
 ## Project Structure
 
