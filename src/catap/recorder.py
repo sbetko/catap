@@ -236,20 +236,20 @@ def _destroy_aggregate_device(device_id: int) -> None:
 def _float32_to_int16(data: bytes) -> bytes:
     """Convert 32-bit float audio samples to 16-bit signed integer samples.
 
-    Uses ``array`` for bulk unpack/pack rather than per-sample ``struct``
-    calls. Samples outside [-1.0, 1.0] are clipped symmetrically to
-    [-32767, 32767].
+    Uses a zero-copy ``memoryview`` over the input bytes and converts samples
+    with a single list comprehension before packing them into an ``array``.
+    Samples outside [-1.0, 1.0] are clipped symmetrically to [-32767, 32767].
     """
-    floats = array.array("f")
-    floats.frombytes(data)
+    scale = 32767
+    floats = memoryview(data).cast("f")
     ints = array.array(
         "h",
-        (
-            32767
-            if f >= 1.0
-            else (-32767 if f <= -1.0 else int(f * 32767))
-            for f in floats
-        ),
+        [
+            scale
+            if sample >= 1.0
+            else (-scale if sample <= -1.0 else int(sample * scale))
+            for sample in floats
+        ],
     )
     return ints.tobytes()
 
