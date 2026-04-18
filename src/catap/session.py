@@ -19,6 +19,7 @@ from catap.recorder import (
     _DEFAULT_MAX_PENDING_BUFFERS,
     AudioRecorder,
     _validate_max_pending_buffers,
+    _validate_recording_target,
 )
 
 
@@ -77,9 +78,11 @@ class RecordingSession:
                 the background worker before new buffers are dropped and the
                 capture fails on stop. Higher values trade memory for tolerance
                 of slow disk writes or ``on_data`` callbacks.
+        Raises:
+            ValueError: If neither ``output_path`` nor ``on_data`` is provided
         """
         self.tap_description = tap_description
-        self.output_path = Path(output_path) if output_path else None
+        self.output_path = _validate_recording_target(output_path, on_data)
         self._on_data = on_data
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
 

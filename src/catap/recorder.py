@@ -35,6 +35,19 @@ _DEFAULT_MAX_PENDING_BUFFERS = 256
 _DEFAULT_POOL_BUFFER_SIZE = 4096
 
 
+def _validate_recording_target(
+    output_path: str | Path | None,
+    on_data: Callable[[bytes, int], None] | None,
+) -> Path | None:
+    """Normalize the recording target and reject target-less captures."""
+    normalized_output_path = Path(output_path) if output_path else None
+    if normalized_output_path is None and on_data is None:
+        raise ValueError(
+            "output_path must be provided unless on_data is set for streaming mode"
+        )
+    return normalized_output_path
+
+
 def _validate_max_pending_buffers(value: int) -> int:
     """Validate and normalize the recorder queue bound."""
     if value <= 0:
@@ -283,9 +296,11 @@ class AudioRecorder:
                 the background worker before new buffers are dropped and the
                 capture fails on stop. Higher values trade memory for tolerance
                 of slow disk writes or ``on_data`` callbacks.
+        Raises:
+            ValueError: If neither ``output_path`` nor ``on_data`` is provided
         """
         self.tap_id = tap_id
-        self.output_path = Path(output_path) if output_path else None
+        self.output_path = _validate_recording_target(output_path, on_data)
         self._on_data = on_data
 
         self._aggregate_device_id: int | None = None
@@ -415,8 +430,7 @@ class AudioRecorder:
         )
         self._convert_float_output = self._is_float and self._bits_per_sample == 32
 
-        if self.output_path is not None or self._on_data is not None:
-            self._start_worker()
+        self._prepare_worker()
 
         try:
             self._aggregate_device_id = _create_aggregate_device_for_tap(
@@ -487,6 +501,42 @@ class AudioRecorder:
                 error.add_note(str(cleanup_error))
             raise error
 
+        try:
+            self._start_worker()
+        except (OSError, RuntimeError) as exc:
+            cleanup_errors: list[OSError | RuntimeError] = []
+            self._is_recording = False
+
+            stop_status = _AudioDeviceStop(self._aggregate_device_id, self._io_proc_id)
+            if stop_status != 0:
+                cleanup_errors.append(
+                    OSError(f"Failed to stop audio device: status {stop_status}")
+                )
+
+            destroy_status = _AudioDeviceDestroyIOProcID(
+                self._aggregate_device_id, self._io_proc_id
+            )
+            if destroy_status != 0:
+                cleanup_errors.append(
+                    OSError(f"Failed to destroy IO proc: status {destroy_status}")
+                )
+            self._io_proc_id = None
+
+            try:
+                _destroy_aggregate_device(self._aggregate_device_id)
+            except OSError as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            self._aggregate_device_id = None
+
+            try:
+                self._stop_worker()
+            except (OSError, RuntimeError) as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+
+            for cleanup_error in cleanup_errors:
+                exc.add_note(str(cleanup_error))
+            raise
+
     def stop(self) -> None:
         """Stop recording and finalize any WAV output.
 
@@ -532,16 +582,36 @@ class AudioRecorder:
         if cleanup_errors:
             raise _combine_errors("Failed to stop recording cleanly", cleanup_errors)
 
-    def _start_worker(self) -> None:
-        """Start the background worker for file writes and user callbacks."""
-        if self.output_path is None and self._on_data is None:
+    def _prepare_worker(self) -> None:
+        """Allocate queueing state before audio callbacks begin."""
+        if self._work_queue is not None and self._buffer_pool is not None:
             return
 
         self._writer_error = None
         self._callback_error = None
         self._dropped_buffers = 0
         self._dropped_frames = 0
+        self._output_file = None
+        self._wav_file = None
         self._pcm_converter = None
+
+        bytes_per_frame = max(
+            1, self._num_channels * (self._bits_per_sample // 8)
+        )
+        pool_buffer_size = max(_DEFAULT_POOL_BUFFER_SIZE, bytes_per_frame * 1024)
+        pool_type = ctypes.c_char * pool_buffer_size
+        self._buffer_pool = deque(
+            pool_type() for _ in range(self._max_pending_buffers)
+        )
+
+        self._work_queue = queue.Queue(maxsize=self._max_pending_buffers)
+
+    def _start_worker(self) -> None:
+        """Start the background worker for file writes and user callbacks."""
+        if self._worker_thread is not None:
+            return
+
+        self._prepare_worker()
 
         if self.output_path is not None:
             output_file = self.output_path.open("wb")
@@ -585,16 +655,6 @@ class AudioRecorder:
             self._output_file = None
             self._wav_file = None
 
-        bytes_per_frame = max(
-            1, self._num_channels * (self._bits_per_sample // 8)
-        )
-        pool_buffer_size = max(_DEFAULT_POOL_BUFFER_SIZE, bytes_per_frame * 1024)
-        pool_type = ctypes.c_char * pool_buffer_size
-        self._buffer_pool = deque(
-            pool_type() for _ in range(self._max_pending_buffers)
-        )
-
-        self._work_queue = queue.Queue(maxsize=self._max_pending_buffers)
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
             name="catap-audio-worker",

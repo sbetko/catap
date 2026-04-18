@@ -90,6 +90,8 @@ session.record_for(5)
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
 
+If you want streaming-only mode, pass `on_data=...` and omit `output_path`.
+
 By default, `catap` queues up to 256 pending audio buffers before treating a
 slow writer or callback as a capture failure. You can tune this with
 `max_pending_buffers=...` on `record_process`, `record_system_audio`,

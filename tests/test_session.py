@@ -187,7 +187,8 @@ def test_recording_session_start_cleans_up_tap_on_failure(
     )
 
     session = session_module.RecordingSession(
-        cast(TapDescription, _FakeTapDescription([42]))
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
     )
 
     with pytest.raises(OSError, match="boom"):
@@ -261,7 +262,8 @@ def test_record_for_propagates_start_failure(
     monkeypatch.setattr(session_module.time, "sleep", slept.append)
 
     session = session_module.RecordingSession(
-        cast(TapDescription, _FakeTapDescription([42]))
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
     )
 
     with pytest.raises(OSError, match="boom"):
@@ -275,10 +277,19 @@ def test_record_for_propagates_start_failure(
 
 def test_record_for_rejects_non_positive_duration() -> None:
     session = session_module.RecordingSession(
-        cast(TapDescription, _FakeTapDescription([42]))
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
     )
     with pytest.raises(ValueError, match="duration must be greater than 0"):
         session.record_for(0)
+
+
+def test_recording_session_requires_output_path_or_callback() -> None:
+    with pytest.raises(
+        ValueError,
+        match="output_path must be provided unless on_data is set for streaming mode",
+    ):
+        session_module.RecordingSession(cast(TapDescription, _FakeTapDescription([42])))
 
 
 def test_record_process_forwards_max_pending_buffers(
@@ -310,4 +321,8 @@ def test_record_process_rejects_non_positive_max_pending_buffers(
         ValueError,
         match="max_pending_buffers must be greater than 0",
     ):
-        session_module.record_process("Music", max_pending_buffers=0)
+        session_module.record_process(
+            "Music",
+            output_path="recording.wav",
+            max_pending_buffers=0,
+        )

@@ -77,9 +77,17 @@ def test_start_worker_raises_cleanly_for_missing_output_directory(tmp_path) -> N
     assert recorder._output_file is None
 
 
+def test_recorder_requires_output_path_or_callback() -> None:
+    with pytest.raises(
+        ValueError,
+        match="output_path must be provided unless on_data is set for streaming mode",
+    ):
+        AudioRecorder(123)
+
+
 def test_recorder_rejects_non_positive_max_pending_buffers() -> None:
     with pytest.raises(ValueError, match="max_pending_buffers must be greater than 0"):
-        AudioRecorder(123, max_pending_buffers=0)
+        AudioRecorder(123, "recording.wav", max_pending_buffers=0)
 
 
 def test_worker_invokes_callback_off_thread() -> None:
@@ -171,7 +179,7 @@ def test_stop_reports_core_audio_cleanup_failures(
         recorder_module, "_destroy_aggregate_device", destroy_aggregate_device
     )
 
-    recorder = AudioRecorder(123)
+    recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
     recorder._is_recording = True
     recorder._aggregate_device_id = 55
     recorder._io_proc_id = ctypes.c_void_p(77)
@@ -190,3 +198,26 @@ def test_stop_reports_core_audio_cleanup_failures(
         for note in exc_info.value.__notes__
     )
     assert any("aggregate cleanup failed" in note for note in exc_info.value.__notes__)
+
+
+def test_failed_start_does_not_clobber_existing_output_file(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "existing.wav"
+    original_bytes = b"keep-this-audio"
+    output_path.write_bytes(original_bytes)
+
+    monkeypatch.setattr(recorder_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(
+        recorder_module,
+        "_create_aggregate_device_for_tap",
+        lambda tap_uid, name: (_ for _ in ()).throw(OSError("aggregate failed")),
+    )
+
+    recorder = AudioRecorder(123, output_path)
+
+    with pytest.raises(OSError, match="aggregate failed"):
+        recorder.start()
+
+    assert output_path.read_bytes() == original_bytes
