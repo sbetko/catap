@@ -22,3 +22,4 @@ All notable changes to this project will be documented in this file.
 - Consolidated internal Core Audio bindings into a single `_coreaudio` module for easier maintenance.
 - Added internal AudioToolbox bindings and synthetic profiling coverage for `AudioConverter` / `ExtAudioFile` comparisons.
 - Flattened the package layout by moving `AudioRecorder` to `catap.recorder` and removing the one-file `catap.core` package.
+- Added a Tkinter demo app for manually exercising the browser, high-level recording flows, callback streaming, and low-level tap/recorder APIs.

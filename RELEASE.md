@@ -31,6 +31,12 @@ terminal app, also run the opt-in integration smoke tests:
 CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
 ```
 
+Optional manual GUI smoke test:
+
+```bash
+uv run python scripts/catap_demo_gui.py
+```
+
 4. Commit and tag:
 
 ```bash

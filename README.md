@@ -133,6 +133,13 @@ print(f"Recorded {recorder.duration_seconds:.2f} seconds")
 destroy_process_tap(tap_id)
 ```
 
+Planned future low-level work:
+- discover and attach to existing non-private taps that were created outside
+  `catap`
+- expose cleaner device/stream-targeted tap support around
+  `TapDescription.device_uid` and `stream`, once device and stream discovery
+  is surfaced cleanly
+
 ## Permissions
 
 Core Audio Tap requires audio capture permissions. The first time you record, macOS will prompt for permission.
@@ -161,6 +168,17 @@ If recording fails with permission errors:
 3. **Aggregate Device**: Wraps the tap in an aggregate device (required by Core Audio to read audio data)
 4. **Audio Capture**: Registers an `AudioDeviceIOProc` callback to receive audio buffers
 5. **WAV Output**: Uses Core Audio `AudioConverter` to convert float32 audio to 16-bit PCM before writing WAV output
+
+## Demo GUI
+
+For an interactive smoke-test harness that exercises process browsing, app
+recording, system recording, exclusions, mute, callback streaming, and the
+low-level tap/recorder APIs:
+
+```bash
+uv sync --group dev
+uv run python scripts/catap_demo_gui.py
+```
 
 ## Project Structure
 
