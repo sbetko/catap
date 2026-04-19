@@ -10,6 +10,7 @@ import pytest
 
 import catap.session as session_module
 from catap.bindings.process import AmbiguousAudioProcessError, AudioProcess
+from catap.bindings.tap import AudioTap
 from catap.bindings.tap_description import TapDescription
 
 
@@ -105,6 +106,11 @@ def _patch_session_symbols(
     monkeypatch.setattr(session_module, "find_process_by_name", _find_process_by_name)
     monkeypatch.setattr(session_module, "create_process_tap", _create_process_tap)
     monkeypatch.setattr(session_module, "destroy_process_tap", _destroy_process_tap)
+    monkeypatch.setattr(
+        session_module,
+        "get_tap_description",
+        lambda tap_id: _FakeTapDescription([tap_id]),
+    )
     monkeypatch.setattr(session_module, "AudioRecorder", recorder_cls)
 
 
@@ -326,3 +332,61 @@ def test_record_process_rejects_non_positive_max_pending_buffers(
             output_path="recording.wav",
             max_pending_buffers=0,
         )
+
+
+def test_record_tap_context_manager_uses_existing_tap_without_destroying_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed_tap_ids: list[int] = []
+    _patch_session_symbols(monkeypatch, destroyed_tap_ids=destroyed_tap_ids)
+
+    tap = AudioTap(88, "tap-uid", cast(TapDescription, _FakeTapDescription([88])))
+    session = session_module.record_tap(tap, output_path="recording.wav")
+
+    assert session.source_tap is tap
+    assert session.tap_description.processes == [88]
+
+    with session as active_session:
+        assert active_session.tap_id == 88
+        assert active_session.is_recording is True
+
+    assert session.tap_id is None
+    assert session.is_recording is False
+    assert destroyed_tap_ids == []
+
+
+def test_record_tap_fetches_description_for_raw_tap_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed_tap_ids: list[int] = []
+    _patch_session_symbols(monkeypatch, destroyed_tap_ids=destroyed_tap_ids)
+
+    session = session_module.record_tap(91, output_path="recording.wav")
+
+    assert session.source_tap is None
+    assert session.tap_description.processes == [91]
+
+    with session:
+        assert session.tap_id == 91
+
+    assert destroyed_tap_ids == []
+
+
+def test_record_tap_does_not_destroy_existing_tap_when_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed_tap_ids: list[int] = []
+    _patch_session_symbols(
+        monkeypatch,
+        recorder_cls=_StartFailingRecorder,
+        destroyed_tap_ids=destroyed_tap_ids,
+    )
+
+    session = session_module.record_tap(91, output_path="recording.wav")
+
+    with pytest.raises(OSError, match="boom"):
+        session.start()
+
+    assert session.tap_id is None
+    assert session.recorder is None
+    assert destroyed_tap_ids == []

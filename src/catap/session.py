@@ -14,6 +14,7 @@ from catap.bindings.process import (
     AudioProcess,
     find_process_by_name,
 )
+from catap.bindings.tap import AudioTap, get_tap_description
 from catap.bindings.tap_description import TapDescription, TapMuteBehavior
 from catap.recorder import (
     _DEFAULT_MAX_PENDING_BUFFERS,
@@ -61,6 +62,8 @@ class RecordingSession:
         on_data: Callable[[bytes, int], None] | None = None,
         *,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
+        existing_tap_id: int | None = None,
+        owns_tap: bool = True,
     ) -> None:
         """
         Create a managed recording session.
@@ -87,8 +90,11 @@ class RecordingSession:
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
 
         self.source_process: AudioProcess | None = None
+        self.source_tap: AudioTap | None = None
         self.excluded_processes: tuple[AudioProcess, ...] = ()
 
+        self._existing_tap_id = existing_tap_id
+        self._owns_tap = owns_tap
         self._tap_id: int | None = None
         self._recorder: AudioRecorder | None = None
 
@@ -187,6 +193,33 @@ class RecordingSession:
         session.excluded_processes = tuple(excluded_processes)
         return session
 
+    @classmethod
+    def from_tap(
+        cls,
+        tap: int | AudioTap,
+        output_path: str | Path | None = None,
+        *,
+        on_data: Callable[[bytes, int], None] | None = None,
+        max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
+    ) -> Self:
+        """Create a managed session that records from an existing tap."""
+        source_tap = tap if isinstance(tap, AudioTap) else None
+        tap_id = tap.audio_object_id if isinstance(tap, AudioTap) else tap
+        tap_description = (
+            source_tap.description if source_tap else get_tap_description(tap_id)
+        )
+
+        session = cls(
+            tap_description,
+            output_path=output_path,
+            on_data=on_data,
+            max_pending_buffers=max_pending_buffers,
+            existing_tap_id=tap_id,
+            owns_tap=False,
+        )
+        session.source_tap = source_tap
+        return session
+
     @property
     def tap_id(self) -> int | None:
         """Current Core Audio tap ID, if the session is active."""
@@ -253,7 +286,11 @@ class RecordingSession:
         if self.is_recording:
             raise RuntimeError("Already recording")
 
-        tap_id = create_process_tap(self.tap_description)
+        tap_id = (
+            self._existing_tap_id
+            if self._existing_tap_id is not None
+            else create_process_tap(self.tap_description)
+        )
 
         try:
             recorder = AudioRecorder(
@@ -266,8 +303,9 @@ class RecordingSession:
             self._recorder = recorder
             recorder.start()
         except Exception:
-            with contextlib.suppress(OSError):
-                destroy_process_tap(tap_id)
+            if self._owns_tap:
+                with contextlib.suppress(OSError):
+                    destroy_process_tap(tap_id)
             self._tap_id = None
             self._recorder = None
             raise
@@ -348,6 +386,9 @@ class RecordingSession:
         tap_id = self._tap_id
         self._tap_id = None
 
+        if not self._owns_tap:
+            return None
+
         try:
             destroy_process_tap(tap_id)
         except OSError as exc:
@@ -425,10 +466,32 @@ def record_system_audio(
     )
 
 
+def record_tap(
+    tap: int | AudioTap,
+    output_path: str | Path | None = None,
+    *,
+    on_data: Callable[[bytes, int], None] | None = None,
+    max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
+) -> RecordingSession:
+    """
+    Create a managed session for recording from an existing visible tap.
+
+    The tap itself is treated as externally owned and will not be destroyed
+    when the session stops or closes.
+    """
+    return RecordingSession.from_tap(
+        tap,
+        output_path=output_path,
+        on_data=on_data,
+        max_pending_buffers=max_pending_buffers,
+    )
+
+
 __all__ = [
     "AmbiguousAudioProcessError",
     "AudioProcessNotFoundError",
     "RecordingSession",
     "record_process",
     "record_system_audio",
+    "record_tap",
 ]

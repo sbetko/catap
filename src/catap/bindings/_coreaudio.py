@@ -166,3 +166,35 @@ def get_property_cfstring(
         return str(objc.objc_object(c_void_p=cf_string_ref.value))  # ty: ignore[unresolved-attribute]
     finally:
         _CFRelease(cf_string_ref)
+
+
+def get_property_objc_object(
+    object_id: int,
+    selector: int,
+    scope: int = kAudioObjectPropertyScopeGlobal,
+    element: int = kAudioObjectPropertyElementMain,
+) -> Any:
+    """Fetch an Objective-C object property and wrap it for PyObjC."""
+    address = _property_address(selector, scope, element)
+    if get_property_data_size(object_id, address) == 0:
+        raise OSError(f"Property {selector:08x} returned no object")
+
+    objc_ref = ctypes.c_void_p()
+    size = ctypes.c_uint32(ctypes.sizeof(objc_ref))
+    status = _AudioObjectGetPropertyData(
+        object_id,
+        ctypes.byref(address),
+        0,
+        None,
+        ctypes.byref(size),
+        ctypes.byref(objc_ref),
+    )
+    if status != 0:
+        raise OSError(
+            f"Failed to get Objective-C property for selector {selector:08x}: "
+            f"status {status}"
+        )
+    if not objc_ref.value:
+        raise OSError(f"Property {selector:08x} returned an empty object")
+
+    return objc.objc_object(c_void_p=objc_ref.value)  # ty: ignore[unresolved-attribute]

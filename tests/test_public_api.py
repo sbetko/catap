@@ -19,8 +19,12 @@ def test_module_has_expected_exports() -> None:
 
     assert "AmbiguousAudioProcessError" in module.__all__
     assert "TapDescription" in module.__all__
+    assert "AudioTap" in module.__all__
     assert "AudioRecorder" in module.__all__
     assert "RecordingSession" in module.__all__
+    assert "list_audio_taps" in module.__all__
+    assert "find_tap_by_uid" in module.__all__
+    assert "record_tap" in module.__all__
     assert "record_process" in module.__all__
     assert "record_system_audio" in module.__all__
     assert isinstance(module.__version__, str)
@@ -30,6 +34,7 @@ def test_public_exports_reference_expected_symbols() -> None:
     module = importlib.import_module("catap")
     recorder_module = importlib.import_module("catap.recorder")
     tap_module = importlib.import_module("catap.bindings.tap_description")
+    visible_tap_module = importlib.import_module("catap.bindings.tap")
     process_module = importlib.import_module("catap.bindings.process")
     hardware_module = importlib.import_module("catap.bindings.hardware")
     session_module = importlib.import_module("catap.session")
@@ -42,12 +47,16 @@ def test_public_exports_reference_expected_symbols() -> None:
         is process_module.AmbiguousAudioProcessError
     )
     assert module.AudioProcess is process_module.AudioProcess
+    assert module.AudioTap is visible_tap_module.AudioTap
     assert module.list_audio_processes is process_module.list_audio_processes
     assert module.find_process_by_name is process_module.find_process_by_name
+    assert module.list_audio_taps is visible_tap_module.list_audio_taps
+    assert module.find_tap_by_uid is visible_tap_module.find_tap_by_uid
     assert module.create_process_tap is hardware_module.create_process_tap
     assert module.destroy_process_tap is hardware_module.destroy_process_tap
     assert module.AudioProcessNotFoundError is session_module.AudioProcessNotFoundError
     assert module.RecordingSession is session_module.RecordingSession
+    assert module.record_tap is session_module.record_tap
     assert module.record_process is session_module.record_process
     assert module.record_system_audio is session_module.record_system_audio
 

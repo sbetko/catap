@@ -153,6 +153,8 @@ from catap import (
     create_process_tap,
     destroy_process_tap,
     find_process_by_name,
+    list_audio_taps,
+    record_tap,
 )
 
 process = find_process_by_name("Safari")
@@ -176,9 +178,18 @@ print(f"Recorded {recorder.duration_seconds:.2f} seconds")
 destroy_process_tap(tap_id)
 ```
 
+If another app has already created a non-private tap, you can discover it and
+attach a recorder without taking ownership of the tap itself:
+
+```python
+from catap import list_audio_taps, record_tap
+
+tap = next(tap for tap in list_audio_taps() if tap.name == "Shared Mix")
+session = record_tap(tap, output_path="shared-mix.wav")
+session.record_for(5)
+```
+
 Planned future low-level work:
-- discover and attach to existing non-private taps that were created outside
-  `catap`
 - expose cleaner device/stream-targeted tap support around
   `TapDescription.device_uid` and `stream`, once device and stream discovery
   is surfaced cleanly
