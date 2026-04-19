@@ -35,6 +35,25 @@ def test_list_audio_processes_smoke() -> None:
         assert isinstance(process.is_outputting, bool)
 
 
+def test_list_audio_devices_smoke() -> None:
+    if not RUN_INTEGRATION:
+        pytest.skip("set CATAP_RUN_INTEGRATION=1 to run integration smoke tests")
+
+    from catap import list_audio_devices
+
+    devices = list_audio_devices()
+    assert isinstance(devices, list)
+
+    for device in devices[:5]:
+        assert isinstance(device.audio_object_id, int)
+        assert device.audio_object_id > 0
+        assert isinstance(device.uid, str)
+        assert device.uid
+        assert isinstance(device.name, str)
+        assert device.name
+        assert isinstance(device.streams, tuple)
+
+
 def test_record_system_audio_smoke(tmp_path) -> None:
     if not RUN_INTEGRATION:
         pytest.skip("set CATAP_RUN_INTEGRATION=1 to run integration smoke tests")

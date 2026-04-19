@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from enum import IntEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import objc
 from Foundation import NSArray, NSNumber  # ty: ignore[unresolved-import]
+
+if TYPE_CHECKING:
+    from catap.bindings.device import AudioDeviceStream
 
 try:
     CATapDescription = objc.lookUpClass("CATapDescription")  # ty: ignore[unresolved-attribute]
@@ -31,7 +34,8 @@ class TapMuteBehavior(IntEnum):
 
     UNMUTED = 0  # Audio sent to hardware AND captured
     MUTED = 1  # Audio captured only, not sent to hardware
-    MUTED_WHEN_TAPPED = 2  # Muted only while an audio client is actively reading the tap
+    # Muted only while an audio client is actively reading the tap.
+    MUTED_WHEN_TAPPED = 2
 
 
 class TapDescription:
@@ -64,6 +68,20 @@ class TapDescription:
         """Create an instance using a CATapDescription process initializer."""
         initializer = getattr(cls._alloc(), initializer_name)
         return cls._from_objc_description(initializer(_process_id_array(processes)))
+
+    @staticmethod
+    def _resolve_device_stream(
+        device: str | AudioDeviceStream,
+        stream: int | None,
+    ) -> tuple[str, int]:
+        """Normalize a target device UID and stream index."""
+        if hasattr(device, "device_uid") and hasattr(device, "stream_index"):
+            return str(device.device_uid), int(device.stream_index)
+
+        if stream is None:
+            raise ValueError("stream must be provided when targeting a device UID")
+
+        return str(device), stream
 
     @classmethod
     def stereo_mixdown_of_processes(cls, processes: Sequence[int]) -> TapDescription:
@@ -116,6 +134,44 @@ class TapDescription:
             TapDescription configured for global mono tap
         """
         return cls._from_processes(processes, "initMonoGlobalTapButExcludeProcesses_")
+
+    @classmethod
+    def of_processes_for_device_stream(
+        cls,
+        processes: Sequence[int],
+        device: str | AudioDeviceStream,
+        stream: int | None = None,
+    ) -> TapDescription:
+        """
+        Create a tap for processes routed to a specific hardware device stream.
+
+        Pass either an ``AudioDeviceStream`` from ``list_audio_devices()`` or a
+        raw ``device_uid`` plus ``stream`` index.
+        """
+        device_uid, stream_index = cls._resolve_device_stream(device, stream)
+        initializer = cls._alloc().initWithProcesses_andDeviceUID_withStream_
+        return cls._from_objc_description(
+            initializer(_process_id_array(processes), device_uid, stream_index)
+        )
+
+    @classmethod
+    def excluding_processes_for_device_stream(
+        cls,
+        processes: Sequence[int],
+        device: str | AudioDeviceStream,
+        stream: int | None = None,
+    ) -> TapDescription:
+        """
+        Create a tap for one hardware stream while excluding selected processes.
+
+        Pass either an ``AudioDeviceStream`` from ``list_audio_devices()`` or a
+        raw ``device_uid`` plus ``stream`` index.
+        """
+        device_uid, stream_index = cls._resolve_device_stream(device, stream)
+        initializer = cls._alloc().initExcludingProcesses_andDeviceUID_withStream_
+        return cls._from_objc_description(
+            initializer(_process_id_array(processes), device_uid, stream_index)
+        )
 
     @property
     def name(self) -> str:
@@ -221,5 +277,7 @@ class TapDescription:
             f"processes={self.processes}, "
             f"is_exclusive={self.is_exclusive}, "
             f"is_mono={self.is_mono}, "
+            f"device_uid={self.device_uid!r}, "
+            f"stream={self.stream!r}, "
             f"mute_behavior={self.mute_behavior.name})"
         )

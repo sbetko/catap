@@ -189,10 +189,21 @@ session = record_tap(tap, output_path="shared-mix.wav")
 session.record_for(5)
 ```
 
-Planned future low-level work:
-- expose cleaner device/stream-targeted tap support around
-  `TapDescription.device_uid` and `stream`, once device and stream discovery
-  is surfaced cleanly
+Device-targeted taps can be built directly from discovered hardware streams:
+
+```python
+from catap import TapDescription, find_process_by_name, list_audio_devices
+
+process = find_process_by_name("Safari")
+device = next(device for device in list_audio_devices() if device.is_default_output)
+stream = device.output_streams[0]
+
+tap_desc = TapDescription.of_processes_for_device_stream(
+    [process.audio_object_id],
+    stream,
+)
+tap_desc.name = "Safari on default speakers"
+```
 
 ## Permissions
 

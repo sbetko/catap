@@ -18,10 +18,16 @@ def test_module_has_expected_exports() -> None:
     module = importlib.import_module("catap")
 
     assert "AmbiguousAudioProcessError" in module.__all__
+    assert "AmbiguousAudioDeviceError" in module.__all__
     assert "TapDescription" in module.__all__
+    assert "AudioDevice" in module.__all__
+    assert "AudioDeviceStream" in module.__all__
     assert "AudioTap" in module.__all__
     assert "AudioRecorder" in module.__all__
     assert "RecordingSession" in module.__all__
+    assert "list_audio_devices" in module.__all__
+    assert "find_audio_device_by_uid" in module.__all__
+    assert "find_audio_device_by_name" in module.__all__
     assert "list_audio_taps" in module.__all__
     assert "find_tap_by_uid" in module.__all__
     assert "record_tap" in module.__all__
@@ -32,6 +38,7 @@ def test_module_has_expected_exports() -> None:
 
 def test_public_exports_reference_expected_symbols() -> None:
     module = importlib.import_module("catap")
+    device_module = importlib.import_module("catap.bindings.device")
     recorder_module = importlib.import_module("catap.recorder")
     tap_module = importlib.import_module("catap.bindings.tap_description")
     visible_tap_module = importlib.import_module("catap.bindings.tap")
@@ -39,15 +46,20 @@ def test_public_exports_reference_expected_symbols() -> None:
     hardware_module = importlib.import_module("catap.bindings.hardware")
     session_module = importlib.import_module("catap.session")
 
+    assert module.AmbiguousAudioDeviceError is device_module.AmbiguousAudioDeviceError
+    assert module.AudioDevice is device_module.AudioDevice
+    assert module.AudioDeviceStream is device_module.AudioDeviceStream
     assert module.AudioRecorder is recorder_module.AudioRecorder
     assert module.TapDescription is tap_module.TapDescription
     assert module.TapMuteBehavior is tap_module.TapMuteBehavior
     assert (
-        module.AmbiguousAudioProcessError
-        is process_module.AmbiguousAudioProcessError
+        module.AmbiguousAudioProcessError is process_module.AmbiguousAudioProcessError
     )
     assert module.AudioProcess is process_module.AudioProcess
     assert module.AudioTap is visible_tap_module.AudioTap
+    assert module.list_audio_devices is device_module.list_audio_devices
+    assert module.find_audio_device_by_name is device_module.find_audio_device_by_name
+    assert module.find_audio_device_by_uid is device_module.find_audio_device_by_uid
     assert module.list_audio_processes is process_module.list_audio_processes
     assert module.find_process_by_name is process_module.find_process_by_name
     assert module.list_audio_taps is visible_tap_module.list_audio_taps
