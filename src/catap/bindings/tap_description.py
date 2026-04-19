@@ -31,7 +31,7 @@ class TapMuteBehavior(IntEnum):
 
     UNMUTED = 0  # Audio sent to hardware AND captured
     MUTED = 1  # Audio captured only, not sent to hardware
-    MUTED_WHEN_TAPPED = 2  # Muted only while tap is being read
+    MUTED_WHEN_TAPPED = 2  # Muted only while an audio client is actively reading the tap
 
 
 class TapDescription:
