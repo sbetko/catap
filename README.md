@@ -245,6 +245,15 @@ uv sync --group dev
 uv run python scripts/catap_demo_gui.py
 ```
 
+For lower-level tap work, the core lab now exposes shared-tap attachment,
+device-stream-targeted tap creation, and a built-in helper tone launcher:
+
+```bash
+uv sync --group dev
+uv run python scripts/catap_core_lab.py
+uv run python scripts/catap_test_tone.py --seconds 60
+```
+
 ## Project Structure
 
 ```
