@@ -9,6 +9,7 @@ from catap.bindings._coreaudio import (
     get_property_bytes as _get_audio_object_property,
     get_property_cfstring as _get_audio_object_cfstring_property,
     get_property_objc_object as _get_audio_object_objc_property,
+    kAudioHardwareBadObjectError,
     kAudioObjectSystemObject,
 )
 from catap.bindings.tap_description import TapDescription
@@ -18,9 +19,35 @@ kAudioTapPropertyUID = int.from_bytes(b"tuid", "big")
 kAudioTapPropertyDescription = int.from_bytes(b"tdsc", "big")
 
 
+class AudioTapNotFoundError(OSError):
+    """Raised when a tap ID no longer refers to a live Core Audio tap."""
+
+
+def _coerce_missing_tap_error(tap_id: int, exc: OSError) -> OSError:
+    """Return a friendlier exception for stale or destroyed taps."""
+    if getattr(exc, "status", None) == kAudioHardwareBadObjectError:
+        return AudioTapNotFoundError(
+            f"Audio tap {tap_id} is no longer available. "
+            "It may have been destroyed by another process."
+        )
+    return exc
+
+
+def _raise_if_missing_tap(tap_id: int, exc: OSError) -> None:
+    """Raise a tap-specific error for stale tap IDs."""
+    if getattr(exc, "status", None) == kAudioHardwareBadObjectError:
+        raise _coerce_missing_tap_error(tap_id, exc) from exc
+
+
 def get_tap_description(tap_id: int) -> TapDescription:
     """Return the current description for an existing tap."""
-    description = _get_audio_object_objc_property(tap_id, kAudioTapPropertyDescription)
+    try:
+        description = _get_audio_object_objc_property(
+            tap_id, kAudioTapPropertyDescription
+        )
+    except OSError as exc:
+        _raise_if_missing_tap(tap_id, exc)
+        raise
     return TapDescription._from_objc_description(description)
 
 
@@ -94,4 +121,10 @@ def find_tap_by_uid(uid: str) -> AudioTap | None:
     return None
 
 
-__all__ = ["AudioTap", "find_tap_by_uid", "get_tap_description", "list_audio_taps"]
+__all__ = [
+    "AudioTap",
+    "AudioTapNotFoundError",
+    "find_tap_by_uid",
+    "get_tap_description",
+    "list_audio_taps",
+]

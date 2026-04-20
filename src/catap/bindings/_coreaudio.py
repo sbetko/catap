@@ -23,6 +23,7 @@ kAudioObjectPropertyScopeGlobal = int.from_bytes(b"glob", "big")
 kAudioObjectPropertyScopeInput = int.from_bytes(b"inpt", "big")
 kAudioObjectPropertyScopeOutput = int.from_bytes(b"outp", "big")
 kAudioObjectPropertyElementMain = 0
+kAudioHardwareBadObjectError = int.from_bytes(b"!obj", "big")
 
 _PropertyAddress = ctypes.c_uint32 * 3  # (selector, scope, element)
 
@@ -62,6 +63,13 @@ def _property_address(
     return _PropertyAddress(selector, scope, element)
 
 
+def _status_error(message: str, status: int) -> OSError:
+    """Return an ``OSError`` annotated with the Core Audio status code."""
+    error = OSError(message)
+    error.status = status  # type: ignore[attr-defined]
+    return error
+
+
 def get_property_data_size(object_id: int, address: Any) -> int:
     """Return the byte size of a property, raising OSError on failure."""
     size = ctypes.c_uint32(0)
@@ -69,9 +77,10 @@ def get_property_data_size(object_id: int, address: Any) -> int:
         object_id, ctypes.byref(address), 0, None, ctypes.byref(size)
     )
     if status != 0:
-        raise OSError(
+        raise _status_error(
             f"Failed to get property size for selector {address[0]:08x}: "
-            f"status {status}"
+            f"status {status}",
+            status,
         )
     return size.value
 
@@ -99,8 +108,9 @@ def get_property_bytes(
         buffer,
     )
     if status != 0:
-        raise OSError(
-            f"Failed to get property data for selector {selector:08x}: status {status}"
+        raise _status_error(
+            f"Failed to get property data for selector {selector:08x}: status {status}",
+            status,
         )
     return buffer.raw[: actual_size.value]
 
@@ -125,9 +135,10 @@ def get_property_struct(
         ctypes.byref(value),
     )
     if status != 0:
-        raise OSError(
+        raise _status_error(
             f"Failed to get property struct for selector {selector:08x}: "
-            f"status {status}"
+            f"status {status}",
+            status,
         )
     return value
 
@@ -157,8 +168,9 @@ def get_property_cfstring(
         ctypes.byref(cf_string_ref),
     )
     if status != 0:
-        raise OSError(
-            f"Failed to get property data for selector {selector:08x}: status {status}"
+        raise _status_error(
+            f"Failed to get property data for selector {selector:08x}: status {status}",
+            status,
         )
 
     if not cf_string_ref.value:
@@ -192,9 +204,10 @@ def get_property_objc_object(
         ctypes.byref(objc_ref),
     )
     if status != 0:
-        raise OSError(
+        raise _status_error(
             f"Failed to get Objective-C property for selector {selector:08x}: "
-            f"status {status}"
+            f"status {status}",
+            status,
         )
     if not objc_ref.value:
         raise OSError(f"Property {selector:08x} returned an empty object")

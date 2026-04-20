@@ -23,6 +23,7 @@ def test_module_has_expected_exports() -> None:
     assert "AudioDevice" in module.__all__
     assert "AudioDeviceStream" in module.__all__
     assert "AudioTap" in module.__all__
+    assert "AudioTapNotFoundError" in module.__all__
     assert "AudioRecorder" in module.__all__
     assert "RecordingSession" in module.__all__
     assert "list_audio_devices" in module.__all__
@@ -57,6 +58,7 @@ def test_public_exports_reference_expected_symbols() -> None:
     )
     assert module.AudioProcess is process_module.AudioProcess
     assert module.AudioTap is visible_tap_module.AudioTap
+    assert module.AudioTapNotFoundError is visible_tap_module.AudioTapNotFoundError
     assert module.list_audio_devices is device_module.list_audio_devices
     assert module.find_audio_device_by_name is device_module.find_audio_device_by_name
     assert module.find_audio_device_by_uid is device_module.find_audio_device_by_uid

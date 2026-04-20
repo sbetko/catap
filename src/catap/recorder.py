@@ -23,6 +23,7 @@ from catap.bindings._coreaudio import (
     kAudioObjectPropertyElementMain,
     kAudioObjectPropertyScopeGlobal,
 )
+from catap.bindings.tap import _raise_if_missing_tap
 
 # Pool buffers are ctypes char arrays rather than bytearrays because
 # ``ctypes.memmove`` rejects bytearray/memoryview as source or destination,
@@ -411,7 +412,11 @@ class AudioRecorder:
         if self._is_recording:
             raise RuntimeError("Already recording")
 
-        tap_uid = _get_tap_uid(self.tap_id)
+        try:
+            tap_uid = _get_tap_uid(self.tap_id)
+        except OSError as exc:
+            _raise_if_missing_tap(self.tap_id, exc)
+            raise
 
         try:
             asbd = get_tap_format(self.tap_id)
@@ -419,7 +424,8 @@ class AudioRecorder:
             self._num_channels = asbd.mChannelsPerFrame
             self._bits_per_sample = asbd.mBitsPerChannel
             self._is_float = bool(asbd.mFormatFlags & kAudioFormatFlagIsFloat)
-        except OSError:
+        except OSError as exc:
+            _raise_if_missing_tap(self.tap_id, exc)
             # Use defaults if we can't get format.
             pass
 

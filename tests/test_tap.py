@@ -142,3 +142,21 @@ def test_find_tap_by_uid_matches_exact_uid(monkeypatch: pytest.MonkeyPatch) -> N
     assert tap_module.find_tap_by_uid("tap-beta") is beta
     assert tap_module.find_tap_by_uid("missing") is None
     assert tap_module.find_tap_by_uid("") is None
+
+
+def test_get_tap_description_raises_audio_tap_not_found_for_bad_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_error = OSError("bad object")
+    stale_error.status = tap_module.kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        tap_module,
+        "_get_audio_object_objc_property",
+        lambda object_id, selector: (_ for _ in ()).throw(stale_error),
+    )
+
+    with pytest.raises(
+        tap_module.AudioTapNotFoundError,
+        match="Audio tap 77 is no longer available",
+    ):
+        tap_module.get_tap_description(77)

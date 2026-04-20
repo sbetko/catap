@@ -38,7 +38,12 @@ from catap.bindings.process import (
     find_process_by_name,
     list_audio_processes,
 )
-from catap.bindings.tap import AudioTap, find_tap_by_uid, list_audio_taps
+from catap.bindings.tap import (
+    AudioTap,
+    AudioTapNotFoundError,
+    find_tap_by_uid,
+    list_audio_taps,
+)
 from catap.bindings.tap_description import TapDescription, TapMuteBehavior
 from catap.recorder import AudioRecorder
 from catap.session import (
@@ -63,6 +68,7 @@ __all__ = [
     "AudioProcessNotFoundError",
     "AudioRecorder",
     "AudioTap",
+    "AudioTapNotFoundError",
     "RecordingSession",
     "TapDescription",
     "TapMuteBehavior",

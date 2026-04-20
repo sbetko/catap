@@ -10,7 +10,7 @@ import pytest
 
 import catap.session as session_module
 from catap.bindings.process import AmbiguousAudioProcessError, AudioProcess
-from catap.bindings.tap import AudioTap
+from catap.bindings.tap import AudioTap, AudioTapNotFoundError
 from catap.bindings.tap_description import TapDescription
 
 
@@ -71,6 +71,14 @@ class _StartFailingRecorder(_FakeRecorder):
     def start(self) -> None:
         self.start_calls += 1
         raise OSError("boom")
+
+
+class _MissingTapRecorder(_FakeRecorder):
+    def start(self) -> None:
+        self.start_calls += 1
+        raise AudioTapNotFoundError(
+            "Audio tap 91 is no longer available. It may have been destroyed."
+        )
 
 
 def _patch_session_symbols(
@@ -386,6 +394,26 @@ def test_record_tap_does_not_destroy_existing_tap_when_start_fails(
 
     with pytest.raises(OSError, match="boom"):
         session.start()
+
+    assert session.tap_id is None
+    assert session.recorder is None
+    assert destroyed_tap_ids == []
+
+
+def test_record_tap_propagates_stale_tap_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed_tap_ids: list[int] = []
+    _patch_session_symbols(
+        monkeypatch,
+        recorder_cls=_MissingTapRecorder,
+        destroyed_tap_ids=destroyed_tap_ids,
+    )
+
+    session = session_module.record_tap(91, output_path="recording.wav")
+
+    with pytest.raises(AudioTapNotFoundError, match="Audio tap 91 is no longer"):
+        session.record_for(1.0)
 
     assert session.tap_id is None
     assert session.recorder is None

@@ -11,6 +11,7 @@ import wave
 import pytest
 
 import catap.recorder as recorder_module
+from catap.bindings.tap import AudioTapNotFoundError
 from catap.recorder import AudioRecorder
 
 
@@ -221,3 +222,24 @@ def test_failed_start_does_not_clobber_existing_output_file(
         recorder.start()
 
     assert output_path.read_bytes() == original_bytes
+
+
+def test_start_raises_audio_tap_not_found_error_for_stale_tap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_error = OSError("tap disappeared")
+    stale_error.status = int.from_bytes(b"!obj", "big")  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        recorder_module,
+        "_get_tap_uid",
+        lambda tap_id: (_ for _ in ()).throw(stale_error),
+    )
+
+    recorder = AudioRecorder(123, "recording.wav")
+
+    with pytest.raises(
+        AudioTapNotFoundError,
+        match="Audio tap 123 is no longer available",
+    ):
+        recorder.start()
