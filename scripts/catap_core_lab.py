@@ -165,6 +165,25 @@ def configure_styles(root: tk.Tk) -> None:
         relief="flat",
         font=("Avenir Next", 11, "bold"),
     )
+    style.configure(
+        "Lab.TNotebook",
+        background=CARD,
+        borderwidth=0,
+        tabmargins=(0, 0, 0, 0),
+    )
+    style.configure(
+        "Lab.TNotebook.Tab",
+        background=CARD_ALT,
+        foreground=MUTED,
+        borderwidth=0,
+        padding=(14, 8),
+        font=("Avenir Next", 11, "bold"),
+    )
+    style.map(
+        "Lab.TNotebook.Tab",
+        background=[("selected", CARD_ALT)],
+        foreground=[("selected", INK)],
+    )
     style.map(
         "Treeview",
         background=[("selected", ACCENT_SOFT)],
@@ -372,8 +391,7 @@ class CoreLabApp:
         )
         frame.grid(row=0, column=col, sticky="nsew", padx=6)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=3)
-        frame.rowconfigure(1, weight=2)
+        frame.rowconfigure(0, weight=1)
 
         process_box = ttk.LabelFrame(
             frame,
@@ -453,7 +471,7 @@ class CoreLabApp:
 
         self.target_listbox = tk.Listbox(
             process_box,
-            height=5,
+            height=4,
             bg=LOG_BG,
             fg=INK,
             relief=tk.SOLID,
@@ -482,42 +500,47 @@ class CoreLabApp:
         ).pack(side=tk.LEFT)
 
         lower = ttk.Frame(frame, style="Card.TFrame")
-        lower.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        lower.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         lower.columnconfigure(0, weight=1)
         lower.rowconfigure(0, weight=1)
-        lower.rowconfigure(1, weight=1)
 
-        tap_box = ttk.LabelFrame(
-            lower,
-            text="Shared Taps",
-            style="Inner.TLabelframe",
-            padding=10,
-        )
-        tap_box.grid(row=0, column=0, sticky="nsew")
+        tool_tabs = ttk.Notebook(lower, style="Lab.TNotebook")
+        tool_tabs.grid(row=0, column=0, sticky="ew")
+
+        tap_box = ttk.Frame(tool_tabs, style="Inner.TFrame", padding=10)
         tap_box.columnconfigure(0, weight=1)
         tap_box.rowconfigure(1, weight=1)
-
         tap_actions = ttk.Frame(tap_box, style="Inner.TFrame")
         tap_actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Button(tap_actions, text="Refresh", command=self._refresh_taps).pack(
-            side=tk.LEFT
-        )
+        tap_actions.columnconfigure(0, weight=1)
+        tap_actions.columnconfigure(1, weight=1)
+        tap_actions.columnconfigure(2, weight=1)
+        ttk.Button(
+            tap_actions,
+            text="Refresh",
+            command=self._refresh_taps,
+        ).grid(row=0, column=0, sticky="ew")
         ttk.Button(
             tap_actions,
             text="Attach Selected Tap",
             command=self._attach_selected_tap,
-        ).pack(side=tk.LEFT, padx=8)
+        ).grid(row=0, column=1, sticky="ew", padx=8)
         self.btn_delete_shared_tap = ttk.Button(
             tap_actions,
             text="Delete Tap",
             style="Danger.TButton",
             command=self._delete_selected_tap,
         )
-        self.btn_delete_shared_tap.pack(side=tk.LEFT)
+        self.btn_delete_shared_tap.grid(row=0, column=2, sticky="ew")
+
+        tap_list_frame = ttk.Frame(tap_box, style="Inner.TFrame")
+        tap_list_frame.grid(row=1, column=0, sticky="nsew")
+        tap_list_frame.columnconfigure(0, weight=1)
+        tap_list_frame.rowconfigure(0, weight=1)
 
         self.tap_listbox = tk.Listbox(
-            tap_box,
-            height=8,
+            tap_list_frame,
+            height=5,
             bg=LOG_BG,
             fg=INK,
             relief=tk.SOLID,
@@ -525,25 +548,24 @@ class CoreLabApp:
             highlightthickness=0,
             font=MONO_FONT,
         )
-        self.tap_listbox.grid(row=1, column=0, sticky="nsew")
+        self.tap_listbox.grid(row=0, column=0, sticky="nsew")
+
+        tap_scroll = ttk.Scrollbar(
+            tap_list_frame,
+            orient=tk.VERTICAL,
+            command=self.tap_listbox.yview,
+        )
+        tap_scroll.grid(row=0, column=1, sticky="ns")
+        self.tap_listbox.configure(yscrollcommand=tap_scroll.set)
 
         ttk.Label(
             tap_box,
-            text=(
-                "Visible taps are non-private taps created by this process or "
-                "another one."
-            ),
+            text="Visible non-private taps from this process or another one.",
             style="Inner.TLabelframe.Label",
             wraplength=360,
         ).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
-        tone_box = ttk.LabelFrame(
-            lower,
-            text="Helper Tone",
-            style="Inner.TLabelframe",
-            padding=10,
-        )
-        tone_box.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        tone_box = ttk.Frame(tool_tabs, style="Inner.TFrame", padding=10)
         tone_box.columnconfigure(1, weight=1)
 
         ttk.Label(
@@ -576,6 +598,9 @@ class CoreLabApp:
             style="Inner.TLabelframe.Label",
             wraplength=360,
         ).grid(row=2, column=0, columnspan=2, sticky="w")
+
+        tool_tabs.add(tap_box, text="Shared Taps")
+        tool_tabs.add(tone_box, text="Helper Tone")
 
     def _build_tap_panel(self, parent: ttk.Frame, col: int) -> None:
         frame = ttk.LabelFrame(
