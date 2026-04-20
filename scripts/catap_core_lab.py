@@ -208,12 +208,13 @@ def _fmt_device_label(device: AudioDevice) -> str:
 
 
 def _fmt_tap_label(tap: AudioTap) -> str:
+    visibility = "[private]" if tap.is_private else "[shared]"
     route = (
         f"{tap.device_uid} stream {tap.stream}"
         if tap.device_uid is not None and tap.stream is not None
         else "all routes"
     )
-    return f"{tap.name} · id {tap.audio_object_id} · {route}"
+    return f"{visibility} {tap.name} · id {tap.audio_object_id} · {route}"
 
 
 class Telemetry:
@@ -553,8 +554,8 @@ class CoreLabApp:
         ttk.Label(
             frame,
             text=(
-                "Create a new CATapDescription or switch over to a visible "
-                "shared tap from another process."
+                "Create a new CATapDescription or switch over to an existing "
+                "tap that this process can see."
             ),
             style="MutedCard.TLabel",
             wraplength=360,
@@ -696,7 +697,10 @@ class CoreLabApp:
 
         ttk.Label(
             shared_tab,
-            text="Attach to or delete a visible non-private tap.",
+            text=(
+                "Attach to or delete a visible tap. Private taps are only "
+                "visible to the process that created them."
+            ),
             style="Inner.TLabelframe.Label",
             wraplength=360,
         ).grid(row=0, column=0, sticky="w", pady=(0, 10))
@@ -751,13 +755,16 @@ class CoreLabApp:
 
         ttk.Label(
             shared_tab,
-            text="Visible non-private taps from this process or another one.",
+            text=(
+                "Rows are tagged [shared] for non-private taps and [private] "
+                "for creator-only taps."
+            ),
             style="Inner.TLabelframe.Label",
             wraplength=360,
         ).grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         tap_tabs.add(create_tab, text="Create Tap")
-        tap_tabs.add(shared_tab, text="Use Shared Tap")
+        tap_tabs.add(shared_tab, text="Use Existing Tap")
 
         active_box = ttk.LabelFrame(
             frame,
@@ -1117,7 +1124,7 @@ class CoreLabApp:
         if not selection:
             messagebox.showinfo(
                 "No Tap Selected",
-                "Choose a visible shared tap from the list first.",
+                "Choose a visible tap from the list first.",
             )
             return
 
@@ -1126,7 +1133,7 @@ class CoreLabApp:
             tap_id=tap.audio_object_id,
             description=tap.description,
             owned=False,
-            source=f"Attached shared tap `{tap.name}`",
+            source=f"Attached existing tap `{tap.name}`",
         )
 
     def _delete_selected_tap(self) -> None:
@@ -1237,7 +1244,7 @@ class CoreLabApp:
             self._refresh_taps()
             return
 
-        self._clear_active_tap(f"Detached shared tap {tap_id}.")
+        self._clear_active_tap(f"Detached existing tap {tap_id}.")
 
     def _choose_dir(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.output_dir.get())
