@@ -324,6 +324,7 @@ class CoreLabApp:
         self.device_combo: ttk.Combobox
         self.stream_combo: ttk.Combobox
         self.mono_check: ttk.Checkbutton
+        self.btn_delete_shared_tap: ttk.Button
         self.btn_create_tap: ttk.Button
         self.btn_destroy_tap: ttk.Button
         self.btn_start_rec: ttk.Button
@@ -506,6 +507,13 @@ class CoreLabApp:
             text="Attach Selected Tap",
             command=self._attach_selected_tap,
         ).pack(side=tk.LEFT, padx=8)
+        self.btn_delete_shared_tap = ttk.Button(
+            tap_actions,
+            text="Delete Tap",
+            style="Danger.TButton",
+            command=self._delete_selected_tap,
+        )
+        self.btn_delete_shared_tap.pack(side=tk.LEFT)
 
         self.tap_listbox = tk.Listbox(
             tap_box,
@@ -578,6 +586,7 @@ class CoreLabApp:
         )
         frame.grid(row=0, column=col, sticky="nsew", padx=6)
         frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(4, weight=1)
 
         ttk.Label(
             frame,
@@ -713,21 +722,32 @@ class CoreLabApp:
         )
         self.btn_destroy_tap.pack(side=tk.LEFT, padx=10)
 
-        ttk.Label(
+        active_box = ttk.LabelFrame(
             frame,
+            text="Active Tap",
+            style="Inner.TLabelframe",
+            padding=10,
+        )
+        active_box.grid(row=4, column=0, sticky="nsew")
+        active_box.columnconfigure(0, weight=1)
+        active_box.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            active_box,
             textvariable=self.tap_status,
-            style="Section.TLabel",
-            foreground=SUCCESS,
-        ).grid(row=4, column=0, sticky="w")
+            style="Inner.TLabelframe.Label",
+            wraplength=360,
+        ).grid(row=0, column=0, sticky="w")
         ttk.Label(
-            frame,
+            active_box,
             textvariable=self.tap_meta,
             font=MONO_FONT,
-            background=CARD,
+            background=CARD_ALT,
             foreground=MUTED,
             justify=tk.LEFT,
-            wraplength=380,
-        ).grid(row=5, column=0, sticky="w", pady=(8, 0))
+            anchor="nw",
+            wraplength=360,
+        ).grid(row=1, column=0, sticky="nsew", pady=(10, 0))
 
     def _build_recorder_panel(self, parent: ttk.Frame, col: int) -> None:
         frame = ttk.LabelFrame(
@@ -738,6 +758,7 @@ class CoreLabApp:
         )
         frame.grid(row=0, column=col, sticky="nsew", padx=6)
         frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
 
         ttk.Label(
             frame,
@@ -812,20 +833,32 @@ class CoreLabApp:
         )
         self.btn_stop_rec.pack(side=tk.LEFT, padx=10)
 
-        ttk.Label(
+        live_box = ttk.LabelFrame(
             frame,
+            text="Live Metrics",
+            style="Inner.TLabelframe",
+            padding=10,
+        )
+        live_box.grid(row=3, column=0, sticky="nsew")
+        live_box.columnconfigure(0, weight=1)
+        live_box.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            live_box,
             textvariable=self.recorder_status,
-            style="Section.TLabel",
-        ).grid(row=3, column=0, sticky="w")
+            style="Inner.TLabelframe.Label",
+            wraplength=360,
+        ).grid(row=0, column=0, sticky="w")
         ttk.Label(
-            frame,
+            live_box,
             textvariable=self.telemetry_status,
             font=MONO_FONT,
-            background=CARD,
+            background=CARD_ALT,
             foreground=SUCCESS,
             justify=tk.LEFT,
-            wraplength=380,
-        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+            anchor="nw",
+            wraplength=360,
+        ).grid(row=1, column=0, sticky="nsew", pady=(10, 0))
 
     def _refresh_processes(self) -> None:
         try:
@@ -892,6 +925,15 @@ class CoreLabApp:
         self.tap_listbox.delete(0, tk.END)
         for tap in self.visible_taps:
             self.tap_listbox.insert(tk.END, _fmt_tap_label(tap))
+
+    def _selected_visible_tap(self) -> AudioTap | None:
+        selection = self.tap_listbox.curselection()
+        if not selection:
+            return None
+        index = selection[0]
+        if index >= len(self.visible_taps):
+            return None
+        return self.visible_taps[index]
 
     def _refresh_devices(self) -> None:
         try:
@@ -1049,6 +1091,47 @@ class CoreLabApp:
             owned=False,
             source=f"Attached shared tap `{tap.name}`",
         )
+
+    def _delete_selected_tap(self) -> None:
+        tap = self._selected_visible_tap()
+        if tap is None:
+            messagebox.showinfo(
+                "No Tap Selected",
+                "Choose a visible tap from the list first.",
+            )
+            return
+
+        if (
+            self.recorder is not None
+            and self.recorder.is_recording
+            and self.active_tap_id == tap.audio_object_id
+        ):
+            messagebox.showwarning(
+                "Recorder Active",
+                "Stop the recorder before deleting the active tap.",
+            )
+            return
+
+        confirmed = messagebox.askyesno(
+            "Delete Tap",
+            (
+                f"Delete visible tap '{tap.name}' (id {tap.audio_object_id})?\n\n"
+                "This destroys the tap for every process that can see it."
+            ),
+        )
+        if not confirmed:
+            return
+
+        try:
+            destroy_process_tap(tap.audio_object_id)
+        except Exception as exc:
+            messagebox.showerror("Tap Deletion Failed", str(exc))
+            return
+
+        if self.active_tap_id == tap.audio_object_id:
+            self._clear_active_tap(f"Deleted visible tap {tap.audio_object_id}.")
+
+        self._refresh_taps()
 
     def _activate_tap(
         self,
