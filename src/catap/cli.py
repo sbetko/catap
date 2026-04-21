@@ -12,13 +12,14 @@ from typing import Protocol
 
 from catap import (
     AmbiguousAudioProcessError,
+    AudioProcess,
     RecordingSession,
     TapDescription,
-    TapMuteBehavior,
     __version__,
     find_process_by_name,
     list_audio_processes,
 )
+from catap.session import build_process_tap_description, build_system_tap_description
 
 _PERMISSION_HINT = [
     "This may be a permissions issue. Try:",
@@ -209,22 +210,14 @@ def _build_app_tap(app_name: str, mute: bool) -> TapDescription | None:
         return None
 
     print(f"Recording from: {process.name} (PID: {process.pid})", flush=True)
-
-    tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
-    tap_desc.name = f"catap recording {process.name}"
-    tap_desc.is_private = True
-
     if mute:
-        tap_desc.mute_behavior = TapMuteBehavior.MUTED
         print("Muting app audio during recording", flush=True)
-    else:
-        tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
 
-    return tap_desc
+    return build_process_tap_description(process, mute=mute)
 
 
 def _build_system_tap(exclude: list[str]) -> TapDescription | None:
-    exclude_ids: list[int] = []
+    excluded_processes: list[AudioProcess] = []
     for excluded_app_name in exclude:
         try:
             process = find_process_by_name(excluded_app_name)
@@ -236,7 +229,7 @@ def _build_system_tap(exclude: list[str]) -> TapDescription | None:
             return None
 
         if process:
-            exclude_ids.append(process.audio_object_id)
+            excluded_processes.append(process)
             print(f"Excluding: {process.name} (PID: {process.pid})", flush=True)
         else:
             print(
@@ -245,11 +238,7 @@ def _build_system_tap(exclude: list[str]) -> TapDescription | None:
             )
 
     print("Recording all system audio", flush=True)
-    tap_desc = TapDescription.stereo_global_tap_excluding(exclude_ids)
-    tap_desc.name = "catap system recording"
-    tap_desc.is_private = True
-    tap_desc.mute_behavior = TapMuteBehavior.UNMUTED
-    return tap_desc
+    return build_system_tap_description(excluded_processes)
 
 
 def _print_recording_start_error(exc: OSError) -> None:

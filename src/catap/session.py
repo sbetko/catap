@@ -45,6 +45,34 @@ def _resolve_processes(processes: Sequence[str | AudioProcess]) -> list[AudioPro
     return [_resolve_process(process) for process in processes]
 
 
+def build_process_tap_description(
+    process: AudioProcess, *, mute: bool = False
+) -> TapDescription:
+    """Build the private stereo-mixdown tap description catap uses for app capture."""
+    tap_description = TapDescription.stereo_mixdown_of_processes(
+        [process.audio_object_id]
+    )
+    tap_description.name = f"catap recording {process.name}"
+    tap_description.is_private = True
+    tap_description.mute_behavior = (
+        TapMuteBehavior.MUTED if mute else TapMuteBehavior.UNMUTED
+    )
+    return tap_description
+
+
+def build_system_tap_description(
+    excluded: Sequence[AudioProcess] = (),
+) -> TapDescription:
+    """Build the private stereo global tap catap uses for system capture."""
+    tap_description = TapDescription.stereo_global_tap_excluding(
+        [process.audio_object_id for process in excluded]
+    )
+    tap_description.name = "catap system recording"
+    tap_description.is_private = True
+    tap_description.mute_behavior = TapMuteBehavior.UNMUTED
+    return tap_description
+
+
 class RecordingSession:
     """
     Managed recording session that owns tap and recorder lifecycle.
@@ -115,29 +143,16 @@ class RecordingSession:
             process: Application name or AudioProcess to record
             output_path: Path to write a WAV file, or None for streaming mode
             mute: Mute app playback while still capturing audio
-            on_data: Optional callback invoked with ``(raw_bytes, num_frames)``
-                for each captured buffer. The bytes are the tap's native
-                format (typically 32-bit float, little-endian, interleaved);
-                inspect the session's ``sample_rate``, ``num_channels``, and
-                ``is_float`` to interpret them. Runs on catap's background
-                worker thread, not on Core Audio's real-time callback thread.
-            max_pending_buffers: Maximum number of audio buffers to queue for
-                the background worker before new buffers are dropped and the
-                capture fails on stop.
+            on_data: Optional streaming callback. See ``RecordingSession`` for
+                buffer format and threading details.
+            max_pending_buffers: Queue bound for the background worker. See
+                ``RecordingSession`` for details.
 
         Raises:
             AudioProcessNotFoundError: If the named app cannot be found
         """
         resolved_process = _resolve_process(process)
-
-        tap_description = TapDescription.stereo_mixdown_of_processes(
-            [resolved_process.audio_object_id]
-        )
-        tap_description.name = f"catap recording {resolved_process.name}"
-        tap_description.is_private = True
-        tap_description.mute_behavior = (
-            TapMuteBehavior.MUTED if mute else TapMuteBehavior.UNMUTED
-        )
+        tap_description = build_process_tap_description(resolved_process, mute=mute)
 
         session = cls(
             tap_description,
@@ -163,26 +178,16 @@ class RecordingSession:
         Args:
             output_path: Path to write a WAV file, or None for streaming mode
             exclude: Apps to exclude from the system capture
-            on_data: Optional callback invoked with ``(raw_bytes, num_frames)``
-                for each captured buffer. The bytes are the tap's native
-                format (typically 32-bit float, little-endian, interleaved);
-                inspect the session's ``sample_rate``, ``num_channels``, and
-                ``is_float`` to interpret them. Runs on catap's background
-                worker thread, not on Core Audio's real-time callback thread.
-            max_pending_buffers: Maximum number of audio buffers to queue for
-                the background worker before new buffers are dropped and the
-                capture fails on stop.
+            on_data: Optional streaming callback. See ``RecordingSession`` for
+                buffer format and threading details.
+            max_pending_buffers: Queue bound for the background worker. See
+                ``RecordingSession`` for details.
 
         Raises:
             AudioProcessNotFoundError: If an excluded app name cannot be found
         """
         excluded_processes = _resolve_processes(exclude)
-        excluded_ids = [process.audio_object_id for process in excluded_processes]
-
-        tap_description = TapDescription.stereo_global_tap_excluding(excluded_ids)
-        tap_description.name = "catap system recording"
-        tap_description.is_private = True
-        tap_description.mute_behavior = TapMuteBehavior.UNMUTED
+        tap_description = build_system_tap_description(excluded_processes)
 
         session = cls(
             tap_description,
