@@ -85,54 +85,22 @@ class TapDescription:
 
     @classmethod
     def stereo_mixdown_of_processes(cls, processes: Sequence[int]) -> TapDescription:
-        """
-        Create a tap that mixes specified processes to stereo.
-
-        Args:
-            processes: AudioObjectIDs of processes to include
-
-        Returns:
-            TapDescription configured for stereo mixdown
-        """
+        """Create a tap that mixes the given processes to stereo."""
         return cls._from_processes(processes, "initStereoMixdownOfProcesses_")
 
     @classmethod
     def stereo_global_tap_excluding(cls, processes: Sequence[int]) -> TapDescription:
-        """
-        Create a global stereo tap excluding specified processes.
-
-        Args:
-            processes: AudioObjectIDs of processes to exclude
-
-        Returns:
-            TapDescription configured for global tap
-        """
+        """Create a global stereo tap that excludes the given processes."""
         return cls._from_processes(processes, "initStereoGlobalTapButExcludeProcesses_")
 
     @classmethod
     def mono_mixdown_of_processes(cls, processes: Sequence[int]) -> TapDescription:
-        """
-        Create a tap that mixes specified processes to mono.
-
-        Args:
-            processes: AudioObjectIDs of processes to include
-
-        Returns:
-            TapDescription configured for mono mixdown
-        """
+        """Create a tap that mixes the given processes to mono."""
         return cls._from_processes(processes, "initMonoMixdownOfProcesses_")
 
     @classmethod
     def mono_global_tap_excluding(cls, processes: Sequence[int]) -> TapDescription:
-        """
-        Create a global mono tap excluding specified processes.
-
-        Args:
-            processes: AudioObjectIDs of processes to exclude
-
-        Returns:
-            TapDescription configured for global mono tap
-        """
+        """Create a global mono tap that excludes the given processes."""
         return cls._from_processes(processes, "initMonoGlobalTapButExcludeProcesses_")
 
     @classmethod
