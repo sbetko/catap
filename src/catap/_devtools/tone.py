@@ -107,17 +107,17 @@ def _load_avfoundation() -> None:
     import objc
 
     _OBJC = objc
-    objc.loadBundle(
+    objc.loadBundle(  # ty: ignore[unresolved-attribute]
         "AVFoundation",
         globals(),
         bundle_path=objc.pathForFramework(
             "/System/Library/Frameworks/AVFoundation.framework"
         ),
     )
-    _AVAudioEngine = objc.lookUpClass("AVAudioEngine")
-    _AVAudioFormat = objc.lookUpClass("AVAudioFormat")
-    _AVAudioPCMBuffer = objc.lookUpClass("AVAudioPCMBuffer")
-    _AVAudioPlayerNode = objc.lookUpClass("AVAudioPlayerNode")
+    _AVAudioEngine = objc.lookUpClass("AVAudioEngine")  # ty: ignore[unresolved-attribute]
+    _AVAudioFormat = objc.lookUpClass("AVAudioFormat")  # ty: ignore[unresolved-attribute]
+    _AVAudioPCMBuffer = objc.lookUpClass("AVAudioPCMBuffer")  # ty: ignore[unresolved-attribute]
+    _AVAudioPlayerNode = objc.lookUpClass("AVAudioPlayerNode")  # ty: ignore[unresolved-attribute]
     _AVFOUNDATION_BUNDLE_LOADED = True
 
 

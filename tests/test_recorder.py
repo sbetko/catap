@@ -416,7 +416,7 @@ def test_stop_preserves_finalize_failure_cause(
     ) as exc_info:
         recorder._stop_worker()
 
-    wav_file._file = None
+    wav_file._file = None  # ty: ignore[unresolved-attribute]
     assert isinstance(exc_info.value.__cause__, ValueError)
     assert any(
         "Failed to finalize audio worker" in note for note in exc_info.value.__notes__
