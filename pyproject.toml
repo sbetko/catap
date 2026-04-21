@@ -69,6 +69,12 @@ markers = [
     "integration: opt-in tests that exercise the real macOS Core Audio bridge",
 ]
 
+[tool.coverage.report]
+omit = [
+    "src/catap/__main__.py",
+    "src/catap/_devtools/*",
+]
+
 [tool.vulture]
 paths = ["src", "tests", "scripts"]
 sort_by_size = true

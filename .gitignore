@@ -9,8 +9,13 @@ wheels/
 # Virtual environments
 .venv
 
+# Coverage artifacts
+.coverage
+.coverage.*
+
 # macOS code signature (regenerated on build)
 _CodeSignature/
+.DS_Store
 
 # Log files
 *.log
