@@ -1,40 +1,44 @@
 # catap
 
-Python wrapper for Apple's Core Audio Tap API (macOS 14.2+). Capture audio from any application.
+A Python wrapper for Apple's Core Audio Tap API (macOS 14.2+). Capture audio
+from any application without loopback drivers or virtual audio devices.
 
-## Features
-
-- Record audio from any macOS application
-- List all audio-producing processes
-- Mute apps while recording (capture only, no playback)
-- Simple CLI interface
-- Python API for programmatic access
-
-## Requirements
-
-- macOS 14.2 or later (for Core Audio Tap API)
-- Python 3.12+
-
-`catap` is macOS-only. On unsupported platforms, imports fail with a clear
-`ImportError` before touching the low-level macOS bindings.
-
-## Installation
-
-### From PyPI
+## Install
 
 ```bash
-# On macOS 14.2+ with Python 3.12+
-pip install catap
+pip install catap            # macOS 14.2+, Python 3.12+
 ```
 
-### From source
+`catap` is macOS-only. On other platforms, imports raise an `ImportError`.
 
+## Quick start
+
+**CLI**
 ```bash
-git clone https://github.com/sbetko/catap.git
-cd catap
-
-uv sync --group dev
+catap record Safari -d 10 -o safari.wav    # record an app for 10 seconds
+catap record --system -d 10 -o mix.wav     # record the full system mix
+catap list-apps                            # see what's producing audio
 ```
+
+**API**
+```python
+from catap import record_process
+
+session = record_process("Safari", output_path="safari.wav")
+session.record_for(10)
+
+print(f"Recorded {session.duration_seconds:.2f}s")
+```
+
+## Highlights
+
+- **Per-app capture** by name, bundle ID, or PID, with uniqueness-aware partial matches.
+- **System capture** with optional app-level exclusions.
+- **Silent capture** — mute an app's playback while you record it, with documented semantics for each mute mode.
+- **Shared taps** — attach to a tap another tool already created, without taking ownership.
+- **Device-targeted taps** — route capture through a specific hardware output stream.
+- **Streaming callbacks** — hand PCM buffers to your own code instead of writing WAV.
+- **Bounded, recoverable I/O** — long captures don't grow RAM without bound; dropped buffers surface as errors on stop.
 
 ## Usage
 
@@ -69,10 +73,8 @@ catap record --system -e Music -e Zoom -d 30 -o ~/system_audio.wav
 from catap import record_process
 
 # High-level API: catap manages tap creation, startup, shutdown, and cleanup.
-with record_process("Safari", output_path="output.wav", mute=False) as session:
-    import time
-
-    time.sleep(5)
+session = record_process("Safari", output_path="output.wav")
+session.record_for(5)
 
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
@@ -80,13 +82,16 @@ print(f"Recorded {session.duration_seconds:.2f} seconds")
 If you use `on_data=...`, the callback runs on catap's background worker
 thread so the Core Audio callback can stay lightweight.
 
-You can also record for a fixed duration without managing the context yourself:
+If you want to control the recording lifetime yourself, use the session as a
+context manager:
 
 ```python
+import time
 from catap import record_process
 
-session = record_process("Safari", output_path="output.wav")
-session.record_for(5)
+with record_process("Safari", output_path="output.wav", mute=False) as session:
+    time.sleep(5)
+
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
 
@@ -179,12 +184,6 @@ Core Audio Tap requires audio capture permissions. The first time you record, ma
 If you run from a terminal (for example `uv run catap record Spotify`), macOS attributes audio capture to that terminal app.
 Grant permission to Terminal, iTerm, or whichever host app is launching `catap`.
 
-### Running with uv
-
-```bash
-uv run catap record Spotify -d 10 -o output.wav
-```
-
 ### Permission Troubleshooting
 
 If recording fails with permission errors:
@@ -218,10 +217,15 @@ uv run python scripts/catap_core_lab.py
 
 ## Development
 
+```bash
+git clone https://github.com/sbetko/catap.git
+cd catap
+uv sync --group dev
+```
+
 ### Quality checks
 
 ```bash
-uv sync --group dev
 uv run --group dev ruff check .
 uv run --group dev ty check --error-on-warning src tests
 uv run --group dev pytest
