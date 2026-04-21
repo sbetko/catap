@@ -18,13 +18,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-import catap  # noqa: E402
-from catap import (  # noqa: E402
+import catap
+from catap import (
     AudioDevice,
     AudioDeviceStream,
     AudioProcess,
@@ -414,8 +409,13 @@ class ToneHelper:
         device_label: str | None = None,
     ) -> None:
         self.stop(silent=True)
-        script = REPO_ROOT / "scripts" / "catap_test_tone.py"
-        command = [sys.executable, str(script), "--seconds", f"{seconds:.1f}"]
+        command = [
+            sys.executable,
+            "-m",
+            "catap._devtools.test_tone",
+            "--seconds",
+            f"{seconds:.1f}",
+        ]
         if device_uid:
             command.extend(["--device-uid", device_uid])
         try:

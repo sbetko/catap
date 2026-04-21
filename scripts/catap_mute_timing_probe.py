@@ -25,37 +25,29 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
-import math
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-import objc
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = REPO_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-from catap import (  # noqa: E402
+from catap import (
     TapDescription,
     TapMuteBehavior,
     create_process_tap,
     destroy_process_tap,
     list_audio_processes,
 )
-from catap.bindings._coreaudio import (  # noqa: E402
+from catap._devtools.tone import TonePlayer
+from catap.bindings._coreaudio import (
     get_property_bytes,
     kAudioObjectSystemObject,
 )
-from catap.recorder import (  # noqa: E402
+from catap.recorder import (
     AudioBufferList,
     AudioDeviceIOProcType,
     AudioTimeStamp,
@@ -67,12 +59,6 @@ from catap.recorder import (  # noqa: E402
     _destroy_aggregate_device,
     _get_tap_uid,
 )
-
-_AVFOUNDATION_BUNDLE_LOADED = False
-_AVAudioEngine: Any = None
-_AVAudioFormat: Any = None
-_AVAudioPCMBuffer: Any = None
-_AVAudioPlayerNode: Any = None
 
 # Experimental Core Audio property selectors used only by this probe.
 _kAudioHardwarePropertyDefaultOutputDevice = int.from_bytes(b"dOut", "big")
@@ -124,106 +110,8 @@ def _probe_current_process_output_is_muted() -> bool:
     )
 
 
-def _load_avfoundation() -> None:
-    """Load the AVFoundation classes needed by the helper process."""
-    global _AVFOUNDATION_BUNDLE_LOADED
-    global _AVAudioEngine
-    global _AVAudioFormat
-    global _AVAudioPCMBuffer
-    global _AVAudioPlayerNode
-
-    if _AVFOUNDATION_BUNDLE_LOADED:
-        return
-
-    objc.loadBundle(
-        "AVFoundation",
-        globals(),
-        bundle_path=objc.pathForFramework(
-            "/System/Library/Frameworks/AVFoundation.framework"
-        ),
-    )
-    _AVAudioEngine = objc.lookUpClass("AVAudioEngine")
-    _AVAudioFormat = objc.lookUpClass("AVAudioFormat")
-    _AVAudioPCMBuffer = objc.lookUpClass("AVAudioPCMBuffer")
-    _AVAudioPlayerNode = objc.lookUpClass("AVAudioPlayerNode")
-    _AVFOUNDATION_BUNDLE_LOADED = True
-
-
 def _print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload), flush=True)
-
-
-class TonePlayer:
-    """Simple in-process sine-wave generator backed by AVAudioEngine."""
-
-    def __init__(
-        self,
-        *,
-        duration_seconds: float = 120.0,
-        sample_rate: float = 44_100.0,
-        channels: int = 2,
-        frequency_hz: float = 440.0,
-        amplitude: float = 0.08,
-    ) -> None:
-        _load_avfoundation()
-
-        self._duration_seconds = duration_seconds
-        self._sample_rate = sample_rate
-        self._channels = channels
-        self._frequency_hz = frequency_hz
-        self._amplitude = amplitude
-
-        self._engine = _AVAudioEngine.alloc().init()
-        self._player = _AVAudioPlayerNode.alloc().init()
-        self._engine.attachNode_(self._player)
-
-        self._format = (
-            _AVAudioFormat.alloc().initStandardFormatWithSampleRate_channels_(
-                self._sample_rate,
-                self._channels,
-            )
-        )
-        self._engine.connect_to_format_(
-            self._player,
-            self._engine.mainMixerNode(),
-            self._format,
-        )
-
-        frame_count = int(self._sample_rate * self._duration_seconds)
-        self._buffer = _AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(
-            self._format,
-            frame_count,
-        )
-        self._buffer.setFrameLength_(frame_count)
-        self._fill_buffer(frame_count)
-
-    def _fill_buffer(self, frame_count: int) -> None:
-        warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
-        channel_ptrs = ctypes.cast(
-            self._buffer.floatChannelData().pointerAsInteger,
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),
-        )
-
-        for channel_index in range(self._channels):
-            channel = ctypes.cast(
-                channel_ptrs[channel_index],
-                ctypes.POINTER(ctypes.c_float * frame_count),
-            ).contents
-            for frame_index in range(frame_count):
-                channel[frame_index] = self._amplitude * math.sin(
-                    2 * math.pi * self._frequency_hz * frame_index / self._sample_rate
-                )
-
-    def start(self) -> None:
-        ok = self._engine.startAndReturnError_(None)
-        if not ok:
-            raise OSError("AVAudioEngine failed to start")
-        self._player.scheduleBuffer_completionHandler_(self._buffer, None)
-        self._player.play()
-
-    def stop(self) -> None:
-        self._player.stop()
-        self._engine.stop()
 
 
 @dataclass(frozen=True)
@@ -563,6 +451,7 @@ def _controller_main(args: argparse.Namespace) -> int:
     mute_behavior = TapMuteBehavior[args.mute_behavior]
     settle_seconds = args.settle_ms / 1000.0
     interactive = bool(args.interactive)
+    script_path = str(Path(__file__).resolve())
 
     if interactive and not sys.stdin.isatty():
         raise RuntimeError("--interactive requires a terminal (TTY) on stdin")
@@ -571,12 +460,11 @@ def _controller_main(args: argparse.Namespace) -> int:
         [
             sys.executable,
             "-u",
-            __file__,
+            script_path,
             "--helper",
             "--tone-seconds",
             str(args.tone_seconds),
         ],
-        cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
