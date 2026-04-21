@@ -10,8 +10,19 @@ import wave
 import pytest
 
 import catap.recorder as recorder_module
+from catap.bindings._audiotoolbox import AudioStreamBasicDescription
 from catap.bindings.tap import AudioTapNotFoundError
 from catap.recorder import AudioRecorder
+
+
+def _stub_tap_format(tap_id: int) -> AudioStreamBasicDescription:
+    del tap_id
+    asbd = AudioStreamBasicDescription()
+    asbd.mSampleRate = 48_000
+    asbd.mChannelsPerFrame = 2
+    asbd.mBitsPerChannel = 32
+    asbd.mFormatFlags = 0
+    return asbd
 
 
 def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
@@ -216,6 +227,7 @@ def test_failed_start_does_not_clobber_existing_output_file(
     output_path.write_bytes(original_bytes)
 
     monkeypatch.setattr(recorder_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(recorder_module, "get_tap_format", _stub_tap_format)
     monkeypatch.setattr(
         recorder_module,
         "_create_aggregate_device_for_tap",
@@ -237,6 +249,7 @@ def test_failed_start_unwinds_cleanup_for_non_oserror_exceptions(
     destroyed: list[int] = []
 
     monkeypatch.setattr(recorder_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(recorder_module, "get_tap_format", _stub_tap_format)
     monkeypatch.setattr(
         recorder_module,
         "_create_aggregate_device_for_tap",
