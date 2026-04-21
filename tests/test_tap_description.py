@@ -5,6 +5,26 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import catap.bindings.tap_description as tap_description_module
+from catap.bindings.device import AudioDeviceStream
+
+
+def _make_audio_device_stream(**overrides: Any) -> AudioDeviceStream:
+    """Build an AudioDeviceStream for tests, overriding any fields of interest."""
+    defaults: dict[str, Any] = {
+        "audio_object_id": 0,
+        "device_uid": "",
+        "device_name": "",
+        "stream_index": 0,
+        "direction": "output",
+        "name": "",
+        "num_channels": 2,
+        "sample_rate": 48000.0,
+        "bits_per_channel": 32,
+        "is_float": True,
+        "format_id": 0,
+    }
+    defaults.update(overrides)
+    return AudioDeviceStream(**defaults)
 
 
 class _FakeUUID:
@@ -106,7 +126,7 @@ class _FakeTapDescriptionObjC:
 
 
 class _FakeTapDescriptionAllocator:
-    _initializer_flags: ClassVar[dict[str, dict[str, bool]]] = {
+    _initializer_flags: ClassVar[dict[str, dict[str, Any]]] = {
         "initMonoMixdownOfProcesses_": {"mono": True, "mixdown": True},
         "initMonoGlobalTapButExcludeProcesses_": {
             "exclusive": True,
@@ -213,11 +233,9 @@ def test_device_stream_factory_methods_support_discovered_streams(
 ) -> None:
     _install_fake_tap_description(monkeypatch)
 
-    stream = type(
-        "FakeAudioDeviceStream",
-        (),
-        {"device_uid": "BuiltInSpeakerDevice", "stream_index": 2},
-    )()
+    stream = _make_audio_device_stream(
+        device_uid="BuiltInSpeakerDevice", stream_index=2
+    )
 
     included = tap_description_module.TapDescription.of_processes_for_device_stream(
         [11, 12], stream

@@ -75,13 +75,14 @@ class TapDescription:
         stream: int | None,
     ) -> tuple[str, int]:
         """Normalize a target device UID and stream index."""
-        if hasattr(device, "device_uid") and hasattr(device, "stream_index"):
-            return str(device.device_uid), int(device.stream_index)
+        if isinstance(device, str):
+            if stream is None:
+                raise ValueError(
+                    "stream must be provided when targeting a device UID"
+                )
+            return device, stream
 
-        if stream is None:
-            raise ValueError("stream must be provided when targeting a device UID")
-
-        return str(device), stream
+        return device.device_uid, device.stream_index
 
     @classmethod
     def stereo_mixdown_of_processes(cls, processes: Sequence[int]) -> TapDescription:
