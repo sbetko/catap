@@ -526,6 +526,7 @@ class CoreLabApp:
         self.btn_start_rec: ttk.Button
         self.btn_stop_rec: ttk.Button
         self.btn_play_rec: ttk.Button
+        self.btn_stop_playback: ttk.Button
 
         self._build_ui()
         self._sync_playback_ui()
@@ -1062,6 +1063,14 @@ class CoreLabApp:
             state=tk.DISABLED,
         )
         self.btn_play_rec.pack(side=tk.LEFT)
+        self.btn_stop_playback = ttk.Button(
+            actions,
+            text="Stop Playback",
+            style="Danger.TButton",
+            command=self._stop_playback,
+            state=tk.DISABLED,
+        )
+        self.btn_stop_playback.pack(side=tk.LEFT, padx=10)
 
         live_box = ttk.LabelFrame(
             frame,
@@ -1445,15 +1454,17 @@ class CoreLabApp:
 
     def _sync_playback_ui(self) -> None:
         path = self.last_recording_path
+        is_recording = self.recorder is not None and self.recorder.is_recording
+        is_playing = self.playback_helper.is_playing
         can_play = (
             path is not None
             and path.exists()
-            and not (
-                self.recorder is not None and self.recorder.is_recording
-            )
+            and not is_recording
+            and not is_playing
         )
         self.btn_play_rec.config(state=tk.NORMAL if can_play else tk.DISABLED)
-        if self.playback_helper.is_playing:
+        self.btn_stop_playback.config(state=tk.NORMAL if is_playing else tk.DISABLED)
+        if is_playing:
             return
         if path is None:
             self.playback_status.set("No saved recording yet.")
@@ -1485,6 +1496,11 @@ class CoreLabApp:
             messagebox.showerror("Playback Failed", str(exc))
             self._sync_playback_ui()
             return
+        self._sync_playback_ui()
+
+    def _stop_playback(self) -> None:
+        self.playback_helper.stop(silent=True)
+        self._sync_playback_ui()
 
     def _start_recorder(self) -> None:
         if self.active_tap_id is None:
@@ -1591,8 +1607,11 @@ class CoreLabApp:
         self.root.after(200, self._refresh_processes)
 
     def _fast_poll(self) -> None:
+        was_playing = self.playback_helper.is_playing
         self.tone_helper.poll()
         self.playback_helper.poll()
+        if was_playing != self.playback_helper.is_playing:
+            self._sync_playback_ui()
         recorder = self.recorder
         if recorder is not None and recorder.is_recording:
             snap = self.telemetry.snapshot()
