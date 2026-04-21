@@ -14,7 +14,6 @@ import math
 import os
 import platform
 import pstats
-import queue
 import resource
 import statistics
 import struct
@@ -23,7 +22,7 @@ import tempfile
 import time
 import tracemalloc
 import wave
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Callable, Sequence
 from itertools import pairwise
 from pathlib import Path
@@ -222,16 +221,25 @@ def _make_synthetic_streaming_recorder(
 
 
 def _install_pool(
-    recorder: AudioRecorder, depth: int, buffer_bytes: int = 4096
+    recorder: AudioRecorder,
+    depth: int,
+    buffer_bytes: int = 4096,
+    *,
+    include_queue: bool = False,
+    queue_maxsize: int | None = None,
 ) -> None:
-    """Populate ``recorder._buffer_pool`` for synthetic io_proc runs.
+    """Install synthetic queueing state for callback-path profiling.
 
-    Mirrors the production ``_start_worker`` setup so the hot path measures
-    the steady-state ``pool.pop`` / ``memmove`` / enqueue path rather than the
+    Mirrors the production buffer-pool setup so the hot path measures the
+    steady-state ``pool.pop`` / ``memmove`` / enqueue path rather than the
     drop-on-exhausted path.
     """
-    pool_type = ctypes.c_char * buffer_bytes
-    recorder._buffer_pool = deque(pool_type() for _ in range(depth))
+    recorder._install_synthetic_worker_state(
+        include_queue=include_queue,
+        pool_depth=depth,
+        queue_maxsize=queue_maxsize,
+        buffer_bytes=buffer_bytes,
+    )
 
 
 def _make_pool_buffer(data: bytes) -> ctypes.Array[ctypes.c_char]:
@@ -576,7 +584,11 @@ def _profile_io_proc() -> dict[str, Any]:
     recorder = _make_synthetic_streaming_recorder()
     recorder._bits_per_sample = 32
     recorder._is_recording = True
-    _install_pool(recorder, depth=recorder.max_pending_buffers)
+    _install_pool(
+        recorder,
+        depth=recorder.max_pending_buffers,
+        include_queue=False,
+    )
 
     iterations = 20_000
     start = time.perf_counter()
@@ -606,8 +618,12 @@ def _profile_io_proc() -> dict[str, Any]:
     queued = _make_synthetic_streaming_recorder(max_pending_buffers=6_000)
     queued._bits_per_sample = 32
     queued._is_recording = True
-    queued._work_queue = queue.Queue(maxsize=6_000)
-    _install_pool(queued, depth=queued.max_pending_buffers)
+    _install_pool(
+        queued,
+        depth=queued.max_pending_buffers,
+        include_queue=True,
+        queue_maxsize=6_000,
+    )
 
     start = time.perf_counter()
     for _ in range(queue_iterations):
@@ -619,8 +635,12 @@ def _profile_io_proc() -> dict[str, Any]:
     queued_refill = _make_synthetic_streaming_recorder(max_pending_buffers=6_000)
     queued_refill._bits_per_sample = 32
     queued_refill._is_recording = True
-    queued_refill._work_queue = queue.Queue(maxsize=6_000)
-    _install_pool(queued_refill, depth=queued_refill.max_pending_buffers)
+    _install_pool(
+        queued_refill,
+        depth=queued_refill.max_pending_buffers,
+        include_queue=True,
+        queue_maxsize=6_000,
+    )
     with_queue_distribution = _measure_timing_distribution(
         lambda: queued_refill._io_proc(
             1, None, buffer_ptr, None, None, None, None
@@ -631,8 +651,12 @@ def _profile_io_proc() -> dict[str, Any]:
     queued_allocs = _make_synthetic_streaming_recorder(max_pending_buffers=6_000)
     queued_allocs._bits_per_sample = 32
     queued_allocs._is_recording = True
-    queued_allocs._work_queue = queue.Queue(maxsize=6_000)
-    _install_pool(queued_allocs, depth=queued_allocs.max_pending_buffers)
+    _install_pool(
+        queued_allocs,
+        depth=queued_allocs.max_pending_buffers,
+        include_queue=True,
+        queue_maxsize=6_000,
+    )
     with_queue_allocs = _measure_allocations(
         lambda: queued_allocs._io_proc(
             1, None, buffer_ptr, None, None, None, None
@@ -679,6 +703,7 @@ def _profile_worker_wav() -> dict[str, Any]:
         _configure_synthetic_recorder(recorder)
         recorder._start_worker()
         assert recorder._work_queue is not None
+        work_queue = recorder._work_queue
         # Pre-build one ctypes buffer and reuse the reference for every queue
         # item. The worker's ``_release_pool_buffer`` appends back to the pool;
         # since there's no io_proc consumer, the pool grows, but the underlying
@@ -686,7 +711,7 @@ def _profile_worker_wav() -> dict[str, Any]:
         shared_buf = _make_pool_buffer(data)
         byte_count = len(data)
         for _ in range(num_buffers):
-            recorder._work_queue.put((shared_buf, frames, byte_count))
+            work_queue.put((shared_buf, frames, byte_count))
         recorder._stop_worker()
 
     try:
@@ -718,21 +743,17 @@ def _profile_worker_wav() -> dict[str, Any]:
     try:
         recorder = AudioRecorder(1, temp_path)
         _configure_synthetic_recorder(recorder)
-        recorder._output_file = Path(temp_path).open("wb")  # noqa: SIM115
-        recorder._wav_file = wave.open(recorder._output_file, "wb")  # noqa: SIM115
-        recorder._wav_file.setnchannels(recorder._num_channels)
-        recorder._wav_file.setsampwidth(recorder._output_bits_per_sample // 8)
-        recorder._wav_file.setframerate(int(recorder._sample_rate))
-        recorder._work_queue = queue.Queue()
+        state = recorder._create_worker_state(start_thread=False, queue_maxsize=0)
+        assert state.work_queue is not None
         shared_buf = _make_pool_buffer(data)
         byte_count = len(data)
         for _ in range(5_000):
-            recorder._work_queue.put((shared_buf, frames, byte_count))
-        recorder._work_queue.put(None)
+            state.work_queue.put((shared_buf, frames, byte_count))
+        state.work_queue.put(None)
 
         profile = cProfile.Profile()
         profile.enable()
-        recorder._worker_loop()
+        recorder._worker_loop(state)
         profile.disable()
         profile_output = _profile_summary(profile)
     finally:
@@ -746,23 +767,20 @@ def _profile_worker_wav() -> dict[str, Any]:
     try:
         alloc_recorder = AudioRecorder(1, alloc_path)
         _configure_synthetic_recorder(alloc_recorder)
-        alloc_recorder._output_file = Path(alloc_path).open("wb")  # noqa: SIM115
-        alloc_recorder._wav_file = wave.open(alloc_recorder._output_file, "wb")  # noqa: SIM115
-        alloc_recorder._wav_file.setnchannels(alloc_recorder._num_channels)
-        alloc_recorder._wav_file.setsampwidth(
-            alloc_recorder._output_bits_per_sample // 8
+        alloc_state = alloc_recorder._create_worker_state(
+            start_thread=False,
+            queue_maxsize=0,
         )
-        alloc_recorder._wav_file.setframerate(int(alloc_recorder._sample_rate))
-        alloc_recorder._work_queue = queue.Queue()
+        assert alloc_state.work_queue is not None
         buffers_for_alloc = 2_000
         shared_buf = _make_pool_buffer(data)
         byte_count = len(data)
         for _ in range(buffers_for_alloc):
-            alloc_recorder._work_queue.put((shared_buf, frames, byte_count))
-        alloc_recorder._work_queue.put(None)
+            alloc_state.work_queue.put((shared_buf, frames, byte_count))
+        alloc_state.work_queue.put(None)
 
         def _drain_once() -> None:
-            alloc_recorder._worker_loop()
+            alloc_recorder._worker_loop(alloc_state)
 
         allocations = _measure_allocations(_drain_once, iterations=1)
         allocations["buffers_processed"] = buffers_for_alloc
@@ -952,7 +970,9 @@ def _profile_worker_queue_latency() -> dict[str, Any]:
     results: dict[str, Any] = {}
     for scenario in scenarios:
         name = scenario["name"]
-        scenario_kwargs = {key: value for key, value in scenario.items() if key != "name"}
+        scenario_kwargs = {
+            key: value for key, value in scenario.items() if key != "name"
+        }
         results[name] = _run_scenario(**scenario_kwargs)
     return results
 
