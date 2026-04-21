@@ -14,3 +14,6 @@ _CodeSignature/
 
 # Log files
 *.log
+
+# Recording artifacts
+*.wav

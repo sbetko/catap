@@ -34,7 +34,7 @@ CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
 Optional manual GUI smoke test:
 
 ```bash
-uv run python scripts/catap_demo_gui.py
+uv run python scripts/catap_core_lab.py
 ```
 
 4. Commit and tag:
