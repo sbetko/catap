@@ -10,7 +10,9 @@ def _load_compare_script():
     script_path = (
         Path(__file__).resolve().parents[1] / "scripts" / "compare_profile_runs.py"
     )
-    spec = importlib.util.spec_from_file_location("compare_profile_runs_script", script_path)
+    spec = importlib.util.spec_from_file_location(
+        "compare_profile_runs_script", script_path
+    )
     assert spec is not None
     assert spec.loader is not None
 

@@ -141,7 +141,8 @@ def _render_table(title: str, rows: list[tuple[str, Any, Any, str]]) -> list[str
     lines = [
         title,
         "-" * len(title),
-        f"{'Metric':<34} {'Main':>12} {'Batch':>12} {'Delta':>12} {'Delta %':>9} {'Better':>8}",
+        f"{'Metric':<34} {'Main':>12} {'Batch':>12} {'Delta':>12} "
+        f"{'Delta %':>9} {'Better':>8}",
         "-" * 93,
     ]
 
@@ -200,7 +201,8 @@ def format_report(
             "Notes",
             "-----",
             "`Better=candidate` means the second JSON file won for that metric.",
-            "For most rows lower is better; `realtime_factor` is the main higher-is-better metric.",
+            "For most rows lower is better; `realtime_factor` is the main "
+            "higher-is-better metric.",
         ]
     )
 
