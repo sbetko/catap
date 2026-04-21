@@ -2,9 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] - 2026-04-17
+## [0.2.0] - 2026-04-21
 
 - Initial public release of `catap`.
+- Added device stream discovery so taps can target a specific input/output stream.
+- Added discovery of existing process taps and the ability to record from them.
+- Added shared-tap support: create, extend, and delete shared taps from the core lab demo.
+- Raised clearer errors for stale shared taps and preserved zero-tap device stream metadata.
+- Hardened audio recorder concurrency and cleanup lifecycle for free-threaded Python builds.
+- Consolidated recorder structs and unified the cleanup cascade.
+- Moved helper tone tooling into an internal devtools package and added regression coverage.
+- Added worker queue latency profiling and restored synthetic profiler compatibility.
+- Expanded the core lab demo with recording playback controls, helper tone device selection, shared-tap workflows, and bench-style chrome.
+- Bumped supported Python floor metadata to include 3.14.
+- Slimmed the README and split implementation notes into `docs/`.
+
+## [0.1.0] - 2026-04-17
+
+- Initial private release of `catap`.
 - Added a CLI for listing audio processes and recording app or system audio.
 - Added a Python API for process taps and WAV recording.
 - Streamed WAV output during recording so long captures do not accumulate unbounded RAM.
