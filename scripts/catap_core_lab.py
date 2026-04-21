@@ -66,6 +66,60 @@ def configure_styles(root: tk.Tk) -> None:
     if "clam" in style.theme_names():
         style.theme_use("clam")
 
+    def map_button_style(
+        style_name: str,
+        *,
+        active_bg: str,
+        active_fg: str,
+        active_border: str,
+        disabled_bg: str = CARD_ALT,
+        disabled_fg: str = MUTED,
+        disabled_border: str = BORDER,
+    ) -> None:
+        style.map(
+            style_name,
+            background=[
+                ("active", active_bg),
+                ("pressed", active_bg),
+                ("disabled", disabled_bg),
+            ],
+            foreground=[
+                ("active", active_fg),
+                ("pressed", active_fg),
+                ("disabled", disabled_fg),
+            ],
+            bordercolor=[
+                ("active", active_border),
+                ("pressed", active_border),
+                ("disabled", disabled_border),
+            ],
+            lightcolor=[
+                ("active", active_border),
+                ("pressed", active_border),
+                ("disabled", disabled_border),
+            ],
+            darkcolor=[
+                ("active", active_border),
+                ("pressed", active_border),
+                ("disabled", disabled_border),
+            ],
+        )
+
+    def map_toggle_style(style_name: str) -> None:
+        style.map(
+            style_name,
+            background=[
+                ("active", CARD_ALT),
+                ("selected", CARD_ALT),
+                ("disabled", CARD_ALT),
+            ],
+            foreground=[
+                ("active", INK),
+                ("selected", INK),
+                ("disabled", MUTED),
+            ],
+        )
+
     root.configure(background=BG)
 
     style.configure(
@@ -125,33 +179,11 @@ def configure_styles(root: tk.Tk) -> None:
         bordercolor=BORDER,
         padding=(10, 6),
     )
-    style.map(
+    map_button_style(
         "TButton",
-        background=[
-            ("active", CARD_ALT),
-            ("pressed", CARD_ALT),
-            ("disabled", CARD_ALT),
-        ],
-        foreground=[
-            ("active", INK),
-            ("pressed", INK),
-            ("disabled", MUTED),
-        ],
-        bordercolor=[
-            ("active", BORDER),
-            ("pressed", BORDER),
-            ("disabled", BORDER),
-        ],
-        lightcolor=[
-            ("active", BORDER),
-            ("pressed", BORDER),
-            ("disabled", BORDER),
-        ],
-        darkcolor=[
-            ("active", BORDER),
-            ("pressed", BORDER),
-            ("disabled", BORDER),
-        ],
+        active_bg=CARD_ALT,
+        active_fg=INK,
+        active_border=BORDER,
     )
     style.configure(
         "Primary.TButton",
@@ -160,33 +192,11 @@ def configure_styles(root: tk.Tk) -> None:
         bordercolor=ACCENT,
         padding=(10, 6),
     )
-    style.map(
+    map_button_style(
         "Primary.TButton",
-        background=[
-            ("active", ACCENT),
-            ("pressed", ACCENT),
-            ("disabled", CARD_ALT),
-        ],
-        foreground=[
-            ("active", "#ffffff"),
-            ("pressed", "#ffffff"),
-            ("disabled", MUTED),
-        ],
-        bordercolor=[
-            ("active", ACCENT),
-            ("pressed", ACCENT),
-            ("disabled", BORDER),
-        ],
-        lightcolor=[
-            ("active", ACCENT),
-            ("pressed", ACCENT),
-            ("disabled", BORDER),
-        ],
-        darkcolor=[
-            ("active", ACCENT),
-            ("pressed", ACCENT),
-            ("disabled", BORDER),
-        ],
+        active_bg=ACCENT,
+        active_fg="#ffffff",
+        active_border=ACCENT,
     )
     style.configure(
         "Danger.TButton",
@@ -195,33 +205,11 @@ def configure_styles(root: tk.Tk) -> None:
         bordercolor=WARN,
         padding=(10, 6),
     )
-    style.map(
+    map_button_style(
         "Danger.TButton",
-        background=[
-            ("active", WARN),
-            ("pressed", WARN),
-            ("disabled", CARD_ALT),
-        ],
-        foreground=[
-            ("active", "#ffffff"),
-            ("pressed", "#ffffff"),
-            ("disabled", MUTED),
-        ],
-        bordercolor=[
-            ("active", WARN),
-            ("pressed", WARN),
-            ("disabled", BORDER),
-        ],
-        lightcolor=[
-            ("active", WARN),
-            ("pressed", WARN),
-            ("disabled", BORDER),
-        ],
-        darkcolor=[
-            ("active", WARN),
-            ("pressed", WARN),
-            ("disabled", BORDER),
-        ],
+        active_bg=WARN,
+        active_fg="#ffffff",
+        active_border=WARN,
     )
     style.configure(
         "Success.TButton",
@@ -230,33 +218,11 @@ def configure_styles(root: tk.Tk) -> None:
         bordercolor=SUCCESS,
         padding=(10, 6),
     )
-    style.map(
+    map_button_style(
         "Success.TButton",
-        background=[
-            ("active", SUCCESS),
-            ("pressed", SUCCESS),
-            ("disabled", CARD_ALT),
-        ],
-        foreground=[
-            ("active", "#ffffff"),
-            ("pressed", "#ffffff"),
-            ("disabled", MUTED),
-        ],
-        bordercolor=[
-            ("active", SUCCESS),
-            ("pressed", SUCCESS),
-            ("disabled", BORDER),
-        ],
-        lightcolor=[
-            ("active", SUCCESS),
-            ("pressed", SUCCESS),
-            ("disabled", BORDER),
-        ],
-        darkcolor=[
-            ("active", SUCCESS),
-            ("pressed", SUCCESS),
-            ("disabled", BORDER),
-        ],
+        active_bg=SUCCESS,
+        active_fg="#ffffff",
+        active_border=SUCCESS,
     )
     style.configure("TEntry", fieldbackground=LOG_BG, foreground=INK)
     style.configure(
@@ -297,33 +263,9 @@ def configure_styles(root: tk.Tk) -> None:
         ],
     )
     style.configure("TCheckbutton", background=CARD_ALT, foreground=INK)
-    style.map(
-        "TCheckbutton",
-        background=[
-            ("active", CARD_ALT),
-            ("selected", CARD_ALT),
-            ("disabled", CARD_ALT),
-        ],
-        foreground=[
-            ("active", INK),
-            ("selected", INK),
-            ("disabled", MUTED),
-        ],
-    )
+    map_toggle_style("TCheckbutton")
     style.configure("TRadiobutton", background=CARD_ALT, foreground=INK)
-    style.map(
-        "TRadiobutton",
-        background=[
-            ("active", CARD_ALT),
-            ("selected", CARD_ALT),
-            ("disabled", CARD_ALT),
-        ],
-        foreground=[
-            ("active", INK),
-            ("selected", INK),
-            ("disabled", MUTED),
-        ],
-    )
+    map_toggle_style("TRadiobutton")
     style.configure(
         "Treeview",
         background=LOG_BG,
