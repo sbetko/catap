@@ -23,20 +23,13 @@ class AudioTapNotFoundError(OSError):
     """Raised when a tap ID no longer refers to a live Core Audio tap."""
 
 
-def _coerce_missing_tap_error(tap_id: int, exc: OSError) -> OSError:
-    """Return a friendlier exception for stale or destroyed taps."""
+def _raise_if_missing_tap(tap_id: int, exc: OSError) -> None:
+    """Translate a stale-tap OSStatus into ``AudioTapNotFoundError``."""
     if getattr(exc, "status", None) == kAudioHardwareBadObjectError:
-        return AudioTapNotFoundError(
+        raise AudioTapNotFoundError(
             f"Audio tap {tap_id} is no longer available. "
             "It may have been destroyed by another process."
-        )
-    return exc
-
-
-def _raise_if_missing_tap(tap_id: int, exc: OSError) -> None:
-    """Raise a tap-specific error for stale tap IDs."""
-    if getattr(exc, "status", None) == kAudioHardwareBadObjectError:
-        raise _coerce_missing_tap_error(tap_id, exc) from exc
+        ) from exc
 
 
 def get_tap_description(tap_id: int) -> TapDescription:
