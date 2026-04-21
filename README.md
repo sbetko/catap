@@ -97,51 +97,18 @@ slow writer or callback as a capture failure. You can tune this with
 `max_pending_buffers=...` on `record_process`, `record_system_audio`,
 `RecordingSession`, or `AudioRecorder`.
 
-If a process query matches more than one audio process, `catap` now reports the
+If a process query matches more than one audio process, `catap` reports the
 candidate processes instead of picking one arbitrarily.
 
-### Mute Behavior Notes
+### Mute Behavior
 
-For the high-level `record_process(..., mute=True)` flow, `catap` uses
-`TapMuteBehavior.MUTED`, which means the app stays muted for the lifetime of
-the tap. In the managed `RecordingSession` APIs that is usually equivalent to
-"muted while recording" because the tap is created on `start()` and destroyed
-on `stop()`.
+For `record_process(..., mute=True)`, the app stays muted for the lifetime of
+the recording session. The two underlying modes (`MUTED` and
+`MUTED_WHEN_TAPPED`) have different lifecycle semantics — see
+[`docs/mute-behavior.md`](docs/mute-behavior.md) for empirical probe results
+and when each mode transitions between audible and inaudible.
 
-At the lower-level tap API, the tap lifetime and the recorder lifetime are
-separate. This matters for the two mute modes:
-
-- `MUTED` keeps playback muted as long as the tap exists, even if no recorder is
-  currently reading from it.
-- `MUTED_WHEN_TAPPED` is closer to "muted while the tap is actively being read
-  by an audio client." In `catap`, that usually means while an `AudioRecorder`
-  is running, but another client reading the same tap would have the same
-  effect.
-
-Empirical phase testing with `scripts/catap_mute_timing_probe.py` found the
-following behavior:
-
-- `MUTED_WHEN_TAPPED` stays audible through `create_process_tap()`,
-  aggregate-device creation, and IO-proc registration. It becomes inaudible
-  when `AudioDeviceStart(...)` begins actively reading the tap, and becomes
-  audible again when `AudioDeviceStop(...)` stops that read activity.
-- `MUTED` stays audible through `create_process_tap()`, but becomes inaudible
-  once the aggregate device containing the tap is created. It stays inaudible
-  after the recorder stops and only becomes audible again when the tap itself
-  is destroyed.
-
-The same probe also found that Core Audio properties such as
-`kAudioHardwarePropertyProcessIsAudible` and
-`kAudioDevicePropertyProcessMute` did not reflect these transitions, so the
-interactive audible result from the probe is currently the more trustworthy
-signal than those properties.
-
-To run the manual phase probe:
-
-```bash
-uv run python scripts/catap_mute_timing_probe.py --interactive --mute-behavior MUTED_WHEN_TAPPED
-uv run python scripts/catap_mute_timing_probe.py --interactive --mute-behavior MUTED
-```
+### Low-level API
 
 For advanced use cases, the low-level API is still available:
 
@@ -234,38 +201,19 @@ If recording fails with permission errors:
 4. **Audio Capture**: Registers an `AudioDeviceIOProc` callback to receive audio buffers
 5. **WAV Output**: Uses Core Audio `AudioConverter` to convert float32 audio to 16-bit PCM before writing WAV output
 
-## Demo GUI
+For Core Audio implementation notes (header locations, tap property codes,
+aggregate-device dictionary keys, references), see
+[`docs/core-audio-notes.md`](docs/core-audio-notes.md).
 
-For an interactive smoke-test harness that exercises process browsing, app
-recording, system recording, exclusions, mute, callback streaming, and the
-low-level tap/recorder APIs:
+## Interactive lab
 
-```bash
-uv sync --group dev
-uv run python scripts/catap_demo_gui.py
-```
-
-For lower-level tap work, the core lab now exposes shared-tap attachment,
-device-stream-targeted tap creation, and a built-in helper tone launcher:
+For a tkinter lab that exercises the tap and recorder surface — process
+browsing, mute modes, callback streaming, shared-tap attachment,
+device-stream-targeted taps, and a built-in helper tone launcher — run:
 
 ```bash
 uv sync --group dev
 uv run python scripts/catap_core_lab.py
-uv run python scripts/catap_test_tone.py --seconds 60
-```
-
-## Project Structure
-
-```
-src/catap/
-├── __init__.py              # Package exports
-├── __main__.py              # python -m catap entry point
-├── cli.py                   # argparse CLI commands
-├── recorder.py              # AudioRecorder class
-├── bindings/
-│   ├── process.py           # Process enumeration (ctypes)
-│   ├── tap_description.py   # CATapDescription wrapper (PyObjC)
-│   └── hardware.py          # Tap create/destroy (ctypes)
 ```
 
 ## Development
@@ -292,60 +240,6 @@ making the default test suite flaky. It covers both process enumeration and a
 short real recording that verifies tap startup, shutdown, and WAV finalization.
 
 See [`RELEASE.md`](RELEASE.md) for the release checklist.
-
-### Core Audio Headers
-
-The Core Audio Tap API is documented in Apple's SDK headers, which contain more detail than the online docs:
-
-```bash
-# Location (with Xcode Command Line Tools)
-$(xcrun --show-sdk-path)/System/Library/Frameworks/CoreAudio.framework/Headers/
-
-# Key files:
-# - AudioHardware.h          - Device APIs, aggregate devices, tap properties
-# - AudioHardwareTapping.h   - AudioHardwareCreateProcessTap (requires __OBJC__)
-```
-
-### Undocumented / Hard-to-Find Details
-
-The following are in the headers but not clearly explained in Apple's online documentation:
-
-**1. Taps require an aggregate device to read audio**
-
-This is the most critical discovery. You cannot register an `AudioDeviceIOProc` directly on a tap. You must:
-1. Create tap with `AudioHardwareCreateProcessTap`
-2. Get tap UID via `kAudioTapPropertyUID` (`'tuid'`)
-3. Create aggregate device with tap in `kAudioAggregateDeviceTapListKey` (`"taps"`)
-4. Register IOProc on the aggregate device
-
-**2. Tap property selectors (four-char codes)**
-
-```python
-kAudioTapPropertyUID = int.from_bytes(b'tuid', 'big')         # Get tap's UUID string
-kAudioTapPropertyFormat = int.from_bytes(b'tfmt', 'big')      # Get AudioStreamBasicDescription
-kAudioTapPropertyDescription = int.from_bytes(b'tdsc', 'big') # Get/set CATapDescription
-```
-
-**3. Aggregate device dictionary keys for taps**
-
-```python
-# Keys for AudioHardwareCreateAggregateDevice dictionary
-"name"          # kAudioAggregateDeviceNameKey
-"uid"           # kAudioAggregateDeviceUIDKey
-"private"       # kAudioAggregateDeviceIsPrivateKey (1 = not visible system-wide)
-"taps"          # kAudioAggregateDeviceTapListKey (array of tap dictionaries)
-"tapautostart"  # kAudioAggregateDeviceTapAutoStartKey
-
-# Keys for each tap in the "taps" array
-"uid"           # kAudioSubTapUIDKey - the tap's UUID from kAudioTapPropertyUID
-"drift"         # kAudioSubTapDriftCompensationKey (1 = enable)
-```
-
-### References
-
-- [Capturing system audio with Core Audio taps](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps) - Apple's high-level guide
-- [AudioCap](https://github.com/insidegui/AudioCap) - Sample Swift implementation
-- [Core Audio Tap Example](https://gist.github.com/sudara/34f00efad69a7e8ceafa078ea0f76f6f) - Minimal Objective-C example
 
 ## License
 
