@@ -147,7 +147,43 @@ def configure_styles(root: tk.Tk) -> None:
         padding=(10, 6),
     )
     style.configure("TEntry", fieldbackground=LOG_BG, foreground=INK)
-    style.configure("TCombobox", fieldbackground=LOG_BG)
+    style.configure(
+        "TCombobox",
+        fieldbackground=LOG_BG,
+        background=LOG_BG,
+        foreground=INK,
+        arrowcolor=INK,
+        bordercolor=BORDER,
+        lightcolor=BORDER,
+        darkcolor=BORDER,
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[
+            ("readonly", LOG_BG),
+            ("disabled", LOG_BG),
+        ],
+        background=[
+            ("readonly", LOG_BG),
+            ("disabled", LOG_BG),
+        ],
+        foreground=[
+            ("readonly", INK),
+            ("disabled", MUTED),
+        ],
+        selectbackground=[
+            ("readonly", LOG_BG),
+            ("disabled", LOG_BG),
+        ],
+        selectforeground=[
+            ("readonly", INK),
+            ("disabled", MUTED),
+        ],
+        arrowcolor=[
+            ("readonly", INK),
+            ("disabled", MUTED),
+        ],
+    )
     style.configure("TCheckbutton", background=CARD, foreground=INK)
     style.configure("TRadiobutton", background=CARD, foreground=INK)
     style.configure(
