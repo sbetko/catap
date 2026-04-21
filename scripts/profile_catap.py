@@ -17,6 +17,7 @@ import pstats
 import queue
 import resource
 import statistics
+import struct
 import sys
 import tempfile
 import time
@@ -101,6 +102,25 @@ def _summarize_durations_us(times_ns: Sequence[int]) -> dict[str, float]:
         "p95_us": round(_percentile(times_us, 0.95), 3),
         "p99_us": round(_percentile(times_us, 0.99), 3),
         "max_us": round(max(times_us), 3),
+    }
+
+
+def _summarize_depths(values: Sequence[int]) -> dict[str, float]:
+    """Summarize observed queue depths."""
+    if not values:
+        return {
+            "samples": 0,
+            "mean": 0.0,
+            "median": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+        }
+    return {
+        "samples": float(len(values)),
+        "mean": round(statistics.mean(values), 3),
+        "median": round(statistics.median(values), 3),
+        "p95": round(_percentile(values, 0.95), 3),
+        "max": round(max(values), 3),
     }
 
 
@@ -217,6 +237,39 @@ def _install_pool(
 def _make_pool_buffer(data: bytes) -> ctypes.Array[ctypes.c_char]:
     """Wrap ``data`` in a ctypes array that matches the worker's pool item type."""
     return (ctypes.c_char * len(data)).from_buffer_copy(data)
+
+
+def _spin_for_ns(duration_ns: int) -> None:
+    """Burn CPU for roughly ``duration_ns`` nanoseconds."""
+    target = time.perf_counter_ns() + duration_ns
+    while time.perf_counter_ns() < target:
+        pass
+
+
+def _sleep_until_ns(target_ns: int) -> None:
+    """Sleep/spin until ``target_ns`` using a coarse sleep then a short spin."""
+    while True:
+        remaining_ns = target_ns - time.perf_counter_ns()
+        if remaining_ns <= 0:
+            return
+        if remaining_ns > 500_000:
+            time.sleep((remaining_ns - 200_000) / 1_000_000_000)
+
+
+def _make_tagged_pool_buffers(
+    num_buffers: int, num_frames: int, num_channels: int = 2
+) -> tuple[list[tuple[int, ctypes.Array[ctypes.c_char]]], int]:
+    """Build unique synthetic buffers with a sequence tag in the first 8 bytes."""
+    base = bytearray(_make_float_buffer(num_frames, num_channels))
+    byte_count = len(base)
+    tagged: list[tuple[int, ctypes.Array[ctypes.c_char]]] = []
+
+    for index in range(num_buffers):
+        payload = bytearray(base)
+        struct.pack_into("<Q", payload, 0, index)
+        tagged.append((index, _make_pool_buffer(bytes(payload))))
+
+    return tagged, byte_count
 
 
 def _profile_audio_converter_conversion() -> dict[str, Any]:
@@ -727,6 +780,183 @@ def _profile_worker_wav() -> dict[str, Any]:
     }
 
 
+def _profile_worker_queue_latency() -> dict[str, Any]:
+    """Measure worker queue overhead proxies and enqueue-to-consumer latency.
+
+    ``enqueue_duration_us`` is a producer-side proxy that captures the cost of
+    calling ``_enqueue_audio_data`` under different queue depths and workloads.
+    It is useful for spotting scheduler / queue-pressure effects, but it is not
+    a direct mutex-contention probe.
+    """
+    frames = 512
+    sample_rate = 48_000
+    callback_interval_ns = int((frames / sample_rate) * 1_000_000_000)
+
+    scenarios = (
+        {
+            "name": "streaming_light_realtime",
+            "num_buffers": 1024,
+            "max_pending_buffers": 64,
+            "callback_spin_ns": 0,
+            "pace_ns": callback_interval_ns,
+            "capture_mode": "streaming",
+        },
+        {
+            "name": "streaming_busy_burst",
+            "num_buffers": 1_500,
+            "max_pending_buffers": 2_048,
+            "callback_spin_ns": 100_000,
+            "pace_ns": None,
+            "capture_mode": "streaming",
+        },
+        {
+            "name": "wav_burst",
+            "num_buffers": 3_000,
+            "max_pending_buffers": 4_096,
+            "callback_spin_ns": 0,
+            "pace_ns": None,
+            "capture_mode": "wav",
+        },
+        {
+            "name": "streaming_and_wav_burst",
+            "num_buffers": 3_000,
+            "max_pending_buffers": 4_096,
+            "callback_spin_ns": 50_000,
+            "pace_ns": None,
+            "capture_mode": "streaming+wav",
+        },
+    )
+
+    def _run_scenario(
+        *,
+        num_buffers: int,
+        max_pending_buffers: int,
+        callback_spin_ns: int,
+        pace_ns: int | None,
+        capture_mode: str,
+    ) -> dict[str, Any]:
+        tagged_buffers, byte_count = _make_tagged_pool_buffers(num_buffers, frames)
+        perf = time.perf_counter_ns
+
+        enqueue_durations_ns: list[int] = []
+        callback_latencies_ns: list[int] = []
+        write_latencies_ns: list[int] = []
+        queue_depths: list[int] = []
+
+        pending_by_sequence: dict[int, dict[str, int | None]] = {}
+        pending_by_buffer: dict[int, dict[str, int | None]] = {}
+
+        if capture_mode == "streaming":
+            temp_path = None
+        else:
+            fd, raw_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            os.unlink(raw_path)
+            temp_path = raw_path
+
+        def on_data(data: bytes, num_frames: int) -> None:
+            del num_frames
+            now = perf()
+            sequence = struct.unpack("<Q", data[:8])[0]
+            meta = pending_by_sequence.get(sequence)
+            if meta is not None:
+                queued_ns = (
+                    meta["queued_ns"]
+                    if meta["queued_ns"] is not None
+                    else meta["enqueue_ns"]
+                )
+                assert queued_ns is not None
+                callback_latencies_ns.append(now - queued_ns)
+            if callback_spin_ns > 0:
+                _spin_for_ns(callback_spin_ns)
+
+        callback = on_data if "streaming" in capture_mode else None
+        recorder = AudioRecorder(
+            1,
+            temp_path,
+            on_data=callback,
+            max_pending_buffers=max_pending_buffers,
+        )
+        _configure_synthetic_recorder(recorder)
+        recorder._start_worker()
+
+        if temp_path is not None and recorder._pcm_converter is not None:
+            original_convert = recorder._pcm_converter.convert
+
+            def instrumented_convert(
+                data: ctypes.Array[ctypes.c_char], size: int | None = None
+            ) -> int:
+                now = perf()
+                meta = pending_by_buffer.get(id(data))
+                if meta is not None:
+                    queued_ns = (
+                        meta["queued_ns"]
+                        if meta["queued_ns"] is not None
+                        else meta["enqueue_ns"]
+                    )
+                    assert queued_ns is not None
+                    write_latencies_ns.append(now - queued_ns)
+                return original_convert(data, size)
+
+            recorder._pcm_converter.convert = instrumented_convert
+
+        producer_start = time.perf_counter()
+        next_deadline_ns = perf()
+        successful_enqueues = 0
+
+        try:
+            for sequence, buf in tagged_buffers:
+                if pace_ns is not None:
+                    _sleep_until_ns(next_deadline_ns)
+                    next_deadline_ns += pace_ns
+
+                enqueue_ns = perf()
+                meta = {"enqueue_ns": enqueue_ns, "queued_ns": None}
+                pending_by_sequence[sequence] = meta
+                pending_by_buffer[id(buf)] = meta
+
+                enqueued = recorder._enqueue_audio_data(buf, frames, byte_count)
+                queued_ns = perf()
+                meta["queued_ns"] = queued_ns
+                enqueue_durations_ns.append(queued_ns - enqueue_ns)
+
+                if not enqueued:
+                    pending_by_sequence.pop(sequence, None)
+                    pending_by_buffer.pop(id(buf), None)
+                    continue
+
+                successful_enqueues += 1
+                if recorder._work_queue is not None:
+                    queue_depths.append(recorder._work_queue.qsize())
+        finally:
+            producer_elapsed_s = time.perf_counter() - producer_start
+            recorder._stop_worker()
+            if temp_path is not None and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+        return {
+            "capture_mode": capture_mode,
+            "num_buffers": num_buffers,
+            "callback_interval_ms": round(callback_interval_ns / 1_000_000, 3)
+            if pace_ns is not None
+            else None,
+            "callback_spin_us": round(callback_spin_ns / 1_000, 3),
+            "successful_enqueues": successful_enqueues,
+            "enqueue_duration_us": _summarize_durations_us(enqueue_durations_ns),
+            "queue_depth": _summarize_depths(queue_depths),
+            "callback_start_latency_us": _summarize_durations_us(callback_latencies_ns),
+            "write_start_latency_us": _summarize_durations_us(write_latencies_ns),
+            "producer_elapsed_s": round(producer_elapsed_s, 4),
+        }
+
+    results: dict[str, Any] = {}
+    for scenario in scenarios:
+        name = scenario["name"]
+        scenario_kwargs = {key: value for key, value in scenario.items() if key != "name"}
+        results[name] = _run_scenario(**scenario_kwargs)
+    return results
+
+
 def _profile_live_process_listing(iterations: int) -> dict[str, Any]:
     wall_times: list[float] = []
     last_count = 0
@@ -884,6 +1114,7 @@ def _collect_results(
             "wav_write_paths": _profile_write_paths(),
             "io_proc": _profile_io_proc(),
             "worker_wav": _profile_worker_wav(),
+            "worker_queue_latency": _profile_worker_queue_latency(),
         },
     }
 
