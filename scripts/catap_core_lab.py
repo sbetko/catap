@@ -289,6 +289,63 @@ class ToneHelper:
             self.status.set("Helper tone finished.")
 
 
+class PlaybackHelper:
+    """Play a recorded WAV file via ``afplay``."""
+
+    def __init__(self, status: tk.StringVar) -> None:
+        self.status = status
+        self.process: subprocess.Popen[bytes] | None = None
+        self.path: Path | None = None
+
+    @property
+    def is_playing(self) -> bool:
+        process = self.process
+        return process is not None and process.poll() is None
+
+    def play(self, path: Path) -> None:
+        resolved = path.expanduser()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Recording does not exist: {resolved}")
+
+        self.stop(silent=True)
+        try:
+            self.process = subprocess.Popen(["afplay", str(resolved)])
+        except OSError as exc:
+            self.process = None
+            self.path = None
+            raise OSError(f"Failed to play recording: {exc}") from exc
+
+        self.path = resolved
+        self.status.set(f"Playing {resolved.name}.")
+
+    def stop(self, *, silent: bool = False) -> None:
+        process = self.process
+        self.process = None
+        self.path = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=0.5)
+            if process.poll() is None:
+                process.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=0.5)
+
+        if not silent:
+            self.status.set("Playback idle.")
+
+    def poll(self) -> None:
+        process = self.process
+        if process is not None and process.poll() is not None:
+            finished = self.path
+            self.process = None
+            self.path = None
+            if finished is not None:
+                self.status.set(f"Finished playing {finished.name}.")
+            else:
+                self.status.set("Playback idle.")
+
+
 class CoreLabApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -326,6 +383,7 @@ class CoreLabApp:
         self.max_pending = tk.StringVar(value="256")
         self.helper_tone_seconds = tk.StringVar(value="60")
         self.helper_tone_status = tk.StringVar(value="Helper tone idle.")
+        self.playback_status = tk.StringVar(value="No saved recording yet.")
 
         self.tap_status = tk.StringVar(value="Tap idle.")
         self.tap_meta = tk.StringVar(value="No active tap.")
@@ -335,8 +393,10 @@ class CoreLabApp:
         )
 
         self.recorder: AudioRecorder | None = None
+        self.last_recording_path: Path | None = None
         self.telemetry = Telemetry()
         self.tone_helper = ToneHelper(self.helper_tone_status)
+        self.playback_helper = PlaybackHelper(self.playback_status)
 
         self.process_tree: ttk.Treeview
         self.target_listbox: tk.Listbox
@@ -349,8 +409,10 @@ class CoreLabApp:
         self.btn_destroy_tap: ttk.Button
         self.btn_start_rec: ttk.Button
         self.btn_stop_rec: ttk.Button
+        self.btn_play_rec: ttk.Button
 
         self._build_ui()
+        self._sync_playback_ui()
         self._refresh_processes()
         self._refresh_taps()
         self._refresh_devices()
@@ -876,6 +938,14 @@ class CoreLabApp:
             state=tk.DISABLED,
         )
         self.btn_stop_rec.pack(side=tk.LEFT, padx=10)
+        self.btn_play_rec = ttk.Button(
+            actions,
+            text="Play Last Recording",
+            style="Success.TButton",
+            command=self._play_last_recording,
+            state=tk.DISABLED,
+        )
+        self.btn_play_rec.pack(side=tk.LEFT)
 
         live_box = ttk.LabelFrame(
             frame,
@@ -885,7 +955,7 @@ class CoreLabApp:
         )
         live_box.grid(row=3, column=0, sticky="nsew")
         live_box.columnconfigure(0, weight=1)
-        live_box.rowconfigure(1, weight=1)
+        live_box.rowconfigure(2, weight=1)
 
         ttk.Label(
             live_box,
@@ -895,6 +965,12 @@ class CoreLabApp:
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             live_box,
+            textvariable=self.playback_status,
+            style="Inner.TLabelframe.Label",
+            wraplength=360,
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(
+            live_box,
             textvariable=self.telemetry_status,
             font=MONO_FONT,
             background=CARD_ALT,
@@ -902,7 +978,7 @@ class CoreLabApp:
             justify=tk.LEFT,
             anchor="nw",
             wraplength=360,
-        ).grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        ).grid(row=2, column=0, sticky="nsew", pady=(10, 0))
 
     def _refresh_processes(self) -> None:
         try:
@@ -1251,6 +1327,49 @@ class CoreLabApp:
         if selected:
             self.output_dir.set(selected)
 
+    def _sync_playback_ui(self) -> None:
+        path = self.last_recording_path
+        can_play = (
+            path is not None
+            and path.exists()
+            and not (
+                self.recorder is not None and self.recorder.is_recording
+            )
+        )
+        self.btn_play_rec.config(state=tk.NORMAL if can_play else tk.DISABLED)
+        if self.playback_helper.is_playing:
+            return
+        if path is None:
+            self.playback_status.set("No saved recording yet.")
+        elif path.exists():
+            self.playback_status.set(f"Ready to play {path.name}.")
+        else:
+            self.playback_status.set("Last recording file is no longer available.")
+
+    def _play_last_recording(self) -> None:
+        path = self.last_recording_path
+        if path is None:
+            messagebox.showinfo(
+                "No Recording",
+                "Record a WAV file before trying to play it back.",
+            )
+            return
+        if not path.exists():
+            self.last_recording_path = None
+            self._sync_playback_ui()
+            messagebox.showerror(
+                "Recording Missing",
+                f"The last recording could not be found:\n{path}",
+            )
+            return
+
+        try:
+            self.playback_helper.play(path)
+        except Exception as exc:
+            messagebox.showerror("Playback Failed", str(exc))
+            self._sync_playback_ui()
+            return
+
     def _start_recorder(self) -> None:
         if self.active_tap_id is None:
             return
@@ -1276,6 +1395,7 @@ class CoreLabApp:
 
         self.telemetry.reset()
         on_data = self.telemetry.callback if self.enable_callback.get() else None
+        self.playback_helper.stop(silent=True)
 
         try:
             recorder = AudioRecorder(
@@ -1296,12 +1416,11 @@ class CoreLabApp:
             return
 
         self.recorder = recorder
-        self.recorder_status.set(
-            f"Recorder active on tap {self.active_tap_id}."
-        )
+        self.recorder_status.set(f"Recorder active on tap {self.active_tap_id}.")
         self.btn_start_rec.config(state=tk.DISABLED)
         self.btn_stop_rec.config(state=tk.NORMAL)
         self.btn_destroy_tap.config(state=tk.DISABLED)
+        self._sync_playback_ui()
 
     def _stop_recorder(self) -> None:
         recorder = self.recorder
@@ -1315,7 +1434,13 @@ class CoreLabApp:
             return
 
         self.recorder = None
-        self.recorder_status.set("Recorder idle.")
+        if recorder.output_path is not None:
+            self.last_recording_path = recorder.output_path
+            self.recorder_status.set(
+                f"Recorder idle. Saved {recorder.output_path.name}."
+            )
+        else:
+            self.recorder_status.set("Recorder idle.")
         self.btn_stop_rec.config(state=tk.DISABLED)
         self.btn_destroy_tap.config(
             state=tk.NORMAL if self.active_tap_id is not None else tk.DISABLED,
@@ -1323,6 +1448,7 @@ class CoreLabApp:
         )
         if self.active_tap_id is not None:
             self.btn_start_rec.config(state=tk.NORMAL)
+        self._sync_playback_ui()
 
     def _start_helper_tone(self) -> None:
         try:
@@ -1350,6 +1476,7 @@ class CoreLabApp:
 
     def _fast_poll(self) -> None:
         self.tone_helper.poll()
+        self.playback_helper.poll()
         recorder = self.recorder
         if recorder is not None and recorder.is_recording:
             snap = self.telemetry.snapshot()
@@ -1362,6 +1489,7 @@ class CoreLabApp:
 
     def _on_close(self) -> None:
         self.tone_helper.stop(silent=True)
+        self.playback_helper.stop(silent=True)
         if self.recorder is not None and self.recorder.is_recording:
             with contextlib.suppress(Exception):
                 self.recorder.stop()
