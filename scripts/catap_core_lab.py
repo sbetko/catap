@@ -9,6 +9,7 @@ capabilities around shared taps and device-stream-targeted taps.
 from __future__ import annotations
 
 import contextlib
+import platform
 import subprocess
 import sys
 import threading
@@ -22,6 +23,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+import catap  # noqa: E402
 from catap import (  # noqa: E402
     AudioDevice,
     AudioDeviceStream,
@@ -43,22 +45,23 @@ DEFAULT_DIR = Path.home() / "Desktop"
 if not DEFAULT_DIR.exists():
     DEFAULT_DIR = Path.home()
 
-BG = "#1e1e24"
-CARD = "#2b2b36"
-CARD_ALT = "#353542"
-ACCENT = "#5c9eff"
-ACCENT_SOFT = "#2c3e50"
-BORDER = "#404050"
-INK = "#e2e2e6"
-MUTED = "#8b8b9e"
-LOG_BG = "#18181d"
-WARN = "#ff6b6b"
-SUCCESS = "#2ed573"
+BG = "#15171e"
+CARD = "#1d2029"
+CARD_ALT = "#262a36"
+ACCENT = "#7aa2f7"
+ACCENT_SOFT = "#24334f"
+BORDER = "#2f3340"
+INK = "#e0e2ea"
+MUTED = "#7d838f"
+LOG_BG = "#101218"
+WARN = "#e36a70"
+SUCCESS = "#73d083"
 
-BODY_FONT = ("Avenir Next", 12)
-TITLE_FONT = ("Avenir Next", 22, "bold")
-SECTION_FONT = ("Avenir Next", 14, "bold")
+BODY_FONT = ("Helvetica Neue", 12)
+LABEL_FONT = ("Helvetica Neue", 11)
+SECTION_FONT = ("Helvetica Neue", 12, "bold")
 MONO_FONT = ("Menlo", 11)
+MONO_SMALL_FONT = ("Menlo", 10)
 
 
 def configure_styles(root: tk.Tk) -> None:
@@ -132,19 +135,31 @@ def configure_styles(root: tk.Tk) -> None:
     style.configure("TFrame", background=BG)
     style.configure("Card.TFrame", background=CARD)
     style.configure("Inner.TFrame", background=CARD_ALT)
-    style.configure("Title.TLabel", background=BG, foreground=INK, font=TITLE_FONT)
+    style.configure("Env.TFrame", background=CARD_ALT)
     style.configure(
         "Section.TLabel",
         background=CARD,
         foreground=INK,
         font=SECTION_FONT,
     )
-    style.configure("Muted.TLabel", background=BG, foreground=MUTED, font=BODY_FONT)
+    style.configure("Muted.TLabel", background=BG, foreground=MUTED, font=LABEL_FONT)
     style.configure(
         "MutedCard.TLabel",
         background=CARD,
         foreground=MUTED,
-        font=BODY_FONT,
+        font=LABEL_FONT,
+    )
+    style.configure(
+        "Env.TLabel",
+        background=CARD_ALT,
+        foreground=MUTED,
+        font=MONO_SMALL_FONT,
+    )
+    style.configure(
+        "EnvValue.TLabel",
+        background=CARD_ALT,
+        foreground=ACCENT,
+        font=MONO_SMALL_FONT,
     )
     style.configure(
         "Card.TLabelframe",
@@ -170,14 +185,15 @@ def configure_styles(root: tk.Tk) -> None:
         "Inner.TLabelframe.Label",
         background=CARD_ALT,
         foreground=INK,
-        font=BODY_FONT,
+        font=LABEL_FONT,
     )
     style.configure(
         "TButton",
         background=CARD_ALT,
         foreground=INK,
         bordercolor=BORDER,
-        padding=(10, 6),
+        padding=(10, 5),
+        font=LABEL_FONT,
     )
     map_button_style(
         "TButton",
@@ -224,7 +240,13 @@ def configure_styles(root: tk.Tk) -> None:
         active_fg="#ffffff",
         active_border=SUCCESS,
     )
-    style.configure("TEntry", fieldbackground=LOG_BG, foreground=INK)
+    style.configure(
+        "TEntry",
+        fieldbackground=LOG_BG,
+        foreground=INK,
+        insertcolor=INK,
+        bordercolor=BORDER,
+    )
     style.configure(
         "TCombobox",
         fieldbackground=LOG_BG,
@@ -262,9 +284,19 @@ def configure_styles(root: tk.Tk) -> None:
             ("disabled", MUTED),
         ],
     )
-    style.configure("TCheckbutton", background=CARD_ALT, foreground=INK)
+    style.configure(
+        "TCheckbutton",
+        background=CARD_ALT,
+        foreground=INK,
+        font=LABEL_FONT,
+    )
     map_toggle_style("TCheckbutton")
-    style.configure("TRadiobutton", background=CARD_ALT, foreground=INK)
+    style.configure(
+        "TRadiobutton",
+        background=CARD_ALT,
+        foreground=INK,
+        font=LABEL_FONT,
+    )
     map_toggle_style("TRadiobutton")
     style.configure(
         "Treeview",
@@ -272,14 +304,15 @@ def configure_styles(root: tk.Tk) -> None:
         fieldbackground=LOG_BG,
         foreground=INK,
         bordercolor=BORDER,
-        rowheight=26,
+        rowheight=22,
+        font=MONO_SMALL_FONT,
     )
     style.configure(
         "Treeview.Heading",
         background=CARD_ALT,
         foreground=INK,
         relief="flat",
-        font=("Avenir Next", 11, "bold"),
+        font=(BODY_FONT[0], BODY_FONT[1] - 1, "bold"),
     )
     style.configure(
         "Lab.TNotebook",
@@ -293,7 +326,7 @@ def configure_styles(root: tk.Tk) -> None:
         foreground=MUTED,
         borderwidth=0,
         padding=(14, 8),
-        font=("Avenir Next", 11, "bold"),
+        font=(BODY_FONT[0], BODY_FONT[1] - 1, "bold"),
     )
     style.map(
         "Lab.TNotebook.Tab",
@@ -368,6 +401,11 @@ class ToneHelper:
         self.status = status
         self.process: subprocess.Popen[bytes] | None = None
 
+    @property
+    def is_running(self) -> bool:
+        process = self.process
+        return process is not None and process.poll() is None
+
     def start(
         self,
         seconds: float,
@@ -388,8 +426,7 @@ class ToneHelper:
 
         device_text = f" on {device_label}" if device_label else ""
         self.status.set(
-            f"Helper tone active{device_text}. Refresh processes and target "
-            f"helper PID {self.process.pid}."
+            f"tone live{device_text}   ·   pid {self.process.pid}"
         )
 
     def stop(self, *, silent: bool = False) -> None:
@@ -405,13 +442,13 @@ class ToneHelper:
                     process.wait(timeout=0.5)
 
         if not silent:
-            self.status.set("Helper tone idle.")
+            self.status.set("tone idle.")
 
     def poll(self) -> None:
         process = self.process
         if process is not None and process.poll() is not None:
             self.process = None
-            self.status.set("Helper tone finished.")
+            self.status.set("tone finished.")
 
 
 class PlaybackHelper:
@@ -441,7 +478,7 @@ class PlaybackHelper:
             raise OSError(f"Failed to play recording: {exc}") from exc
 
         self.path = resolved
-        self.status.set(f"Playing {resolved.name}.")
+        self.status.set(f"playing {resolved.name}")
 
     def stop(self, *, silent: bool = False) -> None:
         process = self.process
@@ -457,7 +494,7 @@ class PlaybackHelper:
                     process.wait(timeout=0.5)
 
         if not silent:
-            self.status.set("Playback idle.")
+            self.status.set("playback idle.")
 
     def poll(self) -> None:
         process = self.process
@@ -466,15 +503,49 @@ class PlaybackHelper:
             self.process = None
             self.path = None
             if finished is not None:
-                self.status.set(f"Finished playing {finished.name}.")
+                self.status.set(f"finished {finished.name}")
             else:
-                self.status.set("Playback idle.")
+                self.status.set("playback idle.")
+
+
+class EnvBar(ttk.Frame):
+    def __init__(self, parent: tk.Widget) -> None:
+        super().__init__(parent, style="Env.TFrame", padding=(12, 7))
+        version = getattr(catap, "__version__", "—")
+        py = (
+            f"{sys.version_info.major}."
+            f"{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        )
+        mac = platform.mac_ver()[0] or "—"
+        arch = platform.machine() or "—"
+        text = f"catap {version}   ·   Python {py}   ·   macOS {mac}   ·   {arch}"
+        ttk.Label(self, text=text, style="Env.TLabel").pack(side=tk.LEFT)
+        ttk.Label(self, text="      state: ", style="Env.TLabel").pack(side=tk.LEFT)
+        self.state = tk.StringVar(value="tap —   ·   rec idle   ·   tone idle")
+        ttk.Label(self, textvariable=self.state, style="EnvValue.TLabel").pack(
+            side=tk.LEFT
+        )
+
+    def set_state(
+        self,
+        *,
+        tap_id: int | None,
+        recorder_active: bool,
+        tone_active: bool,
+        playback_active: bool,
+    ) -> None:
+        tap = f"tap {tap_id}" if tap_id is not None else "tap —"
+        rec = "rec live" if recorder_active else "rec idle"
+        tone = "tone live" if tone_active else "tone idle"
+        play = "play live" if playback_active else "play idle"
+        self.state.set(f"{tap}   ·   {rec}   ·   {tone}   ·   {play}")
 
 
 class CoreLabApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("catap Core API Lab")
+        self.root.title("catap core api lab")
         self.root.geometry("1500x940")
         self.root.minsize(1260, 760)
 
@@ -508,12 +579,12 @@ class CoreLabApp:
         self.enable_callback = tk.BooleanVar(value=True)
         self.max_pending = tk.StringVar(value="256")
         self.helper_tone_seconds = tk.StringVar(value="60")
-        self.helper_tone_status = tk.StringVar(value="Helper tone idle.")
-        self.playback_status = tk.StringVar(value="No saved recording yet.")
+        self.helper_tone_status = tk.StringVar(value="tone idle.")
+        self.playback_status = tk.StringVar(value="no saved recording yet.")
 
-        self.tap_status = tk.StringVar(value="Tap idle.")
-        self.tap_meta = tk.StringVar(value="No active tap.")
-        self.recorder_status = tk.StringVar(value="Recorder idle.")
+        self.tap_status = tk.StringVar(value="tap idle.")
+        self.tap_meta = tk.StringVar(value="no active tap.")
+        self.recorder_status = tk.StringVar(value="recorder idle.")
         self.telemetry_status = tk.StringVar(
             value="[ Telemetry output will appear here ]"
         )
@@ -538,9 +609,11 @@ class CoreLabApp:
         self.btn_stop_rec: ttk.Button
         self.btn_play_rec: ttk.Button
         self.btn_stop_playback: ttk.Button
+        self.env_bar: EnvBar
 
         self._build_ui()
         self._sync_playback_ui()
+        self._sync_env_bar()
         self._refresh_processes()
         self._refresh_taps()
         self._refresh_devices()
@@ -549,19 +622,8 @@ class CoreLabApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
-        header = ttk.Frame(self.root, padding=(16, 12, 16, 8))
-        header.pack(fill=tk.X)
-        ttk.Label(header, text="catap Core Audio API Lab", style="Title.TLabel").pack(
-            anchor="w"
-        )
-        ttk.Label(
-            header,
-            text=(
-                "Exercise low-level process taps, shared non-private taps, "
-                "device-stream-targeted taps, and raw AudioRecorder startup."
-            ),
-            style="Muted.TLabel",
-        ).pack(anchor="w")
+        self.env_bar = EnvBar(self.root)
+        self.env_bar.pack(fill=tk.X)
 
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill=tk.BOTH, expand=True)
@@ -576,7 +638,7 @@ class CoreLabApp:
     def _build_source_panel(self, parent: ttk.Frame, col: int) -> None:
         frame = ttk.LabelFrame(
             parent,
-            text="1. Sources",
+            text="processes",
             style="Card.TLabelframe",
             padding=14,
         )
@@ -586,49 +648,43 @@ class CoreLabApp:
 
         process_box = ttk.LabelFrame(
             frame,
-            text="Process Targeting",
+            text="target",
             style="Inner.TLabelframe",
             padding=10,
         )
         process_box.grid(row=0, column=0, sticky="nsew")
         process_box.columnconfigure(0, weight=1)
-        process_box.rowconfigure(3, weight=1)
-
-        ttk.Label(
-            process_box,
-            text="Choose processes to include or exclude when creating a new tap.",
-            style="Inner.TLabelframe.Label",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        process_box.rowconfigure(2, weight=1)
 
         mode_frame = ttk.Frame(process_box, style="Inner.TFrame")
-        mode_frame.grid(row=1, column=0, sticky="ew")
+        mode_frame.grid(row=0, column=0, sticky="ew")
         ttk.Radiobutton(
             mode_frame,
-            text="Mixdown Selected",
+            text="mixdown selected",
             variable=self.target_mode,
             value="mixdown",
         ).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Radiobutton(
             mode_frame,
-            text="Global (Exclude Selected)",
+            text="global (exclude selected)",
             variable=self.target_mode,
             value="exclude",
         ).pack(side=tk.LEFT)
 
         filter_frame = ttk.Frame(process_box, style="Inner.TFrame")
-        filter_frame.grid(row=2, column=0, sticky="ew", pady=(10, 8))
+        filter_frame.grid(row=1, column=0, sticky="ew", pady=(10, 8))
         ttk.Button(
-            filter_frame, text="Refresh", command=self._refresh_processes
+            filter_frame, text="refresh", command=self._refresh_processes
         ).pack(side=tk.LEFT)
         ttk.Checkbutton(
             filter_frame,
-            text="Show Idle",
+            text="show idle",
             variable=self.show_idle,
             command=self._refresh_processes,
         ).pack(side=tk.LEFT, padx=10)
 
         tree_frame = ttk.Frame(process_box, style="Inner.TFrame")
-        tree_frame.grid(row=3, column=0, sticky="nsew")
+        tree_frame.grid(row=2, column=0, sticky="nsew")
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
 
@@ -638,9 +694,9 @@ class CoreLabApp:
             show="headings",
             selectmode="extended",
         )
-        self.process_tree.heading("state", text="State")
-        self.process_tree.heading("name", text="Name")
-        self.process_tree.heading("pid", text="PID")
+        self.process_tree.heading("state", text="state")
+        self.process_tree.heading("name", text="process")
+        self.process_tree.heading("pid", text="pid")
         self.process_tree.column("state", width=60, anchor="w")
         self.process_tree.column("name", width=180, anchor="w")
         self.process_tree.column("pid", width=60, anchor="w")
@@ -656,9 +712,9 @@ class CoreLabApp:
 
         ttk.Label(
             process_box,
-            text="Selected Processes",
+            text="selection",
             style="Inner.TLabelframe.Label",
-        ).grid(row=4, column=0, sticky="w", pady=(10, 4))
+        ).grid(row=3, column=0, sticky="w", pady=(10, 4))
 
         self.target_listbox = tk.Listbox(
             process_box,
@@ -670,29 +726,29 @@ class CoreLabApp:
             highlightthickness=0,
             font=MONO_FONT,
         )
-        self.target_listbox.grid(row=5, column=0, sticky="ew")
+        self.target_listbox.grid(row=4, column=0, sticky="ew")
 
         target_actions = ttk.Frame(process_box, style="Inner.TFrame")
-        target_actions.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        target_actions.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(
             target_actions,
-            text="Add Selected",
+            text="+ selected",
             command=self._add_targets,
         ).pack(side=tk.LEFT)
         ttk.Button(
             target_actions,
-            text="Remove",
+            text="-",
             command=self._remove_target,
         ).pack(side=tk.LEFT, padx=8)
         ttk.Button(
             target_actions,
-            text="Clear",
+            text="clear",
             command=self._clear_targets,
         ).pack(side=tk.LEFT)
 
         tone_box = ttk.LabelFrame(
             frame,
-            text="Helper Tone",
+            text="tone",
             style="Inner.TLabelframe",
             padding=10,
         )
@@ -701,7 +757,7 @@ class CoreLabApp:
 
         ttk.Label(
             tone_box,
-            text="Output",
+            text="output",
             style="Inner.TLabelframe.Label",
         ).grid(row=0, column=0, sticky="w")
         self.helper_tone_device_combo = ttk.Combobox(
@@ -712,13 +768,13 @@ class CoreLabApp:
         self.helper_tone_device_combo.grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(
             tone_box,
-            text="Refresh",
+            text="refresh",
             command=self._refresh_devices,
         ).grid(row=0, column=2, padx=(6, 0))
 
         ttk.Label(
             tone_box,
-            text="Seconds",
+            text="seconds",
             style="Inner.TLabelframe.Label",
         ).grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(tone_box, textvariable=self.helper_tone_seconds, width=10).grid(
@@ -729,13 +785,13 @@ class CoreLabApp:
         tone_actions.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 6))
         ttk.Button(
             tone_actions,
-            text="Start Tone",
+            text="start",
             style="Primary.TButton",
             command=self._start_helper_tone,
         ).pack(side=tk.LEFT)
         ttk.Button(
             tone_actions,
-            text="Stop Tone",
+            text="stop",
             style="Danger.TButton",
             command=self._stop_helper_tone,
         ).pack(side=tk.LEFT, padx=8)
@@ -750,40 +806,30 @@ class CoreLabApp:
     def _build_tap_panel(self, parent: ttk.Frame, col: int) -> None:
         frame = ttk.LabelFrame(
             parent,
-            text="2. Tap Builder",
+            text="tap",
             style="Card.TLabelframe",
             padding=14,
         )
         frame.grid(row=0, column=col, sticky="nsew", padx=6)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
-
-        ttk.Label(
-            frame,
-            text=(
-                "Create a new CATapDescription or switch over to an existing "
-                "tap that this process can see."
-            ),
-            style="MutedCard.TLabel",
-            wraplength=360,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        frame.rowconfigure(1, weight=1)
 
         tap_tabs = ttk.Notebook(frame, style="Lab.TNotebook")
-        tap_tabs.grid(row=1, column=0, sticky="ew")
+        tap_tabs.grid(row=0, column=0, sticky="ew")
 
         create_tab = ttk.Frame(tap_tabs, style="Inner.TFrame", padding=10)
         create_tab.columnconfigure(0, weight=1)
 
         desc_box = ttk.LabelFrame(
             create_tab,
-            text="TapDescription",
+            text="desc",
             style="Inner.TLabelframe",
             padding=10,
         )
         desc_box.grid(row=0, column=0, sticky="ew")
         desc_box.columnconfigure(1, weight=1)
 
-        ttk.Label(desc_box, text="Name", style="Inner.TLabelframe.Label").grid(
+        ttk.Label(desc_box, text="name", style="Inner.TLabelframe.Label").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Entry(desc_box, textvariable=self.tap_name).grid(
@@ -792,18 +838,18 @@ class CoreLabApp:
 
         self.mono_check = ttk.Checkbutton(
             desc_box,
-            text="Mono Mixdown",
+            text="mono",
             variable=self.tap_is_mono,
         )
         self.mono_check.grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
         ttk.Checkbutton(
             desc_box,
-            text="Private Tap",
+            text="private",
             variable=self.tap_is_private,
         ).grid(row=2, column=1, sticky="w", padx=8, pady=4)
 
-        ttk.Label(desc_box, text="Mute", style="Inner.TLabelframe.Label").grid(
+        ttk.Label(desc_box, text="mute", style="Inner.TLabelframe.Label").grid(
             row=3, column=0, sticky="w"
         )
         ttk.Combobox(
@@ -815,7 +861,7 @@ class CoreLabApp:
 
         route_box = ttk.LabelFrame(
             create_tab,
-            text="Routing",
+            text="route",
             style="Inner.TLabelframe",
             padding=10,
         )
@@ -824,24 +870,22 @@ class CoreLabApp:
 
         ttk.Radiobutton(
             route_box,
-            text="Classic process mixdown/global tap",
+            text="process / global",
             variable=self.route_mode,
             value="classic",
             command=self._sync_route_controls,
         ).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Radiobutton(
             route_box,
-            text="Target a hardware output stream",
+            text="device stream",
             variable=self.route_mode,
             value="device-stream",
             command=self._sync_route_controls,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 8))
 
-        ttk.Label(
-            route_box,
-            text="Device",
-            style="Inner.TLabelframe.Label",
-        ).grid(row=2, column=0, sticky="w")
+        ttk.Label(route_box, text="device", style="Inner.TLabelframe.Label").grid(
+            row=2, column=0, sticky="w"
+        )
         device_row = ttk.Frame(route_box, style="Inner.TFrame")
         device_row.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
         device_row.columnconfigure(0, weight=1)
@@ -854,15 +898,13 @@ class CoreLabApp:
         self.device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
         ttk.Button(
             device_row,
-            text="Refresh",
+            text="refresh",
             command=self._refresh_devices,
         ).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(
-            route_box,
-            text="Stream",
-            style="Inner.TLabelframe.Label",
-        ).grid(row=3, column=0, sticky="w")
+        ttk.Label(route_box, text="stream", style="Inner.TLabelframe.Label").grid(
+            row=3, column=0, sticky="w"
+        )
         self.stream_combo = ttk.Combobox(
             route_box,
             textvariable=self.selected_stream,
@@ -872,10 +914,7 @@ class CoreLabApp:
 
         ttk.Label(
             route_box,
-            text=(
-                "Stream-targeted taps use the selected stream's native format. "
-                "Mono mixdown is disabled in that mode."
-            ),
+            text="native stream format   ·   mono off",
             style="Inner.TLabelframe.Label",
             wraplength=360,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -884,14 +923,14 @@ class CoreLabApp:
         actions.grid(row=2, column=0, sticky="ew", pady=(16, 0))
         self.btn_create_tap = ttk.Button(
             actions,
-            text="Create Tap",
+            text="create",
             style="Primary.TButton",
             command=self._create_tap,
         )
         self.btn_create_tap.pack(side=tk.LEFT)
         self.btn_destroy_tap = ttk.Button(
             actions,
-            text="Destroy Tap",
+            text="destroy",
             style="Danger.TButton",
             command=self._destroy_or_detach_tap,
             state=tk.DISABLED,
@@ -900,43 +939,33 @@ class CoreLabApp:
 
         shared_tab = ttk.Frame(tap_tabs, style="Inner.TFrame", padding=10)
         shared_tab.columnconfigure(0, weight=1)
-        shared_tab.rowconfigure(2, weight=1)
-
-        ttk.Label(
-            shared_tab,
-            text=(
-                "Attach to or delete a visible tap. Private taps are only "
-                "visible to the process that created them."
-            ),
-            style="Inner.TLabelframe.Label",
-            wraplength=360,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        shared_tab.rowconfigure(1, weight=1)
 
         tap_actions = ttk.Frame(shared_tab, style="Inner.TFrame")
-        tap_actions.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        tap_actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         tap_actions.columnconfigure(0, weight=1)
         tap_actions.columnconfigure(1, weight=1)
         tap_actions.columnconfigure(2, weight=1)
         ttk.Button(
             tap_actions,
-            text="Refresh",
+            text="refresh",
             command=self._refresh_taps,
         ).grid(row=0, column=0, sticky="ew")
         ttk.Button(
             tap_actions,
-            text="Attach Selected Tap",
+            text="attach",
             command=self._attach_selected_tap,
         ).grid(row=0, column=1, sticky="ew", padx=8)
         self.btn_delete_shared_tap = ttk.Button(
             tap_actions,
-            text="Delete Tap",
+            text="delete",
             style="Danger.TButton",
             command=self._delete_selected_tap,
         )
         self.btn_delete_shared_tap.grid(row=0, column=2, sticky="ew")
 
         tap_list_frame = ttk.Frame(shared_tab, style="Inner.TFrame")
-        tap_list_frame.grid(row=2, column=0, sticky="nsew")
+        tap_list_frame.grid(row=1, column=0, sticky="nsew")
         tap_list_frame.columnconfigure(0, weight=1)
         tap_list_frame.rowconfigure(0, weight=1)
 
@@ -962,24 +991,21 @@ class CoreLabApp:
 
         ttk.Label(
             shared_tab,
-            text=(
-                "Rows are tagged [shared] for non-private taps and [private] "
-                "for creator-only taps."
-            ),
+            text="[shared] system-visible   ·   [private] creator-only",
             style="Inner.TLabelframe.Label",
             wraplength=360,
-        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
-        tap_tabs.add(create_tab, text="Create Tap")
-        tap_tabs.add(shared_tab, text="Use Existing Tap")
+        tap_tabs.add(create_tab, text="create")
+        tap_tabs.add(shared_tab, text="attach")
 
         active_box = ttk.LabelFrame(
             frame,
-            text="Active Tap",
+            text="active",
             style="Inner.TLabelframe",
             padding=10,
         )
-        active_box.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        active_box.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         active_box.columnconfigure(0, weight=1)
         active_box.rowconfigure(1, weight=1)
 
@@ -1003,47 +1029,37 @@ class CoreLabApp:
     def _build_recorder_panel(self, parent: ttk.Frame, col: int) -> None:
         frame = ttk.LabelFrame(
             parent,
-            text="3. Audio Recorder",
+            text="recorder",
             style="Card.TLabelframe",
             padding=14,
         )
         frame.grid(row=0, column=col, sticky="nsew", padx=6)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(3, weight=1)
-
-        ttk.Label(
-            frame,
-            text=(
-                "Create an aggregate device for the active tap and start the "
-                "raw IO proc-backed recorder."
-            ),
-            style="MutedCard.TLabel",
-            wraplength=360,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        frame.rowconfigure(2, weight=1)
 
         opts = ttk.LabelFrame(
             frame,
-            text="Recorder Options",
+            text="options",
             style="Inner.TLabelframe",
             padding=10,
         )
-        opts.grid(row=1, column=0, sticky="ew")
+        opts.grid(row=0, column=0, sticky="ew")
         opts.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
             opts,
-            text="Write WAV File",
+            text="write wav",
             variable=self.write_wav,
         ).grid(row=0, column=0, sticky="w", pady=4)
         ttk.Checkbutton(
             opts,
-            text="Enable Streaming Callback",
+            text="callback",
             variable=self.enable_callback,
         ).grid(row=1, column=0, sticky="w", pady=4)
 
         ttk.Label(
             opts,
-            text="Max Pending",
+            text="max pending",
             style="Inner.TLabelframe.Label",
         ).grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(opts, textvariable=self.max_pending, width=10).grid(
@@ -1052,7 +1068,7 @@ class CoreLabApp:
 
         ttk.Label(
             opts,
-            text="Output Folder",
+            text="output",
             style="Inner.TLabelframe.Label",
         ).grid(row=3, column=0, sticky="w", pady=4)
         out_row = ttk.Frame(opts, style="Inner.TFrame")
@@ -1066,10 +1082,10 @@ class CoreLabApp:
         )
 
         actions = ttk.Frame(frame, style="Card.TFrame")
-        actions.grid(row=2, column=0, sticky="ew", pady=(16, 12))
+        actions.grid(row=1, column=0, sticky="ew", pady=(16, 12))
         self.btn_start_rec = ttk.Button(
             actions,
-            text="Start Recording",
+            text="record",
             style="Primary.TButton",
             command=self._start_recorder,
             state=tk.DISABLED,
@@ -1077,7 +1093,7 @@ class CoreLabApp:
         self.btn_start_rec.pack(side=tk.LEFT)
         self.btn_stop_rec = ttk.Button(
             actions,
-            text="Stop Recording",
+            text="stop",
             style="Danger.TButton",
             command=self._stop_recorder,
             state=tk.DISABLED,
@@ -1085,7 +1101,7 @@ class CoreLabApp:
         self.btn_stop_rec.pack(side=tk.LEFT, padx=10)
         self.btn_play_rec = ttk.Button(
             actions,
-            text="Play Last Recording",
+            text="play",
             style="Success.TButton",
             command=self._play_last_recording,
             state=tk.DISABLED,
@@ -1093,7 +1109,7 @@ class CoreLabApp:
         self.btn_play_rec.pack(side=tk.LEFT)
         self.btn_stop_playback = ttk.Button(
             actions,
-            text="Stop Playback",
+            text="stop play",
             style="Danger.TButton",
             command=self._stop_playback,
             state=tk.DISABLED,
@@ -1102,11 +1118,11 @@ class CoreLabApp:
 
         live_box = ttk.LabelFrame(
             frame,
-            text="Live Metrics",
+            text="status",
             style="Inner.TLabelframe",
             padding=10,
         )
-        live_box.grid(row=3, column=0, sticky="nsew")
+        live_box.grid(row=2, column=0, sticky="nsew")
         live_box.columnconfigure(0, weight=1)
         live_box.rowconfigure(2, weight=1)
 
@@ -1445,20 +1461,22 @@ class CoreLabApp:
         self.btn_create_tap.config(state=tk.DISABLED)
         self.btn_destroy_tap.config(
             state=tk.NORMAL,
-            text="Destroy Tap" if owned else "Detach Tap",
+            text="destroy" if owned else "detach",
         )
         self.btn_start_rec.config(state=tk.NORMAL)
+        self._sync_env_bar()
 
-    def _clear_active_tap(self, status: str = "Tap idle.") -> None:
+    def _clear_active_tap(self, status: str = "tap idle.") -> None:
         self.active_tap_id = None
         self.active_tap_description = None
         self.active_tap_owned = False
         self.active_tap_source = "none"
         self.tap_status.set(status)
-        self.tap_meta.set("No active tap.")
+        self.tap_meta.set("no active tap.")
         self.btn_create_tap.config(state=tk.NORMAL)
-        self.btn_destroy_tap.config(state=tk.DISABLED, text="Destroy Tap")
+        self.btn_destroy_tap.config(state=tk.DISABLED, text="destroy")
         self.btn_start_rec.config(state=tk.DISABLED)
+        self._sync_env_bar()
 
     def _destroy_or_detach_tap(self) -> None:
         if self.recorder is not None and self.recorder.is_recording:
@@ -1489,6 +1507,14 @@ class CoreLabApp:
         if selected:
             self.output_dir.set(selected)
 
+    def _sync_env_bar(self) -> None:
+        self.env_bar.set_state(
+            tap_id=self.active_tap_id,
+            recorder_active=self.recorder is not None and self.recorder.is_recording,
+            tone_active=self.tone_helper.is_running,
+            playback_active=self.playback_helper.is_playing,
+        )
+
     def _sync_playback_ui(self) -> None:
         path = self.last_recording_path
         is_recording = self.recorder is not None and self.recorder.is_recording
@@ -1504,11 +1530,12 @@ class CoreLabApp:
         if is_playing:
             return
         if path is None:
-            self.playback_status.set("No saved recording yet.")
+            self.playback_status.set("no saved recording yet.")
         elif path.exists():
-            self.playback_status.set(f"Ready to play {path.name}.")
+            self.playback_status.set(f"ready to play {path.name}")
         else:
-            self.playback_status.set("Last recording file is no longer available.")
+            self.playback_status.set("last recording file is unavailable.")
+        self._sync_env_bar()
 
     def _play_last_recording(self) -> None:
         path = self.last_recording_path
@@ -1585,7 +1612,7 @@ class CoreLabApp:
             return
 
         self.recorder = recorder
-        self.recorder_status.set(f"Recorder active on tap {self.active_tap_id}.")
+        self.recorder_status.set(f"recorder live on tap {self.active_tap_id}.")
         self.btn_start_rec.config(state=tk.DISABLED)
         self.btn_stop_rec.config(state=tk.NORMAL)
         self.btn_destroy_tap.config(state=tk.DISABLED)
@@ -1606,14 +1633,14 @@ class CoreLabApp:
         if recorder.output_path is not None:
             self.last_recording_path = recorder.output_path
             self.recorder_status.set(
-                f"Recorder idle. Saved {recorder.output_path.name}."
+                f"recorder idle   ·   saved {recorder.output_path.name}"
             )
         else:
-            self.recorder_status.set("Recorder idle.")
+            self.recorder_status.set("recorder idle.")
         self.btn_stop_rec.config(state=tk.DISABLED)
         self.btn_destroy_tap.config(
             state=tk.NORMAL if self.active_tap_id is not None else tk.DISABLED,
-            text="Destroy Tap" if self.active_tap_owned else "Detach Tap",
+            text="destroy" if self.active_tap_owned else "detach",
         )
         if self.active_tap_id is not None:
             self.btn_start_rec.config(state=tk.NORMAL)
@@ -1649,10 +1676,12 @@ class CoreLabApp:
             messagebox.showerror("Helper Tone Error", str(exc))
             return
 
+        self._sync_env_bar()
         self.root.after(400, self._refresh_processes)
 
     def _stop_helper_tone(self) -> None:
         self.tone_helper.stop()
+        self._sync_env_bar()
         self.root.after(200, self._refresh_processes)
 
     def _fast_poll(self) -> None:
@@ -1661,6 +1690,7 @@ class CoreLabApp:
         self.playback_helper.poll()
         if was_playing != self.playback_helper.is_playing:
             self._sync_playback_ui()
+        self._sync_env_bar()
         recorder = self.recorder
         if recorder is not None and recorder.is_recording:
             snap = self.telemetry.snapshot()
