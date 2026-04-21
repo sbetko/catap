@@ -15,7 +15,14 @@ from typing import TYPE_CHECKING, BinaryIO
 
 from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
-from catap.bindings._audiotoolbox import PcmAudioConverter, make_linear_pcm_asbd
+from catap.bindings._audiotoolbox import (
+    AudioBuffer,
+    AudioBufferList,
+    AudioStreamBasicDescription,
+    PcmAudioConverter,
+    kAudioFormatFlagIsFloat,
+    make_linear_pcm_asbd,
+)
 from catap.bindings._coreaudio import (
     _CoreAudio,
     get_property_cfstring,
@@ -88,46 +95,6 @@ class AudioTimeStamp(ctypes.Structure):
     ]
 
 
-class AudioBuffer(ctypes.Structure):
-    """Single audio buffer within an AudioBufferList."""
-
-    _fields_ = [
-        ("mNumberChannels", ctypes.c_uint32),
-        ("mDataByteSize", ctypes.c_uint32),
-        ("mData", ctypes.c_void_p),
-    ]
-
-
-class AudioBufferList(ctypes.Structure):
-    """Core Audio AudioBufferList.
-
-    The trailing ``mBuffers`` array is variable-length; the struct is defined
-    with one slot so its base size is correct, and extra buffers are reached
-    via pointer arithmetic from ``_io_proc``.
-    """
-
-    _fields_ = [
-        ("mNumberBuffers", ctypes.c_uint32),
-        ("mBuffers", AudioBuffer * 1),
-    ]
-
-
-class AudioStreamBasicDescription(ctypes.Structure):
-    """Core Audio stream format description."""
-
-    _fields_ = [
-        ("mSampleRate", ctypes.c_double),
-        ("mFormatID", ctypes.c_uint32),
-        ("mFormatFlags", ctypes.c_uint32),
-        ("mBytesPerPacket", ctypes.c_uint32),
-        ("mFramesPerPacket", ctypes.c_uint32),
-        ("mBytesPerFrame", ctypes.c_uint32),
-        ("mChannelsPerFrame", ctypes.c_uint32),
-        ("mBitsPerChannel", ctypes.c_uint32),
-        ("mReserved", ctypes.c_uint32),
-    ]
-
-
 if TYPE_CHECKING:
     type AudioTimeStampPtr = ctypes._Pointer[AudioTimeStamp]
     type AudioBufferListPtr = ctypes._Pointer[AudioBufferList]
@@ -136,10 +103,6 @@ else:
     AudioBufferListPtr = ctypes.c_void_p
 
 
-# Format flags
-kAudioFormatFlagIsFloat = 1 << 0
-
-# Tap property selectors
 kAudioTapPropertyUID = int.from_bytes(b"tuid", "big")
 kAudioTapPropertyFormat = int.from_bytes(b"tfmt", "big")
 
@@ -252,6 +215,20 @@ def _destroy_aggregate_device(device_id: int) -> None:
     status = _AudioHardwareDestroyAggregateDevice(device_id)
     if status != 0:
         raise OSError(f"Failed to destroy aggregate device: status {status}")
+
+
+def _destroy_io_proc(device_id: int, io_proc_id: ctypes.c_void_p) -> None:
+    """Destroy a Core Audio IO proc."""
+    status = _AudioDeviceDestroyIOProcID(device_id, io_proc_id)
+    if status != 0:
+        raise OSError(f"Failed to destroy IO proc: status {status}")
+
+
+def _stop_audio_device(device_id: int, io_proc_id: ctypes.c_void_p) -> None:
+    """Stop a Core Audio device IO proc."""
+    status = _AudioDeviceStop(device_id, io_proc_id)
+    if status != 0:
+        raise OSError(f"Failed to stop audio device: status {status}")
 
 
 class AudioRecorder:
@@ -436,111 +413,44 @@ class AudioRecorder:
         )
         self._convert_float_output = self._is_float and self._bits_per_sample == 32
 
-        self._prepare_worker()
-
+        cleanup: list[Callable[[], None]] = []
         try:
-            self._aggregate_device_id = _create_aggregate_device_for_tap(
+            self._prepare_worker()
+            cleanup.append(self._stop_worker)
+
+            agg_id = _create_aggregate_device_for_tap(
                 tap_uid, "catap Recording Device"
             )
-        except Exception:
-            self._stop_worker()
-            raise
+            self._aggregate_device_id = agg_id
+            cleanup.append(lambda: _destroy_aggregate_device(agg_id))
 
-        io_proc_id = ctypes.c_void_p()
-        status = _AudioDeviceCreateIOProcID(
-            self._aggregate_device_id,
-            self._callback,
-            None,
-            ctypes.byref(io_proc_id),
-        )
-
-        if status != 0:
-            cleanup_errors: list[OSError | RuntimeError] = []
-            try:
-                _destroy_aggregate_device(self._aggregate_device_id)
-            except OSError as exc:
-                cleanup_errors.append(exc)
-
-            try:
-                self._stop_worker()
-            except (OSError, RuntimeError) as exc:
-                cleanup_errors.append(exc)
-
-            self._aggregate_device_id = None
-            error = OSError(f"Failed to create IO proc: status {status}")
-            for cleanup_error in cleanup_errors:
-                error.add_note(str(cleanup_error))
-            raise error
-
-        self._io_proc_id = io_proc_id
-
-        self._total_frames = 0
-
-        self._is_recording = True
-        status = _AudioDeviceStart(self._aggregate_device_id, self._io_proc_id)
-
-        if status != 0:
-            cleanup_errors: list[OSError | RuntimeError] = []
-            self._is_recording = False
-            destroy_status = _AudioDeviceDestroyIOProcID(
-                self._aggregate_device_id, self._io_proc_id
+            io_proc_id = ctypes.c_void_p()
+            status = _AudioDeviceCreateIOProcID(
+                agg_id, self._callback, None, ctypes.byref(io_proc_id)
             )
-            if destroy_status != 0:
-                cleanup_errors.append(
-                    OSError(f"Failed to destroy IO proc: status {destroy_status}")
-                )
-            self._io_proc_id = None
+            if status != 0:
+                raise OSError(f"Failed to create IO proc: status {status}")
+            self._io_proc_id = io_proc_id
+            cleanup.append(lambda: _destroy_io_proc(agg_id, io_proc_id))
 
-            try:
-                _destroy_aggregate_device(self._aggregate_device_id)
-            except OSError as exc:
-                cleanup_errors.append(exc)
+            self._total_frames = 0
+            self._is_recording = True
 
-            try:
-                self._stop_worker()
-            except (OSError, RuntimeError) as exc:
-                cleanup_errors.append(exc)
+            status = _AudioDeviceStart(agg_id, io_proc_id)
+            if status != 0:
+                raise OSError(f"Failed to start audio device: status {status}")
+            cleanup.append(lambda: _stop_audio_device(agg_id, io_proc_id))
 
-            self._aggregate_device_id = None
-            error = OSError(f"Failed to start audio device: status {status}")
-            for cleanup_error in cleanup_errors:
-                error.add_note(str(cleanup_error))
-            raise error
-
-        try:
             self._start_worker()
         except (OSError, RuntimeError) as exc:
-            cleanup_errors: list[OSError | RuntimeError] = []
             self._is_recording = False
-
-            stop_status = _AudioDeviceStop(self._aggregate_device_id, self._io_proc_id)
-            if stop_status != 0:
-                cleanup_errors.append(
-                    OSError(f"Failed to stop audio device: status {stop_status}")
-                )
-
-            destroy_status = _AudioDeviceDestroyIOProcID(
-                self._aggregate_device_id, self._io_proc_id
-            )
-            if destroy_status != 0:
-                cleanup_errors.append(
-                    OSError(f"Failed to destroy IO proc: status {destroy_status}")
-                )
-            self._io_proc_id = None
-
-            try:
-                _destroy_aggregate_device(self._aggregate_device_id)
-            except OSError as cleanup_exc:
-                cleanup_errors.append(cleanup_exc)
+            for step in reversed(cleanup):
+                try:
+                    step()
+                except (OSError, RuntimeError) as cleanup_exc:
+                    exc.add_note(str(cleanup_exc))
             self._aggregate_device_id = None
-
-            try:
-                self._stop_worker()
-            except (OSError, RuntimeError) as cleanup_exc:
-                cleanup_errors.append(cleanup_exc)
-
-            for cleanup_error in cleanup_errors:
-                exc.add_note(str(cleanup_error))
+            self._io_proc_id = None
             raise
 
     def stop(self) -> None:
@@ -557,19 +467,15 @@ class AudioRecorder:
         cleanup_errors: list[OSError | RuntimeError] = []
 
         if self._io_proc_id and self._aggregate_device_id:
-            stop_status = _AudioDeviceStop(self._aggregate_device_id, self._io_proc_id)
-            if stop_status != 0:
-                cleanup_errors.append(
-                    OSError(f"Failed to stop audio device: status {stop_status}")
-                )
+            try:
+                _stop_audio_device(self._aggregate_device_id, self._io_proc_id)
+            except OSError as exc:
+                cleanup_errors.append(exc)
 
-            destroy_status = _AudioDeviceDestroyIOProcID(
-                self._aggregate_device_id, self._io_proc_id
-            )
-            if destroy_status != 0:
-                cleanup_errors.append(
-                    OSError(f"Failed to destroy IO proc: status {destroy_status}")
-                )
+            try:
+                _destroy_io_proc(self._aggregate_device_id, self._io_proc_id)
+            except OSError as exc:
+                cleanup_errors.append(exc)
 
             self._io_proc_id = None
 

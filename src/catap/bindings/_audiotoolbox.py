@@ -40,7 +40,12 @@ class AudioBuffer(ctypes.Structure):
 
 
 class AudioBufferList(ctypes.Structure):
-    """Single-buffer AudioBufferList used for interleaved PCM I/O."""
+    """Core Audio AudioBufferList.
+
+    The trailing ``mBuffers`` array is variable-length; this struct carries
+    one slot so its base size is correct, and callers reach extra buffers via
+    pointer arithmetic from ``mBuffers``.
+    """
 
     _fields_ = [
         ("mNumberBuffers", ctypes.c_uint32),
