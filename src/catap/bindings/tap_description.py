@@ -225,7 +225,9 @@ class TapDescription:
     def stream(self) -> int | None:
         """Optional stream index for device-specific taps."""
         stream = self._desc.stream()
-        return int(stream.integerValue()) if stream else None
+        if stream is None:
+            return None
+        return int(stream.integerValue())
 
     @stream.setter
     def stream(self, value: int | None) -> None:

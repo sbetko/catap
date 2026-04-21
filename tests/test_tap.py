@@ -126,6 +126,49 @@ def test_list_audio_taps_returns_visible_taps_sorted(
     assert taps[1].is_private is False
 
 
+def test_list_audio_taps_preserves_stream_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptions = {
+        100: _FakeTapDescriptionObjC(
+            "Alpha tap", private=True, device_uid="BuiltInSpeakerDevice", stream=0
+        ),
+    }
+
+    def _get_audio_object_property(object_id: int, selector: int) -> bytes:
+        assert object_id == tap_module.kAudioObjectSystemObject
+        assert selector == tap_module.kAudioHardwarePropertyTapList
+        return struct.pack("<I", 100)
+
+    def _get_audio_object_cfstring_property(object_id: int, selector: int) -> str:
+        assert selector == tap_module.kAudioTapPropertyUID
+        assert object_id == 100
+        return "tap-alpha"
+
+    def _get_audio_object_objc_property(object_id: int, selector: int) -> Any:
+        assert selector == tap_module.kAudioTapPropertyDescription
+        assert object_id == 100
+        return descriptions[object_id]
+
+    monkeypatch.setattr(
+        tap_module, "_get_audio_object_property", _get_audio_object_property
+    )
+    monkeypatch.setattr(
+        tap_module,
+        "_get_audio_object_cfstring_property",
+        _get_audio_object_cfstring_property,
+    )
+    monkeypatch.setattr(
+        tap_module, "_get_audio_object_objc_property", _get_audio_object_objc_property
+    )
+
+    taps = tap_module.list_audio_taps()
+
+    assert len(taps) == 1
+    assert taps[0].device_uid == "BuiltInSpeakerDevice"
+    assert taps[0].stream == 0
+
+
 def test_find_tap_by_uid_matches_exact_uid(monkeypatch: pytest.MonkeyPatch) -> None:
     alpha = tap_module.AudioTap(
         100,

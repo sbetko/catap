@@ -255,3 +255,18 @@ def test_device_stream_factory_methods_support_discovered_streams(
     assert excluded.device_uid == "BuiltInSpeakerDevice"
     assert excluded.stream == 1
     assert excluded.is_exclusive is True
+
+
+def test_device_stream_factory_preserves_stream_zero(monkeypatch: Any) -> None:
+    _install_fake_tap_description(monkeypatch)
+
+    stream = _make_audio_device_stream(
+        device_uid="BuiltInSpeakerDevice", stream_index=0
+    )
+
+    included = tap_description_module.TapDescription.of_processes_for_device_stream(
+        [11], stream
+    )
+
+    assert included.device_uid == "BuiltInSpeakerDevice"
+    assert included.stream == 0
