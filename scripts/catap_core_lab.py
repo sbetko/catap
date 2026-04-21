@@ -362,25 +362,34 @@ class Telemetry:
 
 
 class ToneHelper:
-    """Launch a deterministic helper tone via ``afplay``."""
+    """Launch a deterministic helper tone helper subprocess."""
 
     def __init__(self, status: tk.StringVar) -> None:
         self.status = status
         self.process: subprocess.Popen[bytes] | None = None
 
-    def start(self, seconds: float) -> None:
+    def start(
+        self,
+        seconds: float,
+        *,
+        device_uid: str | None = None,
+        device_label: str | None = None,
+    ) -> None:
         self.stop(silent=True)
         script = REPO_ROOT / "scripts" / "catap_test_tone.py"
+        command = [sys.executable, str(script), "--seconds", f"{seconds:.1f}"]
+        if device_uid:
+            command.extend(["--device-uid", device_uid])
         try:
-            self.process = subprocess.Popen(
-                [sys.executable, str(script), "--seconds", f"{seconds:.1f}"]
-            )
+            self.process = subprocess.Popen(command)
         except OSError as exc:
             self.process = None
             raise OSError(f"Failed to launch helper tone: {exc}") from exc
 
+        device_text = f" on {device_label}" if device_label else ""
         self.status.set(
-            "Helper tone active via afplay. Refresh processes and target `afplay`."
+            f"Helper tone active{device_text}. Refresh processes and target "
+            f"helper PID {self.process.pid}."
         )
 
     def stop(self, *, silent: bool = False) -> None:
@@ -492,6 +501,7 @@ class CoreLabApp:
         self.route_mode = tk.StringVar(value="classic")
         self.selected_device = tk.StringVar(value="")
         self.selected_stream = tk.StringVar(value="")
+        self.helper_tone_device = tk.StringVar(value="")
 
         self.output_dir = tk.StringVar(value=str(DEFAULT_DIR))
         self.write_wav = tk.BooleanVar(value=True)
@@ -519,6 +529,7 @@ class CoreLabApp:
         self.tap_listbox: tk.Listbox
         self.device_combo: ttk.Combobox
         self.stream_combo: ttk.Combobox
+        self.helper_tone_device_combo: ttk.Combobox
         self.mono_check: ttk.Checkbutton
         self.btn_delete_shared_tap: ttk.Button
         self.btn_create_tap: ttk.Button
@@ -690,15 +701,32 @@ class CoreLabApp:
 
         ttk.Label(
             tone_box,
-            text="Seconds",
+            text="Output",
             style="Inner.TLabelframe.Label",
         ).grid(row=0, column=0, sticky="w")
+        self.helper_tone_device_combo = ttk.Combobox(
+            tone_box,
+            textvariable=self.helper_tone_device,
+            state="readonly",
+        )
+        self.helper_tone_device_combo.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(
+            tone_box,
+            text="Refresh",
+            command=self._refresh_devices,
+        ).grid(row=0, column=2, padx=(6, 0))
+
+        ttk.Label(
+            tone_box,
+            text="Seconds",
+            style="Inner.TLabelframe.Label",
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(tone_box, textvariable=self.helper_tone_seconds, width=10).grid(
-            row=0, column=1, sticky="w", padx=8
+            row=1, column=1, sticky="w", padx=8, pady=(10, 0)
         )
 
         tone_actions = ttk.Frame(tone_box, style="Inner.TFrame")
-        tone_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 6))
+        tone_actions.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 6))
         ttk.Button(
             tone_actions,
             text="Start Tone",
@@ -717,7 +745,7 @@ class CoreLabApp:
             textvariable=self.helper_tone_status,
             style="Inner.TLabelframe.Label",
             wraplength=360,
-        ).grid(row=2, column=0, columnspan=2, sticky="w")
+        ).grid(row=3, column=0, columnspan=3, sticky="w")
 
     def _build_tap_panel(self, parent: ttk.Frame, col: int) -> None:
         frame = ttk.LabelFrame(
@@ -1193,24 +1221,28 @@ class CoreLabApp:
             if device.output_streams
         ]
         self.device_combo["values"] = labels
+        self.helper_tone_device_combo["values"] = labels
 
         if not labels:
             self.selected_device.set("")
+            self.helper_tone_device.set("")
             self.current_streams = []
             self.stream_combo["values"] = []
             self.selected_stream.set("")
             return
 
+        default_device = next(
+            (
+                _fmt_device_label(device)
+                for device in self.devices
+                if device.output_streams and device.is_default_output
+            ),
+            labels[0],
+        )
         if self.selected_device.get() not in labels:
-            default_device = next(
-                (
-                    _fmt_device_label(device)
-                    for device in self.devices
-                    if device.output_streams and device.is_default_output
-                ),
-                labels[0],
-            )
             self.selected_device.set(default_device)
+        if self.helper_tone_device.get() not in labels:
+            self.helper_tone_device.set(default_device)
 
         self._update_stream_choices()
 
@@ -1229,7 +1261,12 @@ class CoreLabApp:
             self.selected_stream.set("")
 
     def _selected_device(self) -> AudioDevice | None:
-        target = self.selected_device.get()
+        return self._find_device_by_label(self.selected_device.get())
+
+    def _selected_helper_tone_device(self) -> AudioDevice | None:
+        return self._find_device_by_label(self.helper_tone_device.get())
+
+    def _find_device_by_label(self, target: str) -> AudioDevice | None:
         for device in self.devices:
             if _fmt_device_label(device) == target:
                 return device
@@ -1594,8 +1631,20 @@ class CoreLabApp:
             )
             return
 
+        device = self._selected_helper_tone_device()
+        if device is None:
+            messagebox.showerror(
+                "Helper Tone Error",
+                "Choose an output device for the helper tone first.",
+            )
+            return
+
         try:
-            self.tone_helper.start(seconds)
+            self.tone_helper.start(
+                seconds,
+                device_uid=device.uid,
+                device_label=device.name,
+            )
         except Exception as exc:
             messagebox.showerror("Helper Tone Error", str(exc))
             return
