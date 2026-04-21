@@ -42,6 +42,11 @@ from catap.recorder import (
 )
 
 
+def _discard_audio_data(data: bytes, num_frames: int) -> None:
+    """Accept streamed audio data without retaining it."""
+    del data, num_frames
+
+
 def _profile_summary(profile: cProfile.Profile, limit: int = 12) -> str:
     stream = io.StringIO()
     stats = pstats.Stats(profile, stream=stream).strip_dirs().sort_stats("cumulative")
@@ -183,6 +188,17 @@ def _configure_synthetic_recorder(recorder: AudioRecorder) -> None:
     recorder._is_float = True
     recorder._output_bits_per_sample = 16
     recorder._convert_float_output = True
+
+
+def _make_synthetic_streaming_recorder(
+    max_pending_buffers: int = 256,
+) -> AudioRecorder:
+    """Create a recorder for synthetic benchmarks that don't write a file."""
+    return AudioRecorder(
+        1,
+        on_data=_discard_audio_data,
+        max_pending_buffers=max_pending_buffers,
+    )
 
 
 def _install_pool(
@@ -504,7 +520,7 @@ def _profile_io_proc() -> dict[str, Any]:
 
     # no_queue path recycles the one pool buffer back on every call via
     # ``_enqueue_audio_data``'s no-queue short-circuit. A tiny pool is fine.
-    recorder = AudioRecorder(1)
+    recorder = _make_synthetic_streaming_recorder()
     recorder._bits_per_sample = 32
     recorder._is_recording = True
     _install_pool(recorder, depth=recorder.max_pending_buffers)
@@ -534,7 +550,7 @@ def _profile_io_proc() -> dict[str, Any]:
     # with_queue path doesn't recycle: items accumulate in the queue, so the
     # pool drains by ``queue_iterations`` entries. Size accordingly.
     queue_iterations = 5_000
-    queued = AudioRecorder(1, max_pending_buffers=6_000)
+    queued = _make_synthetic_streaming_recorder(max_pending_buffers=6_000)
     queued._bits_per_sample = 32
     queued._is_recording = True
     queued._work_queue = queue.Queue(maxsize=6_000)
@@ -547,7 +563,7 @@ def _profile_io_proc() -> dict[str, Any]:
     assert queued._work_queue is not None
     queued_item_count = queued._work_queue.qsize()
 
-    queued_refill = AudioRecorder(1, max_pending_buffers=6_000)
+    queued_refill = _make_synthetic_streaming_recorder(max_pending_buffers=6_000)
     queued_refill._bits_per_sample = 32
     queued_refill._is_recording = True
     queued_refill._work_queue = queue.Queue(maxsize=6_000)
@@ -559,7 +575,7 @@ def _profile_io_proc() -> dict[str, Any]:
         iterations=5_000,
     )
 
-    queued_allocs = AudioRecorder(1, max_pending_buffers=6_000)
+    queued_allocs = _make_synthetic_streaming_recorder(max_pending_buffers=6_000)
     queued_allocs._bits_per_sample = 32
     queued_allocs._is_recording = True
     queued_allocs._work_queue = queue.Queue(maxsize=6_000)
