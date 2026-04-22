@@ -9,8 +9,8 @@ import wave
 
 import pytest
 
+import catap._capture_engine as capture_module
 import catap._recording_worker as worker_module
-import catap.recorder as recorder_module
 from catap.bindings._audiotoolbox import AudioStreamBasicDescription
 from catap.bindings.tap import AudioTapNotFoundError
 from catap.recorder import AudioRecorder
@@ -186,17 +186,20 @@ def test_stop_reports_core_audio_cleanup_failures(
         calls.append(f"destroy-device:{device_id}")
         raise OSError("aggregate cleanup failed")
 
-    monkeypatch.setattr(recorder_module, "_AudioDeviceStop", stop_device)
-    monkeypatch.setattr(recorder_module, "_AudioDeviceDestroyIOProcID", destroy_io_proc)
+    monkeypatch.setattr(capture_module, "_AudioDeviceStop", stop_device)
+    monkeypatch.setattr(capture_module, "_AudioDeviceDestroyIOProcID", destroy_io_proc)
     monkeypatch.setattr(
-        recorder_module, "_destroy_aggregate_device", destroy_aggregate_device
+        capture_module, "_destroy_aggregate_device", destroy_aggregate_device
     )
 
     recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
     recorder._is_recording = True
     recorder._lifecycle_state = "recording"
-    recorder._aggregate_device_id = 55
-    recorder._io_proc_id = ctypes.c_void_p(77)
+    recorder._capture_session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
 
     with pytest.raises(
         OSError,
@@ -227,10 +230,10 @@ def test_failed_start_does_not_clobber_existing_output_file(
     original_bytes = b"keep-this-audio"
     output_path.write_bytes(original_bytes)
 
-    monkeypatch.setattr(recorder_module, "_get_tap_uid", lambda tap_id: "tap-uid")
-    monkeypatch.setattr(recorder_module, "get_tap_format", _stub_tap_format)
+    monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(capture_module, "_get_tap_format", _stub_tap_format)
     monkeypatch.setattr(
-        recorder_module,
+        capture_module,
         "_create_aggregate_device_for_tap",
         lambda tap_uid, name: (_ for _ in ()).throw(OSError("aggregate failed")),
     )
@@ -249,15 +252,15 @@ def test_failed_start_unwinds_cleanup_for_non_oserror_exceptions(
 ) -> None:
     destroyed: list[int] = []
 
-    monkeypatch.setattr(recorder_module, "_get_tap_uid", lambda tap_id: "tap-uid")
-    monkeypatch.setattr(recorder_module, "get_tap_format", _stub_tap_format)
+    monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(capture_module, "_get_tap_format", _stub_tap_format)
     monkeypatch.setattr(
-        recorder_module,
+        capture_module,
         "_create_aggregate_device_for_tap",
         lambda tap_uid, name: 42,
     )
     monkeypatch.setattr(
-        recorder_module,
+        capture_module,
         "_destroy_aggregate_device",
         lambda device_id: destroyed.append(device_id),
     )
@@ -267,7 +270,7 @@ def test_failed_start_unwinds_cleanup_for_non_oserror_exceptions(
         raise wave.Error("unsupported format")
 
     monkeypatch.setattr(
-        recorder_module, "_AudioDeviceCreateIOProcID", _fail_create_io_proc
+        capture_module, "_AudioDeviceCreateIOProcID", _fail_create_io_proc
     )
 
     recorder = AudioRecorder(123, tmp_path / "recording.wav")
@@ -287,7 +290,7 @@ def test_start_raises_audio_tap_not_found_error_for_stale_tap(
     stale_error.status = int.from_bytes(b"!obj", "big")  # type: ignore[attr-defined]
 
     monkeypatch.setattr(
-        recorder_module,
+        capture_module,
         "_get_tap_uid",
         lambda tap_id: (_ for _ in ()).throw(stale_error),
     )

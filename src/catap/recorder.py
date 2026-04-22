@@ -6,13 +6,17 @@ import ctypes
 import queue
 import threading
 import traceback
-import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
-
+from catap._capture_engine import (
+    AudioBufferListPtr,
+    AudioDeviceIOProcType,
+    AudioTimeStampPtr,
+    _TapCaptureEngine,
+    _TapCaptureSession,
+    _TapStreamFormat,
+)
 from catap._recording_worker import (
     _AudioWorker,
     _combine_errors,
@@ -21,20 +25,7 @@ from catap._recording_worker import (
     _WorkerItem,
     _WorkerState,
 )
-from catap.bindings._audiotoolbox import (
-    AudioBuffer,
-    AudioBufferList,
-    AudioStreamBasicDescription,
-    kAudioFormatFlagIsFloat,
-)
-from catap.bindings._coreaudio import (
-    _CoreAudio,
-    get_property_cfstring,
-    get_property_struct,
-    kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal,
-)
-from catap.bindings.tap import _raise_if_missing_tap
+from catap.bindings._audiotoolbox import AudioBuffer
 
 _DEFAULT_MAX_PENDING_BUFFERS = 256
 
@@ -66,156 +57,6 @@ def _add_secondary_failure(
     primary.add_note(
         f"{summary}:\n{''.join(traceback.format_exception(secondary)).rstrip()}"
     )
-
-
-class AudioTimeStamp(ctypes.Structure):
-    """Core Audio AudioTimeStamp structure."""
-
-    _fields_ = [
-        ("mSampleTime", ctypes.c_double),
-        ("mHostTime", ctypes.c_uint64),
-        ("mRateScalar", ctypes.c_double),
-        ("mWordClockTime", ctypes.c_uint64),
-        ("mSMPTETime", ctypes.c_uint8 * 24),
-        ("mFlags", ctypes.c_uint32),
-        ("mReserved", ctypes.c_uint32),
-    ]
-
-
-if TYPE_CHECKING:
-    type AudioTimeStampPtr = ctypes._Pointer[AudioTimeStamp]
-    type AudioBufferListPtr = ctypes._Pointer[AudioBufferList]
-else:
-    AudioTimeStampPtr = ctypes.c_void_p
-    AudioBufferListPtr = ctypes.c_void_p
-
-
-kAudioTapPropertyUID = int.from_bytes(b"tuid", "big")
-kAudioTapPropertyFormat = int.from_bytes(b"tfmt", "big")
-
-
-AudioDeviceIOProcType = ctypes.CFUNCTYPE(
-    ctypes.c_int32,  # OSStatus return
-    ctypes.c_uint32,  # AudioObjectID inDevice
-    ctypes.POINTER(AudioTimeStamp),  # const AudioTimeStamp* inNow
-    ctypes.POINTER(AudioBufferList),  # const AudioBufferList* inInputData
-    ctypes.POINTER(AudioTimeStamp),  # const AudioTimeStamp* inInputTime
-    ctypes.POINTER(AudioBufferList),  # AudioBufferList* outOutputData
-    ctypes.POINTER(AudioTimeStamp),  # const AudioTimeStamp* inOutputTime
-    ctypes.c_void_p,  # void* inClientData
-)
-
-
-_AudioHardwareCreateAggregateDevice = _CoreAudio.AudioHardwareCreateAggregateDevice
-_AudioHardwareCreateAggregateDevice.argtypes = [
-    ctypes.c_void_p,
-    ctypes.POINTER(ctypes.c_uint32),
-]
-_AudioHardwareCreateAggregateDevice.restype = ctypes.c_int32
-
-_AudioHardwareDestroyAggregateDevice = _CoreAudio.AudioHardwareDestroyAggregateDevice
-_AudioHardwareDestroyAggregateDevice.argtypes = [ctypes.c_uint32]
-_AudioHardwareDestroyAggregateDevice.restype = ctypes.c_int32
-
-_AudioDeviceCreateIOProcID = _CoreAudio.AudioDeviceCreateIOProcID
-_AudioDeviceCreateIOProcID.argtypes = [
-    ctypes.c_uint32,
-    AudioDeviceIOProcType,
-    ctypes.c_void_p,
-    ctypes.POINTER(ctypes.c_void_p),
-]
-_AudioDeviceCreateIOProcID.restype = ctypes.c_int32
-
-_AudioDeviceDestroyIOProcID = _CoreAudio.AudioDeviceDestroyIOProcID
-_AudioDeviceDestroyIOProcID.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-_AudioDeviceDestroyIOProcID.restype = ctypes.c_int32
-
-_AudioDeviceStart = _CoreAudio.AudioDeviceStart
-_AudioDeviceStart.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-_AudioDeviceStart.restype = ctypes.c_int32
-
-_AudioDeviceStop = _CoreAudio.AudioDeviceStop
-_AudioDeviceStop.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-_AudioDeviceStop.restype = ctypes.c_int32
-
-
-def _get_tap_uid(tap_id: int) -> str:
-    """Return the UID string for a tap."""
-    uid = get_property_cfstring(
-        tap_id,
-        kAudioTapPropertyUID,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain,
-    )
-    if uid is None:
-        raise OSError(f"Tap {tap_id} reported an empty UID")
-    return uid
-
-
-def get_tap_format(tap_id: int) -> AudioStreamBasicDescription:
-    """Return the audio format for a tap."""
-    result = get_property_struct(
-        tap_id,
-        kAudioTapPropertyFormat,
-        AudioStreamBasicDescription,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain,
-    )
-    # get_property_struct returns ctypes.Structure; narrow for callers.
-    assert isinstance(result, AudioStreamBasicDescription)
-    return result
-
-
-def _create_aggregate_device_for_tap(tap_uid: str, name: str) -> int:
-    """Create an aggregate device that includes the specified tap."""
-    agg_uid = f"io.github.catap.aggregate.{uuid.uuid4()}"
-
-    tap_entry = NSDictionary.dictionaryWithDictionary_(
-        {
-            "uid": tap_uid,
-            "drift": NSNumber.numberWithBool_(True),
-        }
-    )
-    tap_list = NSArray.arrayWithObject_(tap_entry)
-
-    description = NSDictionary.dictionaryWithDictionary_(
-        {
-            "name": name,
-            "uid": agg_uid,
-            "private": NSNumber.numberWithBool_(True),
-            "taps": tap_list,
-            "tapautostart": NSNumber.numberWithBool_(False),
-        }
-    )
-
-    cf_dict_ptr = description.__c_void_p__()
-    device_id = ctypes.c_uint32(0)
-    status = _AudioHardwareCreateAggregateDevice(cf_dict_ptr, ctypes.byref(device_id))
-    if status != 0:
-        raise OSError(f"Failed to create aggregate device: status {status}")
-
-    return device_id.value
-
-
-def _destroy_aggregate_device(device_id: int) -> None:
-    """Destroy an aggregate device."""
-    status = _AudioHardwareDestroyAggregateDevice(device_id)
-    if status != 0:
-        raise OSError(f"Failed to destroy aggregate device: status {status}")
-
-
-def _destroy_io_proc(device_id: int, io_proc_id: ctypes.c_void_p) -> None:
-    """Destroy a Core Audio IO proc."""
-    status = _AudioDeviceDestroyIOProcID(device_id, io_proc_id)
-    if status != 0:
-        raise OSError(f"Failed to destroy IO proc: status {status}")
-
-
-def _stop_audio_device(device_id: int, io_proc_id: ctypes.c_void_p) -> None:
-    """Stop a Core Audio device IO proc."""
-    status = _AudioDeviceStop(device_id, io_proc_id)
-    if status != 0:
-        raise OSError(f"Failed to stop audio device: status {status}")
 
 
 class AudioRecorder:
@@ -268,9 +109,8 @@ class AudioRecorder:
         self.output_path = _validate_recording_target(output_path, on_data)
         self._on_data = on_data
 
-        self._aggregate_device_id: int | None = None
-
-        self._io_proc_id: ctypes.c_void_p | None = None
+        self._capture_engine = _TapCaptureEngine()
+        self._capture_session: _TapCaptureSession | None = None
         self._is_recording = False
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
         self._worker = _AudioWorker(
@@ -295,6 +135,32 @@ class AudioRecorder:
 
         # Keep reference to callback to prevent garbage collection.
         self._callback = AudioDeviceIOProcType(self._io_proc)
+
+    def _default_stream_format(self) -> _TapStreamFormat:
+        """Build the fallback stream format used before tap metadata is known."""
+        return _TapStreamFormat(
+            sample_rate=self._sample_rate,
+            num_channels=self._num_channels,
+            bits_per_sample=self._bits_per_sample,
+            is_float=self._is_float,
+        )
+
+    def _apply_stream_format(self, stream_format: _TapStreamFormat) -> None:
+        """Apply tap stream metadata to recorder state."""
+        self._sample_rate = stream_format.sample_rate
+        self._num_channels = stream_format.num_channels
+        self._bits_per_sample = stream_format.bits_per_sample
+        self._is_float = stream_format.is_float
+
+    @property
+    def _aggregate_device_id(self) -> int | None:
+        session = self._capture_session
+        return None if session is None else session.aggregate_device_id
+
+    @property
+    def _io_proc_id(self) -> ctypes.c_void_p | None:
+        session = self._capture_session
+        return None if session is None else session.io_proc_id
 
     def _make_worker_config(self) -> _WorkerConfig:
         """Build worker configuration from the current stream format."""
@@ -442,22 +308,11 @@ class AudioRecorder:
             self._lifecycle_state = "starting"
 
         try:
-            try:
-                tap_uid = _get_tap_uid(self.tap_id)
-            except OSError as exc:
-                _raise_if_missing_tap(self.tap_id, exc)
-                raise
-
-            try:
-                asbd = get_tap_format(self.tap_id)
-                self._sample_rate = asbd.mSampleRate
-                self._num_channels = asbd.mChannelsPerFrame
-                self._bits_per_sample = asbd.mBitsPerChannel
-                self._is_float = bool(asbd.mFormatFlags & kAudioFormatFlagIsFloat)
-            except OSError as exc:
-                _raise_if_missing_tap(self.tap_id, exc)
-                # Use defaults if we can't get format.
-                pass
+            stream_format = self._capture_engine.describe_tap_stream(
+                self.tap_id,
+                default=self._default_stream_format(),
+            )
+            self._apply_stream_format(stream_format)
 
             self._output_bits_per_sample = (
                 16
@@ -469,22 +324,15 @@ class AudioRecorder:
             self._reset_counters()
 
             cleanup: list[Callable[[], None]] = []
+            capture_session: _TapCaptureSession | None = None
             worker_state: _WorkerState | None = None
             try:
-                agg_id = _create_aggregate_device_for_tap(
-                    tap_uid, "catap Recording Device"
+                capture_session = self._capture_engine.open_tap_capture(
+                    self.tap_id,
+                    self._callback,
                 )
-                self._aggregate_device_id = agg_id
-                cleanup.append(lambda: _destroy_aggregate_device(agg_id))
-
-                io_proc_id = ctypes.c_void_p()
-                status = _AudioDeviceCreateIOProcID(
-                    agg_id, self._callback, None, ctypes.byref(io_proc_id)
-                )
-                if status != 0:
-                    raise OSError(f"Failed to create IO proc: status {status}")
-                self._io_proc_id = io_proc_id
-                cleanup.append(lambda: _destroy_io_proc(agg_id, io_proc_id))
+                self._capture_session = capture_session
+                cleanup.append(lambda: self._capture_engine.close(capture_session))
 
                 worker_state = self._start_worker()
                 cleanup.append(lambda: self._stop_worker(worker_state))
@@ -492,10 +340,8 @@ class AudioRecorder:
                 with self._lifecycle_lock:
                     self._is_recording = True
 
-                status = _AudioDeviceStart(agg_id, io_proc_id)
-                if status != 0:
-                    raise OSError(f"Failed to start audio device: status {status}")
-                cleanup.append(lambda: _stop_audio_device(agg_id, io_proc_id))
+                self._capture_engine.start(capture_session)
+                cleanup.append(lambda: self._capture_engine.stop(capture_session))
             except Exception as exc:
                 with self._lifecycle_lock:
                     self._is_recording = False
@@ -508,8 +354,7 @@ class AudioRecorder:
                             "Cleanup failure during recorder startup",
                             cleanup_exc,
                         )
-                self._aggregate_device_id = None
-                self._io_proc_id = None
+                self._capture_session = None
                 if self._worker_state is worker_state:
                     self._worker_state = None
                 raise
@@ -536,26 +381,19 @@ class AudioRecorder:
 
             self._lifecycle_state = "stopping"
             self._is_recording = False
-            aggregate_device_id = self._aggregate_device_id
-            io_proc_id = self._io_proc_id
+            capture_session = self._capture_session
             worker_state = self._worker_state
 
         cleanup_errors: list[OSError | RuntimeError] = []
 
-        if io_proc_id and aggregate_device_id:
+        if capture_session is not None:
             try:
-                _stop_audio_device(aggregate_device_id, io_proc_id)
+                self._capture_engine.stop(capture_session)
             except OSError as exc:
                 cleanup_errors.append(exc)
 
             try:
-                _destroy_io_proc(aggregate_device_id, io_proc_id)
-            except OSError as exc:
-                cleanup_errors.append(exc)
-
-        if aggregate_device_id:
-            try:
-                _destroy_aggregate_device(aggregate_device_id)
+                self._capture_engine.close(capture_session)
             except OSError as exc:
                 cleanup_errors.append(exc)
 
@@ -565,10 +403,7 @@ class AudioRecorder:
             except (OSError, RuntimeError) as exc:
                 cleanup_errors.append(exc)
 
-        self._aggregate_device_id = None
-        self._io_proc_id = None
-        if self._worker_state is worker_state:
-            self._worker_state = None
+        self._capture_session = None
 
         with self._lifecycle_lock:
             self._lifecycle_state = "idle"
