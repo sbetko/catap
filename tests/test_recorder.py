@@ -9,6 +9,7 @@ import wave
 
 import pytest
 
+import catap._recording_worker as worker_module
 import catap.recorder as recorder_module
 from catap.bindings._audiotoolbox import AudioStreamBasicDescription
 from catap.bindings.tap import AudioTapNotFoundError
@@ -331,7 +332,7 @@ def test_start_worker_failure_closes_resources_without_join(
         def is_alive(self) -> bool:
             return False
 
-    monkeypatch.setattr(recorder_module.threading, "Thread", _FailingThread)
+    monkeypatch.setattr(worker_module.threading, "Thread", _FailingThread)
 
     recorder = AudioRecorder(123, tmp_path / "recording.wav")
 
