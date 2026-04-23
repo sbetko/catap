@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-04-23
+
+- Refactored the recorder into focused internal capture-engine, worker, support,
+  and session-backend modules.
+- Preserved recorder cleanup failures across stop and close paths so secondary
+  teardown errors are not lost.
+- Surfaced Core Audio callback failures on recorder stop instead of silently
+  swallowing them.
+- Added synthetic and live profiling probes for worker throughput, conversion
+  cost, callback timing, queue depth, and dropped-buffer behavior.
+- Replaced the old private-internals profiling scripts with the new profiling
+  harnesses.
+- Added performance and real-time notes for the recorder callback, queueing
+  model, CPython deque assumptions, and known tradeoffs.
+- Tightened README wording and added the current tested macOS hardware/version.
+- Consolidated Core Audio binding discovery helpers and expanded related tests.
+- Updated locked development dependencies.
+
 ## [0.2.0] - 2026-04-21
 
 - Initial public release of `catap`.
