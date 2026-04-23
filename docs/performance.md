@@ -17,7 +17,10 @@ are reported when recording stops.
 The buffer pool is a `collections.deque`: the Core Audio callback pops buffers
 from one side, and the worker appends them back after processing. The current
 implementation relies on CPython's safety for individual deque `pop()` and
-`append()` operations. Multi-step invariants still use explicit locks.
+`append()` operations. In CPython 3.14, these deque methods are generated from
+`@critical_section` Argument Clinic blocks and their wrappers enter
+`Py_BEGIN_CRITICAL_SECTION(deque)`. That supports this one-operation-at-a-time
+use of the deque, but multi-step invariants still use explicit locks.
 
 ## Known Tradeoffs
 
@@ -45,3 +48,15 @@ Useful measurements for the next harness:
 - Queue depth over time during long recordings.
 - Buffer drops under intentionally slow sinks.
 - Callback hot-path cost with and without pool-buffer resize.
+
+For a synthetic profile that does not require audio-capture permission, run:
+
+```bash
+uv run python scripts/catap_profile_pipeline.py
+```
+
+To intentionally stress the bounded queue with a slow callback:
+
+```bash
+uv run python scripts/catap_profile_pipeline.py --slow-callback-ms 2
+```

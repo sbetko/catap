@@ -51,28 +51,17 @@ print(f"Recorded {session.duration_seconds:.2f} seconds")
 
 ### Command Line
 
+The CLI is intentionally small. These are the commands I use most often:
+
 ```bash
-# List applications producing audio
 catap list-apps
-
-# List all audio processes (including idle ones)
 catap list-apps --all
-
-# Record from an application by exact or unambiguous partial name
-catap record Safari -o ~/safari_audio.wav
-
-# Record for a specific duration
-catap record Spotify -d 30 -o ~/song.wav
-
-# Record with app muted (capture only, no playback)
-catap record Spotify --mute -d 60 -o ~/silent_capture.wav
-
-# Record system audio
-catap record --system -d 30 -o ~/system_audio.wav
-
-# Record system audio (optionally excluding apps)
-catap record --system -e Music -e Zoom -d 30 -o ~/system_audio.wav
+catap record Safari -d 30 -o safari.wav
+catap record Spotify --mute -d 60 -o spotify.wav
+catap record --system -e Music -e Zoom -d 30 -o system.wav
 ```
+
+Run `catap record --help` for the full set of recording options.
 
 ### Python API
 
