@@ -182,6 +182,38 @@ def get_property_cfstring(
         _CFRelease(cf_string_ref)
 
 
+def get_optional_property_cfstring(
+    object_id: int,
+    selector: int,
+    scope: int = kAudioObjectPropertyScopeGlobal,
+    element: int = kAudioObjectPropertyElementMain,
+) -> str | None:
+    """Fetch an optional CFString property, suppressing only lookup failures."""
+    try:
+        return get_property_cfstring(object_id, selector, scope, element)
+    except OSError:
+        return None
+
+
+def get_property_object_ids(
+    object_id: int,
+    selector: int,
+    scope: int = kAudioObjectPropertyScopeGlobal,
+    element: int = kAudioObjectPropertyElementMain,
+) -> list[int]:
+    """Fetch a property containing packed AudioObjectIDs.
+
+    The payload is decoded in complete 4-byte chunks only; any trailing partial
+    bytes are ignored.
+    """
+    data = get_property_bytes(object_id, selector, scope, element)
+    full_length = len(data) - (len(data) % 4)
+    return [
+        int.from_bytes(data[offset : offset + 4], "little")
+        for offset in range(0, full_length, 4)
+    ]
+
+
 def get_property_objc_object(
     object_id: int,
     selector: int,

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import struct
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
@@ -13,8 +11,10 @@ from catap.bindings._audiotoolbox import (
     kAudioFormatFlagIsFloat,
 )
 from catap.bindings._coreaudio import (
+    get_optional_property_cfstring as _get_optional_audio_object_cfstring_property,
     get_property_bytes as _get_audio_object_property,
     get_property_cfstring as _get_audio_object_cfstring_property,
+    get_property_object_ids as _get_audio_object_ids,
     get_property_struct as _get_audio_object_struct_property,
     kAudioObjectPropertyScopeInput,
     kAudioObjectPropertyScopeOutput,
@@ -93,16 +93,11 @@ class AmbiguousAudioDeviceError(LookupError):
         super().__init__(f"Multiple audio devices match '{query}': {formatted_matches}")
 
 
-def _parse_object_ids(data: bytes) -> list[int]:
-    count = len(data) // 4
-    return [struct.unpack("<I", data[i * 4 : (i + 1) * 4])[0] for i in range(count)]
-
-
 def _get_object_id_property(selector: int) -> int | None:
     data = _get_audio_object_property(kAudioObjectSystemObject, selector)
     if len(data) < 4:
         return None
-    return struct.unpack("<I", data[:4])[0]
+    return int.from_bytes(data[:4], "little")
 
 
 def _stream_direction(
@@ -111,13 +106,13 @@ def _stream_direction(
 ) -> Literal["input", "output"]:
     try:
         data = _get_audio_object_property(stream_id, kAudioStreamPropertyDirection)
-    except (OSError, struct.error):
+    except OSError:
         return fallback
 
     if len(data) < 4:
         return fallback
 
-    return "input" if struct.unpack("<I", data[:4])[0] else "output"
+    return "input" if int.from_bytes(data[:4], "little") else "output"
 
 
 def _stream_name(
@@ -125,10 +120,11 @@ def _stream_name(
     direction: Literal["input", "output"],
     index: int,
 ) -> str:
-    with contextlib.suppress(OSError):
-        name = _get_audio_object_cfstring_property(stream_id, kAudioObjectPropertyName)
-        if name:
-            return name
+    name = _get_optional_audio_object_cfstring_property(
+        stream_id, kAudioObjectPropertyName
+    )
+    if name:
+        return name
     return f"{direction.title()} Stream {index}"
 
 
@@ -141,15 +137,13 @@ def _device_streams(
 
     for scope, fallback_direction in (_OUTPUT_SCOPE, _INPUT_SCOPE):
         try:
-            data = _get_audio_object_property(
-                device_id,
-                kAudioDevicePropertyStreams,
-                scope=scope,
+            stream_ids = _get_audio_object_ids(
+                device_id, kAudioDevicePropertyStreams, scope=scope
             )
         except OSError:
             continue
 
-        for stream_index, stream_id in enumerate(_parse_object_ids(data)):
+        for stream_index, stream_id in enumerate(stream_ids):
             try:
                 stream_format = _get_audio_object_struct_property(
                     stream_id,
@@ -182,11 +176,11 @@ def _device_streams(
 
 def list_audio_devices() -> list[AudioDevice]:
     """List the Core Audio devices currently visible to the system."""
-    data = _get_audio_object_property(
+    device_ids = _get_audio_object_ids(
         kAudioObjectSystemObject,
         kAudioHardwarePropertyDevices,
     )
-    if not data:
+    if not device_ids:
         return []
 
     default_input_id = _get_object_id_property(kAudioHardwarePropertyDefaultInputDevice)
@@ -198,7 +192,7 @@ def list_audio_devices() -> list[AudioDevice]:
     )
 
     devices: list[AudioDevice] = []
-    for device_id in _parse_object_ids(data):
+    for device_id in device_ids:
         try:
             uid = _get_audio_object_cfstring_property(
                 device_id,
@@ -207,19 +201,15 @@ def list_audio_devices() -> list[AudioDevice]:
             if not uid:
                 continue
 
-            name = uid
-            with contextlib.suppress(OSError):
-                device_name = _get_audio_object_cfstring_property(
+            name = (
+                _get_optional_audio_object_cfstring_property(
                     device_id, kAudioObjectPropertyName
                 )
-                if device_name:
-                    name = device_name
-
-            manufacturer: str | None = None
-            with contextlib.suppress(OSError):
-                manufacturer = _get_audio_object_cfstring_property(
-                    device_id, kAudioObjectPropertyManufacturer
-                )
+                or uid
+            )
+            manufacturer = _get_optional_audio_object_cfstring_property(
+                device_id, kAudioObjectPropertyManufacturer
+            )
 
             devices.append(
                 AudioDevice(
@@ -233,7 +223,7 @@ def list_audio_devices() -> list[AudioDevice]:
                     is_default_system_output=device_id == default_system_output_id,
                 )
             )
-        except (OSError, struct.error):
+        except OSError:
             continue
 
     return sorted(

@@ -33,9 +33,13 @@ class _FakeWorkspace:
 def test_list_audio_processes_decodes_bundle_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process_list = struct.pack("<I", 41)
     pid = struct.pack("<I", 9001)
     is_outputting = struct.pack("<I", 1)
+
+    def get_object_ids(object_id: int, selector: int) -> list[int]:
+        assert object_id == process_module.kAudioObjectSystemObject
+        assert selector == process_module.kAudioHardwarePropertyProcessObjectList
+        return [41]
 
     def get_property(
         object_id: int,
@@ -44,9 +48,6 @@ def test_list_audio_processes_decodes_bundle_ids(
         element: int = 0,
     ) -> bytes:
         del scope, element
-        if object_id == process_module.kAudioObjectSystemObject:
-            assert selector == process_module.kAudioHardwarePropertyProcessObjectList
-            return process_list
         if object_id == 41 and selector == process_module.kAudioProcessPropertyPID:
             return pid
         if (
@@ -56,10 +57,11 @@ def test_list_audio_processes_decodes_bundle_ids(
             return is_outputting
         raise AssertionError(f"unexpected property lookup: {(object_id, selector)}")
 
+    monkeypatch.setattr(process_module, "_get_audio_object_ids", get_object_ids)
     monkeypatch.setattr(process_module, "_get_audio_object_property", get_property)
     monkeypatch.setattr(
         process_module,
-        "_get_audio_object_cfstring_property",
+        "_get_optional_audio_object_cfstring_property",
         lambda object_id, selector, scope=0, element=0: (
             "com.apple.Music"
             if (object_id, selector)
@@ -100,8 +102,8 @@ def test_list_audio_processes_propagates_core_audio_failures(
 ) -> None:
     monkeypatch.setattr(
         process_module,
-        "_get_audio_object_property",
-        lambda object_id, selector, scope=0, element=0: (_ for _ in ()).throw(
+        "_get_audio_object_ids",
+        lambda object_id, selector: (_ for _ in ()).throw(
             OSError("core audio unavailable")
         ),
     )
@@ -164,3 +166,29 @@ def test_find_process_by_name_raises_on_ambiguous_partial_match(
         process_module.find_process_by_name("mus")
 
     assert len(exc_info.value.matches) == 2
+
+
+def test_find_process_by_name_prefers_exact_bundle_id_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper = process_module.AudioProcess(
+        2,
+        200,
+        "com.apple.MusicHelper",
+        "Music Helper",
+        False,
+    )
+    target = process_module.AudioProcess(
+        1,
+        100,
+        "com.apple.Music",
+        "Music Player",
+        True,
+    )
+    monkeypatch.setattr(
+        process_module,
+        "list_audio_processes",
+        lambda: [helper, target],
+    )
+
+    assert process_module.find_process_by_name("com.apple.music") is target

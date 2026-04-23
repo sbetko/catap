@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 
 from catap.bindings._coreaudio import (
-    get_property_bytes as _get_audio_object_property,
     get_property_cfstring as _get_audio_object_cfstring_property,
     get_property_objc_object as _get_audio_object_objc_property,
+    get_property_object_ids as _get_audio_object_ids,
     kAudioHardwareBadObjectError,
     kAudioObjectSystemObject,
 )
@@ -75,14 +74,11 @@ class AudioTap:
 
 def list_audio_taps() -> list[AudioTap]:
     """List every tap currently visible to the calling process."""
-    data = _get_audio_object_property(
+    tap_ids = _get_audio_object_ids(
         kAudioObjectSystemObject, kAudioHardwarePropertyTapList
     )
-    if not data:
+    if not tap_ids:
         return []
-
-    count = len(data) // 4
-    tap_ids = [struct.unpack("<I", data[i * 4 : (i + 1) * 4])[0] for i in range(count)]
 
     taps: list[AudioTap] = []
     for tap_id in tap_ids:
@@ -97,7 +93,7 @@ def list_audio_taps() -> list[AudioTap]:
                     description=get_tap_description(tap_id),
                 )
             )
-        except (OSError, struct.error):
+        except OSError:
             continue
 
     return sorted(taps, key=lambda tap: (tap.name.casefold(), tap.uid))

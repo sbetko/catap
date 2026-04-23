@@ -100,6 +100,29 @@ def test_list_audio_devices_returns_stream_metadata(
             f"Unexpected property request: {(object_id, selector, scope)}"
         )
 
+    def _get_audio_object_ids(
+        object_id: int,
+        selector: int,
+        scope: int = device_module.kAudioObjectPropertyScopeOutput,
+        element: int = 0,
+    ) -> list[int]:
+        del element
+        if object_id == device_module.kAudioObjectSystemObject:
+            assert selector == device_module.kAudioHardwarePropertyDevices
+            return [20, 10]
+
+        if selector == device_module.kAudioDevicePropertyStreams:
+            return {
+                (10, device_module.kAudioObjectPropertyScopeOutput): [1001, 1002],
+                (10, device_module.kAudioObjectPropertyScopeInput): [],
+                (20, device_module.kAudioObjectPropertyScopeOutput): [],
+                (20, device_module.kAudioObjectPropertyScopeInput): [2001],
+            }[(object_id, scope)]
+
+        raise AssertionError(
+            f"Unexpected object-id request: {(object_id, selector, scope)}"
+        )
+
     def _get_audio_object_cfstring_property(object_id: int, selector: int) -> str:
         return {
             (10, device_module.kAudioDevicePropertyDeviceUID): "BuiltInSpeakerDevice",
@@ -123,12 +146,22 @@ def test_list_audio_devices_returns_stream_metadata(
         return stream_formats[object_id]
 
     monkeypatch.setattr(
+        device_module, "_get_audio_object_ids", _get_audio_object_ids
+    )
+    monkeypatch.setattr(
         device_module, "_get_audio_object_property", _get_audio_object_property
     )
     monkeypatch.setattr(
         device_module,
         "_get_audio_object_cfstring_property",
         _get_audio_object_cfstring_property,
+    )
+    monkeypatch.setattr(
+        device_module,
+        "_get_optional_audio_object_cfstring_property",
+        lambda object_id, selector, scope=0, element=0: (
+            _get_audio_object_cfstring_property(object_id, selector)
+        ),
     )
     monkeypatch.setattr(
         device_module,
@@ -220,3 +253,49 @@ def test_find_audio_device_by_name_raises_when_partial_match_is_ambiguous(
         match="Multiple audio devices match 'Speaker'",
     ):
         device_module.find_audio_device_by_name("Speaker")
+
+
+def test_find_audio_device_by_name_matches_exact_uid_after_name_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    speaker = device_module.AudioDevice(
+        audio_object_id=1,
+        uid="speaker-main",
+        name="Built-in Speakers",
+        manufacturer="Apple",
+        streams=(),
+        is_default_input=False,
+        is_default_output=True,
+        is_default_system_output=True,
+    )
+    monitor = device_module.AudioDevice(
+        audio_object_id=2,
+        uid="studio-monitor",
+        name="Speaker Main",
+        manufacturer="Apple",
+        streams=(),
+        is_default_input=False,
+        is_default_output=False,
+        is_default_system_output=False,
+    )
+    monkeypatch.setattr(
+        device_module, "list_audio_devices", lambda: [speaker, monitor]
+    )
+
+    assert device_module.find_audio_device_by_name("speaker-main") is speaker
+
+
+@pytest.mark.parametrize("payload", [b"", b"\x01\x02\x03"])
+def test_get_object_id_property_returns_none_for_short_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    monkeypatch.setattr(
+        device_module,
+        "_get_audio_object_property",
+        lambda object_id, selector, scope=0: payload,
+    )
+
+    assert device_module._get_object_id_property(
+        device_module.kAudioHardwarePropertyDefaultOutputDevice
+    ) is None

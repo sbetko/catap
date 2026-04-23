@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import struct
 from typing import Any
 
 import pytest
@@ -85,10 +84,10 @@ def test_list_audio_taps_returns_visible_taps_sorted(
         ),
     }
 
-    def _get_audio_object_property(object_id: int, selector: int) -> bytes:
+    def _get_audio_object_ids(object_id: int, selector: int) -> list[int]:
         assert object_id == tap_module.kAudioObjectSystemObject
         assert selector == tap_module.kAudioHardwarePropertyTapList
-        return struct.pack("<II", 200, 100)
+        return [200, 100]
 
     def _get_audio_object_cfstring_property(object_id: int, selector: int) -> str:
         assert selector == tap_module.kAudioTapPropertyUID
@@ -102,7 +101,7 @@ def test_list_audio_taps_returns_visible_taps_sorted(
         return descriptions[object_id]
 
     monkeypatch.setattr(
-        tap_module, "_get_audio_object_property", _get_audio_object_property
+        tap_module, "_get_audio_object_ids", _get_audio_object_ids
     )
     monkeypatch.setattr(
         tap_module,
@@ -135,10 +134,10 @@ def test_list_audio_taps_preserves_stream_zero(
         ),
     }
 
-    def _get_audio_object_property(object_id: int, selector: int) -> bytes:
+    def _get_audio_object_ids(object_id: int, selector: int) -> list[int]:
         assert object_id == tap_module.kAudioObjectSystemObject
         assert selector == tap_module.kAudioHardwarePropertyTapList
-        return struct.pack("<I", 100)
+        return [100]
 
     def _get_audio_object_cfstring_property(object_id: int, selector: int) -> str:
         assert selector == tap_module.kAudioTapPropertyUID
@@ -151,7 +150,7 @@ def test_list_audio_taps_preserves_stream_zero(
         return descriptions[object_id]
 
     monkeypatch.setattr(
-        tap_module, "_get_audio_object_property", _get_audio_object_property
+        tap_module, "_get_audio_object_ids", _get_audio_object_ids
     )
     monkeypatch.setattr(
         tap_module,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import struct
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -10,8 +9,9 @@ from dataclasses import dataclass
 from AppKit import NSRunningApplication, NSWorkspace  # ty: ignore[unresolved-import]
 
 from catap.bindings._coreaudio import (
+    get_optional_property_cfstring as _get_optional_audio_object_cfstring_property,
     get_property_bytes as _get_audio_object_property,
-    get_property_cfstring as _get_audio_object_cfstring_property,
+    get_property_object_ids as _get_audio_object_ids,
     kAudioObjectSystemObject,
 )
 
@@ -59,18 +59,11 @@ class AmbiguousAudioProcessError(LookupError):
 
 def list_audio_processes() -> list[AudioProcess]:
     """List all processes currently registered with Core Audio."""
-    data = _get_audio_object_property(
+    process_ids = _get_audio_object_ids(
         kAudioObjectSystemObject, kAudioHardwarePropertyProcessObjectList
     )
-
-    if not data:
+    if not process_ids:
         return []
-
-    # Parse array of AudioObjectID (UInt32)
-    count = len(data) // 4
-    process_ids = [
-        struct.unpack("<I", data[i * 4 : (i + 1) * 4])[0] for i in range(count)
-    ]
 
     workspace = NSWorkspace.sharedWorkspace()
     running_apps = {
@@ -85,19 +78,19 @@ def list_audio_processes() -> list[AudioProcess]:
             pid_data = _get_audio_object_property(audio_id, kAudioProcessPropertyPID)
             pid = struct.unpack("<I", pid_data[:4])[0]
 
-            bundle_id: str | None = None
-            with contextlib.suppress(OSError):
-                bundle_id = _get_audio_object_cfstring_property(
-                    audio_id, kAudioProcessPropertyBundleID
-                )
+            bundle_id = _get_optional_audio_object_cfstring_property(
+                audio_id, kAudioProcessPropertyBundleID
+            )
 
             is_outputting = False
-            with contextlib.suppress(OSError):
+            try:
                 output_data = _get_audio_object_property(
                     audio_id, kAudioProcessPropertyIsRunningOutput
                 )
                 if output_data:
                     is_outputting = struct.unpack("<I", output_data[:4])[0] != 0
+            except OSError:
+                pass
 
             name = "Unknown"
             if bundle_id and bundle_id in running_apps:
