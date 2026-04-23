@@ -64,3 +64,15 @@ uv run python scripts/catap_profile_pipeline.py --slow-callback-ms 2
 The default converter and worker profiles are unpaced throughput tests. The
 slow-callback profile is paced at the synthetic buffer interval. To also run
 the old-style burst pressure test, add `--slow-burst`.
+
+For a live probe that creates a real tap and measures callback timing through
+the public recording API:
+
+```bash
+uv run python scripts/catap_live_probe.py --seconds 2
+```
+
+The live probe reports callback intervals, observed frames/bytes, stop-time
+drop errors, and best-effort queue depth when the current private recorder
+state exposes it. It requires the same macOS audio-capture permission as a
+normal recording.
