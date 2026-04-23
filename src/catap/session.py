@@ -8,69 +8,66 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Self
 
-from catap.bindings.hardware import create_process_tap, destroy_process_tap
-from catap.bindings.process import (
-    AmbiguousAudioProcessError,
-    AudioProcess,
-    find_process_by_name,
-)
-from catap.bindings.tap import AudioTap, get_tap_description
-from catap.bindings.tap_description import TapDescription, TapMuteBehavior
-from catap.recorder import (
+from catap._recording_support import (
     _DEFAULT_MAX_PENDING_BUFFERS,
-    AudioRecorder,
     _validate_max_pending_buffers,
     _validate_recording_target,
 )
+from catap._session_backend import (
+    _DEFAULT_SESSION_BACKEND,
+    _RecorderLike,
+    _SessionBackend,
+)
+from catap.bindings.process import (
+    AmbiguousAudioProcessError,
+    AudioProcess,
+)
+from catap.bindings.tap import AudioTap
+from catap.bindings.tap_description import TapDescription
 
 
 class AudioProcessNotFoundError(LookupError):
     """Raised when a named audio process cannot be found."""
 
 
-def _resolve_process(process: str | AudioProcess) -> AudioProcess:
+def _resolve_process(
+    process: str | AudioProcess,
+    backend: _SessionBackend,
+) -> AudioProcess:
     """Resolve a process name into an AudioProcess."""
     if isinstance(process, AudioProcess):
         return process
 
-    resolved = find_process_by_name(process)
+    resolved = backend.find_process_by_name(process)
     if resolved is None:
         raise AudioProcessNotFoundError(f"No audio process found matching '{process}'")
 
     return resolved
 
 
-def _resolve_processes(processes: Sequence[str | AudioProcess]) -> list[AudioProcess]:
+def _resolve_processes(
+    processes: Sequence[str | AudioProcess],
+    backend: _SessionBackend,
+) -> list[AudioProcess]:
     """Resolve a list of process specifiers into AudioProcess objects."""
-    return [_resolve_process(process) for process in processes]
+    return [_resolve_process(process, backend) for process in processes]
 
 
 def build_process_tap_description(
     process: AudioProcess, *, mute: bool = False
 ) -> TapDescription:
     """Build the private stereo-mixdown tap description catap uses for app capture."""
-    tap_description = TapDescription.stereo_mixdown_of_processes(
-        [process.audio_object_id]
+    return _DEFAULT_SESSION_BACKEND.build_process_tap_description(
+        process,
+        mute=mute,
     )
-    tap_description.name = f"catap recording {process.name}"
-    tap_description.is_private = True
-    tap_description.mute_behavior = (
-        TapMuteBehavior.MUTED if mute else TapMuteBehavior.UNMUTED
-    )
-    return tap_description
 
 
 def build_system_tap_description(
     excluded: Sequence[AudioProcess] = (),
 ) -> TapDescription:
     """Build the private stereo global tap catap uses for system capture."""
-    tap_description = TapDescription.stereo_global_tap_excluding(
-        [process.audio_object_id for process in excluded]
-    )
-    tap_description.name = "catap system recording"
-    tap_description.is_private = True
-    tap_description.mute_behavior = TapMuteBehavior.UNMUTED
-    return tap_description
+    return _DEFAULT_SESSION_BACKEND.build_system_tap_description(excluded)
 
 
 class RecordingSession:
@@ -90,8 +87,6 @@ class RecordingSession:
         on_data: Callable[[bytes, int], None] | None = None,
         *,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
-        existing_tap_id: int | None = None,
-        owns_tap: bool = True,
     ) -> None:
         """
         Create a managed recording session.
@@ -116,15 +111,16 @@ class RecordingSession:
         self.output_path = _validate_recording_target(output_path, on_data)
         self._on_data = on_data
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
+        self._backend = _DEFAULT_SESSION_BACKEND
 
         self.source_process: AudioProcess | None = None
         self.source_tap: AudioTap | None = None
         self.excluded_processes: tuple[AudioProcess, ...] = ()
 
-        self._existing_tap_id = existing_tap_id
-        self._owns_tap = owns_tap
+        self._existing_tap_id: int | None = None
+        self._owns_tap = True
         self._tap_id: int | None = None
-        self._recorder: AudioRecorder | None = None
+        self._recorder: _RecorderLike | None = None
 
     @classmethod
     def from_process(
@@ -151,8 +147,12 @@ class RecordingSession:
         Raises:
             AudioProcessNotFoundError: If the named app cannot be found
         """
-        resolved_process = _resolve_process(process)
-        tap_description = build_process_tap_description(resolved_process, mute=mute)
+        backend = _DEFAULT_SESSION_BACKEND
+        resolved_process = _resolve_process(process, backend)
+        tap_description = backend.build_process_tap_description(
+            resolved_process,
+            mute=mute,
+        )
 
         session = cls(
             tap_description,
@@ -160,6 +160,7 @@ class RecordingSession:
             on_data=on_data,
             max_pending_buffers=max_pending_buffers,
         )
+        session._backend = backend
         session.source_process = resolved_process
         return session
 
@@ -186,8 +187,9 @@ class RecordingSession:
         Raises:
             AudioProcessNotFoundError: If an excluded app name cannot be found
         """
-        excluded_processes = _resolve_processes(exclude)
-        tap_description = build_system_tap_description(excluded_processes)
+        backend = _DEFAULT_SESSION_BACKEND
+        excluded_processes = _resolve_processes(exclude, backend)
+        tap_description = backend.build_system_tap_description(excluded_processes)
 
         session = cls(
             tap_description,
@@ -195,6 +197,7 @@ class RecordingSession:
             on_data=on_data,
             max_pending_buffers=max_pending_buffers,
         )
+        session._backend = backend
         session.excluded_processes = tuple(excluded_processes)
         return session
 
@@ -208,10 +211,13 @@ class RecordingSession:
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """Create a managed session that records from an existing tap."""
+        backend = _DEFAULT_SESSION_BACKEND
         source_tap = tap if isinstance(tap, AudioTap) else None
         tap_id = tap.audio_object_id if isinstance(tap, AudioTap) else tap
         tap_description = (
-            source_tap.description if source_tap else get_tap_description(tap_id)
+            source_tap.description
+            if source_tap
+            else backend.get_tap_description(tap_id)
         )
 
         session = cls(
@@ -219,9 +225,10 @@ class RecordingSession:
             output_path=output_path,
             on_data=on_data,
             max_pending_buffers=max_pending_buffers,
-            existing_tap_id=tap_id,
-            owns_tap=False,
         )
+        session._backend = backend
+        session._existing_tap_id = tap_id
+        session._owns_tap = False
         session.source_tap = source_tap
         return session
 
@@ -229,11 +236,6 @@ class RecordingSession:
     def tap_id(self) -> int | None:
         """Current Core Audio tap ID, if the session is active."""
         return self._tap_id
-
-    @property
-    def recorder(self) -> AudioRecorder | None:
-        """Current or most recent low-level recorder."""
-        return self._recorder
 
     @property
     def is_recording(self) -> bool:
@@ -294,11 +296,11 @@ class RecordingSession:
         tap_id = (
             self._existing_tap_id
             if self._existing_tap_id is not None
-            else create_process_tap(self.tap_description)
+            else self._backend.create_process_tap(self.tap_description)
         )
 
         try:
-            recorder = AudioRecorder(
+            recorder = self._backend.create_recorder(
                 tap_id,
                 self.output_path,
                 on_data=self._on_data,
@@ -310,7 +312,7 @@ class RecordingSession:
         except Exception:
             if self._owns_tap:
                 with contextlib.suppress(OSError):
-                    destroy_process_tap(tap_id)
+                    self._backend.destroy_process_tap(tap_id)
             self._tap_id = None
             self._recorder = None
             raise
@@ -395,7 +397,7 @@ class RecordingSession:
             return None
 
         try:
-            destroy_process_tap(tap_id)
+            self._backend.destroy_process_tap(tap_id)
         except OSError as exc:
             return exc
 

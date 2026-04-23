@@ -6,6 +6,8 @@ import ctypes
 import struct
 import threading
 import wave
+from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -26,21 +28,68 @@ def _stub_tap_format(tap_id: int) -> AudioStreamBasicDescription:
     return asbd
 
 
+def _make_worker(
+    *,
+    record_dropped_frames: Callable[[int], None] | None = None,
+    consume_dropped_stats: Callable[[], tuple[int, int]] | None = None,
+) -> worker_module._AudioWorker:
+    return worker_module._AudioWorker(
+        record_dropped_frames=(
+            (lambda num_frames: None)
+            if record_dropped_frames is None
+            else record_dropped_frames
+        ),
+        consume_dropped_stats=(
+            (lambda: (0, 0))
+            if consume_dropped_stats is None
+            else consume_dropped_stats
+        ),
+    )
+
+
+def _make_worker_config(
+    *,
+    output_path: Path | None = None,
+    on_data: Callable[[bytes, int], None] | None = None,
+    max_pending_buffers: int = 256,
+    sample_rate: float = 44_100.0,
+    num_channels: int = 2,
+    bits_per_sample: int = 16,
+    output_bits_per_sample: int | None = None,
+    convert_float_output: bool = False,
+) -> worker_module._WorkerConfig:
+    if output_bits_per_sample is None:
+        output_bits_per_sample = bits_per_sample
+
+    return worker_module._WorkerConfig(
+        output_path=output_path,
+        on_data=on_data,
+        max_pending_buffers=max_pending_buffers,
+        sample_rate=sample_rate,
+        num_channels=num_channels,
+        bits_per_sample=bits_per_sample,
+        output_bits_per_sample=output_bits_per_sample,
+        convert_float_output=convert_float_output,
+    )
+
+
 def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
     output_path = tmp_path / "recording.wav"
-    recorder = AudioRecorder(123, output_path)
-    recorder._sample_rate = 48_000
-    recorder._num_channels = 2
-    recorder._bits_per_sample = 32
-    recorder._is_float = True
-    recorder._output_bits_per_sample = 16
-    recorder._convert_float_output = True
+    worker = _make_worker()
+    config = _make_worker_config(
+        output_path=output_path,
+        sample_rate=48_000,
+        num_channels=2,
+        bits_per_sample=32,
+        output_bits_per_sample=16,
+        convert_float_output=True,
+    )
 
-    recorder._start_worker()
+    worker.start(config)
     data = struct.pack("<4f", 0.5, -0.5, 1.0, -1.0)
     buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-    assert recorder._enqueue_audio_data(buf, 2, len(data)) is True
-    recorder._stop_worker()
+    assert worker.enqueue_audio_data(buf, 2, len(data)) is True
+    worker.stop()
 
     with wave.open(str(output_path), "rb") as wav_file:
         assert wav_file.getframerate() == 48_000
@@ -53,19 +102,19 @@ def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
 
 def test_writer_preserves_int16_audio(tmp_path) -> None:
     output_path = tmp_path / "recording.wav"
-    recorder = AudioRecorder(123, output_path)
-    recorder._sample_rate = 44_100
-    recorder._num_channels = 1
-    recorder._bits_per_sample = 16
-    recorder._is_float = False
-    recorder._output_bits_per_sample = 16
-    recorder._convert_float_output = False
+    worker = _make_worker()
+    config = _make_worker_config(
+        output_path=output_path,
+        sample_rate=44_100,
+        num_channels=1,
+        bits_per_sample=16,
+    )
 
-    recorder._start_worker()
+    worker.start(config)
     data = struct.pack("<3h", 100, -200, 300)
     buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-    assert recorder._enqueue_audio_data(buf, 3, len(data)) is True
-    recorder._stop_worker()
+    assert worker.enqueue_audio_data(buf, 3, len(data)) is True
+    worker.stop()
 
     with wave.open(str(output_path), "rb") as wav_file:
         assert wav_file.getframerate() == 44_100
@@ -78,13 +127,14 @@ def test_writer_preserves_int16_audio(tmp_path) -> None:
 
 def test_start_worker_raises_cleanly_for_missing_output_directory(tmp_path) -> None:
     output_path = tmp_path / "missing" / "recording.wav"
-    recorder = AudioRecorder(123, output_path)
+    worker = _make_worker()
+    config = _make_worker_config(output_path=output_path)
 
     with pytest.raises(FileNotFoundError):
-        recorder._start_worker()
+        worker.start(config)
 
-    assert recorder._wav_file is None
-    assert recorder._output_file is None
+    assert worker.wav_file is None
+    assert worker.output_file is None
 
 
 def test_recorder_requires_output_path_or_callback() -> None:
@@ -110,63 +160,80 @@ def test_worker_invokes_callback_off_thread() -> None:
         assert num_frames == 1
         callback_event.set()
 
-    recorder = AudioRecorder(123, on_data=on_data)
-    recorder._start_worker()
+    worker = _make_worker()
+    config = _make_worker_config(on_data=on_data)
+    worker.start(config)
 
     buf = (ctypes.c_char * 2).from_buffer_copy(b"\x01\x02")
-    assert recorder._enqueue_audio_data(buf, 1, 2) is True
+    assert worker.enqueue_audio_data(buf, 1, 2) is True
     assert callback_event.wait(timeout=1)
 
-    recorder._stop_worker()
+    worker.stop()
 
     assert callback_threads == ["catap-audio-worker"]
 
 
 def test_worker_thread_is_non_daemon() -> None:
-    recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
-    recorder._start_worker()
+    worker = _make_worker()
+    config = _make_worker_config(on_data=lambda data, num_frames: None)
+    worker.start(config)
 
-    assert recorder._worker_thread is not None
-    assert recorder._worker_thread.daemon is False
+    assert worker.thread is not None
+    assert worker.thread.daemon is False
 
-    recorder._stop_worker()
+    worker.stop()
+
+
+def test_worker_rejects_double_start(tmp_path) -> None:
+    worker = _make_worker()
+    config = _make_worker_config(output_path=tmp_path / "recording.wav")
+    worker.start(config)
+
+    with pytest.raises(RuntimeError, match="Audio worker already started"):
+        worker.start(config)
+
+    worker.stop()
 
 
 def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
     callback_started = threading.Event()
     allow_callback_to_finish = threading.Event()
+    dropped_frames: list[int] = []
 
     def on_data(data: bytes, num_frames: int) -> None:
         del data, num_frames
         callback_started.set()
         assert allow_callback_to_finish.wait(timeout=1)
 
-    recorder = AudioRecorder(123, on_data=on_data, max_pending_buffers=1)
-    recorder._start_worker()
-    recorder._is_recording = True
+    worker = _make_worker(
+        record_dropped_frames=dropped_frames.append,
+        consume_dropped_stats=lambda: (len(dropped_frames), sum(dropped_frames)),
+    )
+    config = _make_worker_config(on_data=on_data, max_pending_buffers=1)
+    worker.start(config)
 
     buf_type = ctypes.c_char * 2
     assert (
-        recorder._enqueue_audio_data(buf_type.from_buffer_copy(b"\x00\x01"), 1, 2)
+        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x00\x01"), 1, 2)
         is True
     )
     assert callback_started.wait(timeout=1)
     assert (
-        recorder._enqueue_audio_data(buf_type.from_buffer_copy(b"\x02\x03"), 1, 2)
+        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x02\x03"), 1, 2)
         is True
     )
     assert (
-        recorder._enqueue_audio_data(buf_type.from_buffer_copy(b"\x04\x05"), 2, 2)
+        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x04\x05"), 2, 2)
         is False
     )
 
     allow_callback_to_finish.set()
 
     with pytest.raises(RuntimeError, match="Dropped 1 audio buffer") as exc_info:
-        recorder._stop_worker()
+        worker.stop()
 
     assert "2 frame(s)" in str(exc_info.value)
-    assert recorder.max_pending_buffers == 1
+    assert config.max_pending_buffers == 1
 
 
 def test_stop_reports_core_audio_cleanup_failures(
@@ -337,16 +404,17 @@ def test_start_worker_failure_closes_resources_without_join(
 
     monkeypatch.setattr(worker_module.threading, "Thread", _FailingThread)
 
-    recorder = AudioRecorder(123, tmp_path / "recording.wav")
+    worker = _make_worker()
+    config = _make_worker_config(output_path=tmp_path / "recording.wav")
 
     with pytest.raises(RuntimeError, match="thread start failed"):
-        recorder._start_worker()
+        worker.start(config)
 
     assert calls == ["init", "start"]
-    assert recorder._worker_state is None
-    assert recorder._output_file is None
-    assert recorder._wav_file is None
-    assert recorder._pcm_converter is None
+    assert worker.thread is None
+    assert worker.output_file is None
+    assert worker.wav_file is None
+    assert worker.pcm_converter is None
 
 
 def test_stop_preserves_callback_failure_cause() -> None:
@@ -357,18 +425,19 @@ def test_stop_preserves_callback_failure_cause() -> None:
         callback_seen.set()
         raise ValueError("boom")
 
-    recorder = AudioRecorder(123, on_data=on_data)
-    recorder._start_worker()
+    worker = _make_worker()
+    config = _make_worker_config(on_data=on_data)
+    worker.start(config)
 
     buf = (ctypes.c_char * 2).from_buffer_copy(b"\x01\x02")
-    assert recorder._enqueue_audio_data(buf, 1, 2) is True
+    assert worker.enqueue_audio_data(buf, 1, 2) is True
     assert callback_seen.wait(timeout=1)
 
     with pytest.raises(
         RuntimeError,
         match="Audio data callback failed: boom",
     ) as exc_info:
-        recorder._stop_worker()
+        worker.stop()
 
     assert isinstance(exc_info.value.__cause__, ValueError)
     assert any(
@@ -380,31 +449,33 @@ def test_stop_preserves_write_failure_cause(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    recorder = AudioRecorder(123, tmp_path / "recording.wav")
-    recorder._sample_rate = 48_000
-    recorder._num_channels = 2
-    recorder._bits_per_sample = 32
-    recorder._is_float = True
-    recorder._output_bits_per_sample = 16
-    recorder._convert_float_output = True
-    recorder._start_worker()
+    worker = _make_worker()
+    config = _make_worker_config(
+        output_path=tmp_path / "recording.wav",
+        sample_rate=48_000,
+        num_channels=2,
+        bits_per_sample=32,
+        output_bits_per_sample=16,
+        convert_float_output=True,
+    )
+    worker.start(config)
 
-    assert recorder._wav_file is not None
+    assert worker.wav_file is not None
 
     def _fail_write(_data: object) -> None:
         raise ValueError("disk full")
 
-    monkeypatch.setattr(recorder._wav_file, "writeframesraw", _fail_write)
+    monkeypatch.setattr(worker.wav_file, "writeframesraw", _fail_write)
 
     data = struct.pack("<4f", 0.5, -0.5, 1.0, -1.0)
     buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-    assert recorder._enqueue_audio_data(buf, 2, len(data)) is True
+    assert worker.enqueue_audio_data(buf, 2, len(data)) is True
 
     with pytest.raises(
         OSError,
         match="Failed to write WAV data: disk full",
     ) as exc_info:
-        recorder._stop_worker()
+        worker.stop()
 
     assert isinstance(exc_info.value.__cause__, ValueError)
     assert any(
@@ -416,11 +487,12 @@ def test_stop_preserves_finalize_failure_cause(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    recorder = AudioRecorder(123, tmp_path / "recording.wav")
-    recorder._start_worker()
+    worker = _make_worker()
+    config = _make_worker_config(output_path=tmp_path / "recording.wav")
+    worker.start(config)
 
-    assert recorder._wav_file is not None
-    wav_file = recorder._wav_file
+    assert worker.wav_file is not None
+    wav_file = worker.wav_file
 
     def _fail_close() -> None:
         raise ValueError("close failed")
@@ -431,8 +503,9 @@ def test_stop_preserves_finalize_failure_cause(
         OSError,
         match="Failed to finalize WAV file: close failed",
     ) as exc_info:
-        recorder._stop_worker()
+        worker.stop()
 
+    # Prevent pytest teardown from re-invoking the patched failing close.
     wav_file._file = None  # ty: ignore[unresolved-attribute]
     assert isinstance(exc_info.value.__cause__, ValueError)
     assert any(

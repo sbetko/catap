@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import ctypes
-import traceback
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
-from catap._recording_worker import _combine_errors
+from catap._recording_support import _add_secondary_failure, _combine_errors
 from catap.bindings._audiotoolbox import (
     AudioBufferList,
     AudioStreamBasicDescription,
@@ -24,15 +23,6 @@ from catap.bindings._coreaudio import (
     kAudioObjectPropertyScopeGlobal,
 )
 from catap.bindings.tap import _raise_if_missing_tap
-
-
-def _add_secondary_failure(
-    primary: BaseException, summary: str, secondary: BaseException
-) -> None:
-    """Attach a secondary failure's traceback to ``primary`` as a note."""
-    primary.add_note(
-        f"{summary}:\n{''.join(traceback.format_exception(secondary)).rstrip()}"
-    )
 
 
 class AudioTimeStamp(ctypes.Structure):

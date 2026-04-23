@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import ctypes
-import queue
 import threading
-import traceback
 from collections.abc import Callable
 from pathlib import Path
 
@@ -17,46 +15,18 @@ from catap._capture_engine import (
     _TapCaptureSession,
     _TapStreamFormat,
 )
+from catap._recording_support import (
+    _DEFAULT_MAX_PENDING_BUFFERS,
+    _add_secondary_failure,
+    _combine_errors,
+    _validate_max_pending_buffers,
+    _validate_recording_target,
+)
 from catap._recording_worker import (
     _AudioWorker,
-    _combine_errors,
-    _PoolBuffer,
     _WorkerConfig,
-    _WorkerItem,
-    _WorkerState,
 )
 from catap.bindings._audiotoolbox import AudioBuffer
-
-_DEFAULT_MAX_PENDING_BUFFERS = 256
-
-
-def _validate_recording_target(
-    output_path: str | Path | None,
-    on_data: Callable[[bytes, int], None] | None,
-) -> Path | None:
-    """Normalize the recording target and reject target-less captures."""
-    normalized_output_path = Path(output_path) if output_path else None
-    if normalized_output_path is None and on_data is None:
-        raise ValueError(
-            "output_path must be provided unless on_data is set for streaming mode"
-        )
-    return normalized_output_path
-
-
-def _validate_max_pending_buffers(value: int) -> int:
-    """Validate and normalize the recorder queue bound."""
-    if value <= 0:
-        raise ValueError("max_pending_buffers must be greater than 0")
-    return value
-
-
-def _add_secondary_failure(
-    primary: BaseException, summary: str, secondary: BaseException
-) -> None:
-    """Attach a secondary failure's traceback to ``primary`` as a note."""
-    primary.add_note(
-        f"{summary}:\n{''.join(traceback.format_exception(secondary)).rstrip()}"
-    )
 
 
 class AudioRecorder:
@@ -175,34 +145,6 @@ class AudioRecorder:
             convert_float_output=self._convert_float_output,
         )
 
-    @property
-    def _worker_state(self) -> _WorkerState | None:
-        return self._worker.state
-
-    @_worker_state.setter
-    def _worker_state(self, state: _WorkerState | None) -> None:
-        self._worker.state = state
-
-    @property
-    def _worker_thread(self) -> threading.Thread | None:
-        return self._worker.thread
-
-    @property
-    def _work_queue(self) -> queue.Queue[_WorkerItem] | None:
-        return self._worker.work_queue
-
-    @property
-    def _output_file(self):
-        return self._worker.output_file
-
-    @property
-    def _wav_file(self):
-        return self._worker.wav_file
-
-    @property
-    def _pcm_converter(self):
-        return self._worker.pcm_converter
-
     def _reset_counters(self) -> None:
         with self._stats_lock:
             self._total_frames = 0
@@ -250,7 +192,6 @@ class AudioRecorder:
             if num_buffers == 0:
                 return 0
 
-            worker_state = self._worker_state
             for i in range(num_buffers):
                 # AudioBufferList has a variable-length mBuffers array; index
                 # past the first slot via pointer arithmetic.
@@ -272,18 +213,17 @@ class AudioRecorder:
                     else:
                         num_frames = 0
 
-                    buf = self._acquire_pool_buffer(byte_count, worker_state)
+                    buf = self._worker.acquire_pool_buffer(byte_count)
                     if buf is None:
                         self._record_dropped_frames(num_frames)
                         continue
 
                     ctypes.memmove(buf, buffer.mData, byte_count)
 
-                    if self._enqueue_audio_data(
+                    if self._worker.enqueue_audio_data(
                         buf,
                         num_frames,
                         byte_count,
-                        worker_state,
                     ):
                         self._record_accepted_frames(num_frames)
 
@@ -325,7 +265,6 @@ class AudioRecorder:
 
             cleanup: list[Callable[[], None]] = []
             capture_session: _TapCaptureSession | None = None
-            worker_state: _WorkerState | None = None
             try:
                 capture_session = self._capture_engine.open_tap_capture(
                     self.tap_id,
@@ -334,8 +273,8 @@ class AudioRecorder:
                 self._capture_session = capture_session
                 cleanup.append(lambda: self._capture_engine.close(capture_session))
 
-                worker_state = self._start_worker()
-                cleanup.append(lambda: self._stop_worker(worker_state))
+                self._worker.start(self._make_worker_config())
+                cleanup.append(self._worker.stop)
 
                 with self._lifecycle_lock:
                     self._is_recording = True
@@ -355,8 +294,6 @@ class AudioRecorder:
                             cleanup_exc,
                         )
                 self._capture_session = None
-                if self._worker_state is worker_state:
-                    self._worker_state = None
                 raise
         except Exception:
             with self._lifecycle_lock:
@@ -382,7 +319,6 @@ class AudioRecorder:
             self._lifecycle_state = "stopping"
             self._is_recording = False
             capture_session = self._capture_session
-            worker_state = self._worker_state
 
         cleanup_errors: list[OSError | RuntimeError] = []
 
@@ -397,11 +333,10 @@ class AudioRecorder:
             except OSError as exc:
                 cleanup_errors.append(exc)
 
-        if worker_state is not None:
-            try:
-                self._stop_worker(worker_state)
-            except (OSError, RuntimeError) as exc:
-                cleanup_errors.append(exc)
+        try:
+            self._worker.stop()
+        except (OSError, RuntimeError) as exc:
+            cleanup_errors.append(exc)
 
         self._capture_session = None
 
@@ -410,37 +345,6 @@ class AudioRecorder:
 
         if cleanup_errors:
             raise _combine_errors("Failed to stop recording cleanly", cleanup_errors)
-
-    def _start_worker(self) -> _WorkerState:
-        """Start the background worker for file writes and user callbacks."""
-        return self._worker.start(self._make_worker_config())
-
-    def _acquire_pool_buffer(
-        self,
-        needed: int,
-        state: _WorkerState | None = None,
-    ) -> _PoolBuffer | None:
-        """Return a ctypes buffer sized for ``needed`` bytes, or None if exhausted.
-
-        Called from the Core Audio real-time thread. In steady state the pool
-        is non-empty and buffers are already large enough, so the hot path
-        skips both the allocator and any lock.
-        """
-        return self._worker.acquire_pool_buffer(needed, state)
-
-    def _enqueue_audio_data(
-        self,
-        buf: _PoolBuffer,
-        num_frames: int,
-        byte_count: int,
-        state: _WorkerState | None = None,
-    ) -> bool:
-        """Queue audio work without blocking the Core Audio callback thread."""
-        return self._worker.enqueue_audio_data(buf, num_frames, byte_count, state)
-
-    def _stop_worker(self, state: _WorkerState | None = None) -> None:
-        """Flush and stop the background worker."""
-        self._worker.stop(state)
 
     @property
     def is_recording(self) -> bool:

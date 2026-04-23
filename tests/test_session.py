@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -81,45 +81,91 @@ class _MissingTapRecorder(_FakeRecorder):
         )
 
 
-def _patch_session_symbols(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    process_lookup: dict[str, AudioProcess] | None = None,
-    recorder_cls: type[_FakeRecorder] = _FakeRecorder,
-    created_tap_ids: list[int] | None = None,
-    destroyed_tap_ids: list[int] | None = None,
-) -> None:
-    process_lookup = process_lookup or {}
-    created_tap_ids = created_tap_ids if created_tap_ids is not None else []
-    destroyed_tap_ids = destroyed_tap_ids if destroyed_tap_ids is not None else []
+class _FakeSessionBackend:
+    def __init__(
+        self,
+        *,
+        process_lookup: dict[str, AudioProcess] | None = None,
+        recorder_cls: type[_FakeRecorder] = _FakeRecorder,
+        created_tap_ids: list[int] | None = None,
+        destroyed_tap_ids: list[int] | None = None,
+    ) -> None:
+        self.process_lookup = process_lookup or {}
+        self.recorder_cls = recorder_cls
+        self.created_tap_ids = created_tap_ids if created_tap_ids is not None else []
+        self.destroyed_tap_ids = (
+            destroyed_tap_ids if destroyed_tap_ids is not None else []
+        )
+        self.created_recorders: list[_FakeRecorder] = []
+        self.taps_described: list[int] = []
+        self.process_resolver: Callable[[str], AudioProcess | None] | None = None
 
-    def _find_process_by_name(name: str) -> AudioProcess | None:
-        return process_lookup.get(name)
+    def find_process_by_name(self, name: str) -> AudioProcess | None:
+        if self.process_resolver is not None:
+            return self.process_resolver(name)
+        return self.process_lookup.get(name)
 
-    def _create_process_tap(description: _FakeTapDescription) -> int:
-        created_tap_ids.append(
+    def build_process_tap_description(
+        self,
+        process: AudioProcess,
+        *,
+        mute: bool = False,
+    ) -> _FakeTapDescription:
+        tap_description = _FakeTapDescription([process.audio_object_id])
+        tap_description.name = f"catap recording {process.name}"
+        tap_description.is_private = True
+        tap_description.mute_behavior = "muted" if mute else "unmuted"
+        return tap_description
+
+    def build_system_tap_description(
+        self,
+        excluded: tuple[AudioProcess, ...] | list[AudioProcess] = (),
+    ) -> _FakeTapDescription:
+        tap_description = _FakeTapDescription(
+            [process.audio_object_id for process in excluded],
+            exclusive=True,
+        )
+        tap_description.name = "catap system recording"
+        tap_description.is_private = True
+        tap_description.mute_behavior = "unmuted"
+        return tap_description
+
+    def get_tap_description(self, tap_id: int) -> _FakeTapDescription:
+        self.taps_described.append(tap_id)
+        return _FakeTapDescription([tap_id])
+
+    def create_process_tap(self, description: _FakeTapDescription) -> int:
+        self.created_tap_ids.append(
             description.processes[0] if description.processes else 99
         )
         return 77
 
-    def _destroy_process_tap(tap_id: int) -> None:
-        destroyed_tap_ids.append(tap_id)
+    def destroy_process_tap(self, tap_id: int) -> None:
+        self.destroyed_tap_ids.append(tap_id)
 
-    monkeypatch.setattr(session_module, "TapDescription", _FakeTapDescription)
-    monkeypatch.setattr(
-        session_module,
-        "TapMuteBehavior",
-        SimpleNamespace(UNMUTED="unmuted", MUTED="muted"),
-    )
-    monkeypatch.setattr(session_module, "find_process_by_name", _find_process_by_name)
-    monkeypatch.setattr(session_module, "create_process_tap", _create_process_tap)
-    monkeypatch.setattr(session_module, "destroy_process_tap", _destroy_process_tap)
-    monkeypatch.setattr(
-        session_module,
-        "get_tap_description",
-        lambda tap_id: _FakeTapDescription([tap_id]),
-    )
-    monkeypatch.setattr(session_module, "AudioRecorder", recorder_cls)
+    def create_recorder(
+        self,
+        tap_id: int,
+        output_path: Path | None,
+        on_data: object = None,
+        *,
+        max_pending_buffers: int = 256,
+    ) -> _FakeRecorder:
+        recorder = self.recorder_cls(
+            tap_id,
+            output_path,
+            on_data,
+            max_pending_buffers=max_pending_buffers,
+        )
+        self.created_recorders.append(recorder)
+        return recorder
+
+
+def _install_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: _FakeSessionBackend,
+) -> None:
+    monkeypatch.setattr(session_module, "_DEFAULT_SESSION_BACKEND", backend)
 
 
 def test_record_process_context_manager_manages_lifecycle(
@@ -127,46 +173,45 @@ def test_record_process_context_manager_manages_lifecycle(
 ) -> None:
     process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
     destroyed_tap_ids: list[int] = []
-    _patch_session_symbols(
-        monkeypatch,
+    backend = _FakeSessionBackend(
         process_lookup={"Music": process},
         destroyed_tap_ids=destroyed_tap_ids,
     )
+    _install_backend(monkeypatch, backend)
 
     session = session_module.record_process(
         "Music",
         output_path="recording.wav",
         mute=True,
     )
-    recorder = session.recorder
 
     assert session.source_process == process
     assert session.tap_description.name == "catap recording Music"
     assert session.tap_description.processes == [11]
     assert session.tap_description.is_private is True
     assert session.tap_description.mute_behavior == "muted"
+    assert backend.created_recorders == []
 
     with session as active_session:
         assert active_session.tap_id == 77
         assert active_session.is_recording is True
-        assert active_session.recorder is not None
-        assert active_session.recorder.output_path == Path("recording.wav")
-        assert active_session.recorder.max_pending_buffers == 256
-        recorder = active_session.recorder
+        assert len(backend.created_recorders) == 1
+        recorder = backend.created_recorders[0]
+        assert recorder.output_path == Path("recording.wav")
+        assert recorder.max_pending_buffers == 256
 
     assert session.tap_id is None
     assert session.is_recording is False
     assert session.duration_seconds == 0.5
-    fake_recorder = cast(_FakeRecorder, recorder)
-    assert fake_recorder.start_calls == 1
-    assert fake_recorder.stop_calls == 1
+    assert recorder.start_calls == 1
+    assert recorder.stop_calls == 1
     assert destroyed_tap_ids == [77]
 
 
 def test_record_process_raises_for_missing_process_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_session_symbols(monkeypatch)
+    _install_backend(monkeypatch, _FakeSessionBackend())
 
     with pytest.raises(
         session_module.AudioProcessNotFoundError,
@@ -179,12 +224,13 @@ def test_record_process_propagates_ambiguous_process_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
-    _patch_session_symbols(monkeypatch)
+    backend = _FakeSessionBackend()
 
     def _raise_ambiguous(name: str) -> AudioProcess | None:
         raise AmbiguousAudioProcessError(name, [process, process])
 
-    monkeypatch.setattr(session_module, "find_process_by_name", _raise_ambiguous)
+    backend.process_resolver = _raise_ambiguous
+    _install_backend(monkeypatch, backend)
 
     with pytest.raises(AmbiguousAudioProcessError, match="Multiple audio processes"):
         session_module.record_process("Music")
@@ -194,11 +240,11 @@ def test_recording_session_start_cleans_up_tap_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destroyed_tap_ids: list[int] = []
-    _patch_session_symbols(
-        monkeypatch,
+    backend = _FakeSessionBackend(
         recorder_cls=_StartFailingRecorder,
         destroyed_tap_ids=destroyed_tap_ids,
     )
+    _install_backend(monkeypatch, backend)
 
     session = session_module.RecordingSession(
         cast(TapDescription, _FakeTapDescription([42])),
@@ -209,7 +255,8 @@ def test_recording_session_start_cleans_up_tap_on_failure(
         session.start()
 
     assert session.tap_id is None
-    assert session.recorder is None
+    assert len(backend.created_recorders) == 1
+    assert backend.created_recorders[0].start_calls == 1
     assert destroyed_tap_ids == [77]
 
 
@@ -218,10 +265,10 @@ def test_record_system_audio_tracks_excluded_processes(
 ) -> None:
     music = AudioProcess(11, 111, "com.apple.Music", "Music", True)
     zoom = AudioProcess(12, 222, "us.zoom.xos", "Zoom", True)
-    _patch_session_symbols(
-        monkeypatch,
+    backend = _FakeSessionBackend(
         process_lookup={"Music": music},
     )
+    _install_backend(monkeypatch, backend)
 
     session = session_module.record_system_audio(
         output_path="system.wav",
@@ -242,11 +289,11 @@ def test_record_for_starts_and_closes_session(
     process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
     destroyed_tap_ids: list[int] = []
     slept: list[float] = []
-    _patch_session_symbols(
-        monkeypatch,
+    backend = _FakeSessionBackend(
         process_lookup={"Music": process},
         destroyed_tap_ids=destroyed_tap_ids,
     )
+    _install_backend(monkeypatch, backend)
     monkeypatch.setattr(session_module.time, "sleep", slept.append)
 
     session = session_module.record_process("Music", output_path="recording.wav")
@@ -256,8 +303,8 @@ def test_record_for_starts_and_closes_session(
     assert session.tap_id is None
     assert session.is_recording is False
     assert slept == [2.5]
-    assert session.recorder is not None
-    fake_recorder = cast(_FakeRecorder, session.recorder)
+    assert len(backend.created_recorders) == 1
+    fake_recorder = backend.created_recorders[0]
     assert fake_recorder.start_calls == 1
     assert fake_recorder.stop_calls == 1
     assert destroyed_tap_ids == [77]
@@ -268,11 +315,11 @@ def test_record_for_propagates_start_failure(
 ) -> None:
     destroyed_tap_ids: list[int] = []
     slept: list[float] = []
-    _patch_session_symbols(
-        monkeypatch,
+    backend = _FakeSessionBackend(
         recorder_cls=_StartFailingRecorder,
         destroyed_tap_ids=destroyed_tap_ids,
     )
+    _install_backend(monkeypatch, backend)
     monkeypatch.setattr(session_module.time, "sleep", slept.append)
 
     session = session_module.RecordingSession(
@@ -285,7 +332,8 @@ def test_record_for_propagates_start_failure(
 
     assert slept == []
     assert session.tap_id is None
-    assert session.recorder is None
+    assert len(backend.created_recorders) == 1
+    assert backend.created_recorders[0].start_calls == 1
     assert destroyed_tap_ids == [77]
 
 
@@ -310,7 +358,8 @@ def test_record_process_forwards_max_pending_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
-    _patch_session_symbols(monkeypatch, process_lookup={"Music": process})
+    backend = _FakeSessionBackend(process_lookup={"Music": process})
+    _install_backend(monkeypatch, backend)
 
     session = session_module.record_process(
         "Music",
@@ -321,15 +370,18 @@ def test_record_process_forwards_max_pending_buffers(
     assert session.max_pending_buffers == 32
 
     with session:
-        assert session.recorder is not None
-        assert session.recorder.max_pending_buffers == 32
+        assert len(backend.created_recorders) == 1
+        assert backend.created_recorders[0].max_pending_buffers == 32
 
 
 def test_record_process_rejects_non_positive_max_pending_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
-    _patch_session_symbols(monkeypatch, process_lookup={"Music": process})
+    _install_backend(
+        monkeypatch,
+        _FakeSessionBackend(process_lookup={"Music": process}),
+    )
 
     with pytest.raises(
         ValueError,
@@ -346,7 +398,10 @@ def test_record_tap_context_manager_uses_existing_tap_without_destroying_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destroyed_tap_ids: list[int] = []
-    _patch_session_symbols(monkeypatch, destroyed_tap_ids=destroyed_tap_ids)
+    _install_backend(
+        monkeypatch,
+        _FakeSessionBackend(destroyed_tap_ids=destroyed_tap_ids),
+    )
 
     tap = AudioTap(88, "tap-uid", cast(TapDescription, _FakeTapDescription([88])))
     session = session_module.record_tap(tap, output_path="recording.wav")
@@ -367,12 +422,14 @@ def test_record_tap_fetches_description_for_raw_tap_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destroyed_tap_ids: list[int] = []
-    _patch_session_symbols(monkeypatch, destroyed_tap_ids=destroyed_tap_ids)
+    backend = _FakeSessionBackend(destroyed_tap_ids=destroyed_tap_ids)
+    _install_backend(monkeypatch, backend)
 
     session = session_module.record_tap(91, output_path="recording.wav")
 
     assert session.source_tap is None
     assert session.tap_description.processes == [91]
+    assert backend.taps_described == [91]
 
     with session:
         assert session.tap_id == 91
@@ -384,11 +441,11 @@ def test_record_tap_does_not_destroy_existing_tap_when_start_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destroyed_tap_ids: list[int] = []
-    _patch_session_symbols(
-        monkeypatch,
+    backend = _FakeSessionBackend(
         recorder_cls=_StartFailingRecorder,
         destroyed_tap_ids=destroyed_tap_ids,
     )
+    _install_backend(monkeypatch, backend)
 
     session = session_module.record_tap(91, output_path="recording.wav")
 
@@ -396,7 +453,8 @@ def test_record_tap_does_not_destroy_existing_tap_when_start_fails(
         session.start()
 
     assert session.tap_id is None
-    assert session.recorder is None
+    assert len(backend.created_recorders) == 1
+    assert backend.created_recorders[0].start_calls == 1
     assert destroyed_tap_ids == []
 
 
@@ -404,11 +462,11 @@ def test_record_tap_propagates_stale_tap_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destroyed_tap_ids: list[int] = []
-    _patch_session_symbols(
-        monkeypatch,
+    backend = _FakeSessionBackend(
         recorder_cls=_MissingTapRecorder,
         destroyed_tap_ids=destroyed_tap_ids,
     )
+    _install_backend(monkeypatch, backend)
 
     session = session_module.record_tap(91, output_path="recording.wav")
 
@@ -416,5 +474,6 @@ def test_record_tap_propagates_stale_tap_error(
         session.record_for(1.0)
 
     assert session.tap_id is None
-    assert session.recorder is None
+    assert len(backend.created_recorders) == 1
+    assert backend.created_recorders[0].start_calls == 1
     assert destroyed_tap_ids == []

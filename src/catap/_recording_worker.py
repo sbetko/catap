@@ -6,7 +6,6 @@ import contextlib
 import ctypes
 import queue
 import threading
-import traceback
 import wave
 from collections import deque
 from collections.abc import Callable
@@ -14,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
+from catap._recording_support import _combine_errors, _translate_exception
 from catap.bindings._audiotoolbox import (
     PcmAudioConverter,
     make_linear_pcm_asbd,
@@ -28,34 +28,6 @@ type _WorkerItem = tuple[_PoolBuffer, int, int] | None
 type _WorkerFailure = OSError | RuntimeError
 
 _DEFAULT_POOL_BUFFER_SIZE = 4096
-
-
-def _combine_errors(
-    summary: str, errors: list[_WorkerFailure]
-) -> _WorkerFailure:
-    """Annotate the primary error with summary and secondary tracebacks."""
-    primary = errors[0]
-    primary.add_note(summary)
-
-    for error in errors[1:]:
-        primary.add_note(
-            "Additional cleanup failure:\n"
-            f"{''.join(traceback.format_exception(error)).rstrip()}"
-        )
-
-    return primary
-
-
-def _translate_exception(
-    error_type: type[OSError] | type[RuntimeError],
-    message: str,
-    cause: Exception,
-) -> _WorkerFailure:
-    """Create an exception with an explicit cause chain."""
-    try:
-        raise error_type(message) from cause
-    except error_type as wrapped:
-        return wrapped
 
 
 @dataclass(slots=True)
@@ -83,6 +55,8 @@ class _WorkerState:
     pcm_converter: PcmAudioConverter | None = None
     thread: threading.Thread | None = None
     failures: list[_WorkerFailure] = field(default_factory=list)
+    # Keep the two sink failures independent so one broken sink does not
+    # silence the other for the rest of the capture.
     callback_failed: bool = False
     writer_failed: bool = False
 
@@ -101,27 +75,9 @@ class _AudioWorker:
         self._state: _WorkerState | None = None
 
     @property
-    def state(self) -> _WorkerState | None:
-        return self._state
-
-    @state.setter
-    def state(self, state: _WorkerState | None) -> None:
-        self._state = state
-
-    @property
     def thread(self) -> threading.Thread | None:
         state = self._state
         return None if state is None else state.thread
-
-    @property
-    def work_queue(self) -> queue.Queue[_WorkerItem] | None:
-        state = self._state
-        return None if state is None else state.work_queue
-
-    @property
-    def buffer_pool(self) -> deque[_PoolBuffer] | None:
-        state = self._state
-        return None if state is None else state.buffer_pool
 
     @property
     def output_file(self) -> BinaryIO | None:
@@ -138,19 +94,17 @@ class _AudioWorker:
         state = self._state
         return None if state is None else state.pcm_converter
 
-    def start(self, config: _WorkerConfig) -> _WorkerState:
+    def start(self, config: _WorkerConfig) -> None:
         """Start the background worker for file writes and user callbacks."""
         if self._state is not None:
-            return self._state
+            raise RuntimeError("Audio worker already started")
 
-        state = self._create_state(config, start_thread=True)
+        state = self._create_state(config)
         self._state = state
-        return state
 
-    def stop(self, state: _WorkerState | None = None) -> None:
+    def stop(self) -> None:
         """Flush and stop the background worker."""
-        if state is None:
-            state = self._state
+        state = self._state
         if state is None:
             return
 
@@ -164,8 +118,7 @@ class _AudioWorker:
         if state.thread is not None:
             state.thread.join()
 
-        if self._state is state:
-            self._state = None
+        self._state = None
 
         worker_errors = list(state.failures)
         dropped_buffers, dropped_frames = self._consume_dropped_stats()
@@ -183,18 +136,15 @@ class _AudioWorker:
         if worker_errors:
             raise _combine_errors("Failed to finalize audio worker", worker_errors)
 
-    def acquire_pool_buffer(
-        self,
-        needed: int,
-        state: _WorkerState | None = None,
-    ) -> _PoolBuffer | None:
+    def acquire_pool_buffer(self, needed: int) -> _PoolBuffer | None:
         """Return a ctypes buffer sized for ``needed`` bytes, or None if exhausted."""
-        if state is None:
-            state = self._state
+        state = self._state
         if state is None:
             return None
 
         try:
+            # The RT callback only pops while the worker thread only appends.
+            # CPython keeps those individual deque operations atomic.
             buf = state.buffer_pool.pop()
         except IndexError:
             return None
@@ -211,11 +161,9 @@ class _AudioWorker:
         buf: _PoolBuffer,
         num_frames: int,
         byte_count: int,
-        state: _WorkerState | None = None,
     ) -> bool:
         """Queue audio work without blocking the Core Audio callback thread."""
-        if state is None:
-            state = self._state
+        state = self._state
         if state is None:
             return True
 
@@ -233,36 +181,19 @@ class _AudioWorker:
 
         return True
 
-    def _create_state(
-        self,
-        config: _WorkerConfig,
-        *,
-        start_thread: bool,
-        include_queue: bool = True,
-        pool_depth: int | None = None,
-        queue_maxsize: int | None = None,
-        buffer_bytes: int | None = None,
-    ) -> _WorkerState:
-        """Create worker-owned queueing state and optionally start the worker."""
-        if start_thread and not include_queue:
-            raise ValueError("start_thread requires include_queue=True")
-
+    def _create_state(self, config: _WorkerConfig) -> _WorkerState:
+        """Create worker-owned queueing state and start the worker thread."""
         bytes_per_frame = max(1, config.num_channels * (config.bits_per_sample // 8))
         pool_buffer_size = max(
             _DEFAULT_POOL_BUFFER_SIZE,
             bytes_per_frame * 1024,
         )
-        if buffer_bytes is not None:
-            pool_buffer_size = buffer_bytes
-
-        depth = config.max_pending_buffers if pool_depth is None else pool_depth
-        queue_bound = (
-            config.max_pending_buffers if queue_maxsize is None else queue_maxsize
-        )
         pool_type = ctypes.c_char * pool_buffer_size
         state = _WorkerState(
-            buffer_pool=deque(pool_type() for _ in range(depth)),
-            work_queue=queue.Queue(maxsize=queue_bound) if include_queue else None,
+            buffer_pool=deque(
+                pool_type() for _ in range(config.max_pending_buffers)
+            ),
+            work_queue=queue.Queue(maxsize=config.max_pending_buffers),
         )
 
         with contextlib.ExitStack() as stack:
@@ -296,15 +227,14 @@ class _AudioWorker:
                 state.wav_file = wav_file
                 state.pcm_converter = pcm_converter
 
-            if start_thread:
-                thread = threading.Thread(
-                    target=self._worker_loop,
-                    args=(state, config.on_data),
-                    name="catap-audio-worker",
-                    daemon=False,
-                )
-                thread.start()
-                state.thread = thread
+            thread = threading.Thread(
+                target=self._worker_loop,
+                args=(state, config.on_data),
+                name="catap-audio-worker",
+                daemon=False,
+            )
+            thread.start()
+            state.thread = thread
 
             stack.pop_all()
 
