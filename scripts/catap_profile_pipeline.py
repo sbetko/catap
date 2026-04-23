@@ -3,6 +3,10 @@
 This script does not create a Core Audio tap and does not require system-audio
 permission. It feeds synthetic float32 stereo buffers through the same
 AudioConverter and background worker pieces used by AudioRecorder.
+
+The default converter/worker profiles are unpaced throughput tests. The
+optional slow-callback profile is paced at the synthetic audio buffer interval
+so it behaves more like real Core Audio delivery.
 """
 
 from __future__ import annotations
@@ -145,6 +149,7 @@ def profile_worker(
     output_path: Path | None,
     on_data: Callable[[bytes, int], None] | None,
     convert_float_output: bool,
+    pace_seconds: float | None = None,
 ) -> ProfileResult:
     """Measure background worker throughput for one sink configuration."""
     dropped_buffers = 0
@@ -179,16 +184,22 @@ def profile_worker(
 
     worker.start(config)
     started = time.perf_counter()
+    next_deadline = started
     try:
         for _ in range(buffers):
             buffer = worker.acquire_pool_buffer(len(payload))
             if buffer is None:
                 record_dropped_frames(frames_per_buffer)
-                continue
+            else:
+                ctypes.memmove(buffer, input_buffer, len(payload))
+                if worker.enqueue_audio_data(buffer, frames_per_buffer, len(payload)):
+                    accepted_buffers += 1
 
-            ctypes.memmove(buffer, input_buffer, len(payload))
-            if worker.enqueue_audio_data(buffer, frames_per_buffer, len(payload)):
-                accepted_buffers += 1
+            if pace_seconds is not None:
+                next_deadline += pace_seconds
+                sleep_seconds = next_deadline - time.perf_counter()
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
     finally:
         try:
             worker.stop()
@@ -262,6 +273,7 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
 
     if args.slow_callback_ms is not None:
         delay_seconds = args.slow_callback_ms / 1000.0
+        audio_buffer_seconds = args.buffer_frames / args.sample_rate
 
         def slow_on_data(data: bytes, _num_frames: int) -> None:
             del data
@@ -269,9 +281,9 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
 
         results.append(
             profile_worker(
-                name="slow-callback",
+                name="slow-callback-paced",
                 payload=payload,
-                buffers=args.buffers,
+                buffers=args.slow_buffers,
                 frames_per_buffer=args.buffer_frames,
                 sample_rate=args.sample_rate,
                 channels=args.channels,
@@ -279,8 +291,25 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
                 output_path=None,
                 on_data=slow_on_data,
                 convert_float_output=False,
+                pace_seconds=audio_buffer_seconds,
             )
         )
+
+        if args.slow_burst:
+            results.append(
+                profile_worker(
+                    name="slow-callback-burst",
+                    payload=payload,
+                    buffers=args.buffers,
+                    frames_per_buffer=args.buffer_frames,
+                    sample_rate=args.sample_rate,
+                    channels=args.channels,
+                    max_pending_buffers=args.slow_max_pending_buffers,
+                    output_path=None,
+                    on_data=slow_on_data,
+                    convert_float_output=False,
+                )
+            )
 
     return results
 
@@ -344,13 +373,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--slow-callback-ms",
         type=_non_negative_float,
         default=None,
-        help="Also run a slow callback profile with this per-buffer delay",
+        help="Also run a paced slow-callback profile with this per-buffer delay",
+    )
+    parser.add_argument(
+        "--slow-buffers",
+        type=_positive_int,
+        default=200,
+        help="Buffers to feed into --slow-callback-ms (default: 200)",
     )
     parser.add_argument(
         "--slow-max-pending-buffers",
         type=_positive_int,
         default=8,
         help="Queue depth for --slow-callback-ms (default: 8)",
+    )
+    parser.add_argument(
+        "--slow-burst",
+        action="store_true",
+        help="Also run the slow callback as an unpaced burst pressure test",
     )
     parser.add_argument(
         "--json",

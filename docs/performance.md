@@ -55,8 +55,12 @@ For a synthetic profile that does not require audio-capture permission, run:
 uv run python scripts/catap_profile_pipeline.py
 ```
 
-To intentionally stress the bounded queue with a slow callback:
+To simulate a slow callback with Core Audio-like pacing:
 
 ```bash
 uv run python scripts/catap_profile_pipeline.py --slow-callback-ms 2
 ```
+
+The default converter and worker profiles are unpaced throughput tests. The
+slow-callback profile is paced at the synthetic buffer interval. To also run
+the old-style burst pressure test, add `--slow-burst`.
