@@ -219,7 +219,7 @@ class _TapCaptureEngine:
     def open_tap_capture(
         self,
         tap_id: int,
-        callback: AudioDeviceIOProcType,
+        callback: object,
     ) -> _TapCaptureSession:
         """Create the aggregate device and IOProc for a recorder session."""
         try:

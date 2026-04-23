@@ -8,6 +8,7 @@ import threading
 import wave
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -511,6 +512,33 @@ def test_stop_preserves_finalize_failure_cause(
     assert any(
         "Failed to finalize audio worker" in note for note in exc_info.value.__notes__
     )
+
+
+def test_io_proc_failure_is_reported_on_stop() -> None:
+    recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+
+    status = recorder._io_proc(
+        0,
+        cast(Any, None),
+        cast(Any, object()),
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+    )
+
+    assert status == 0
+
+    with pytest.raises(RuntimeError, match="Audio callback failed") as exc_info:
+        recorder.stop()
+
+    assert isinstance(exc_info.value.__cause__, AttributeError)
+    assert any(
+        "Failed to stop recording cleanly" in note for note in exc_info.value.__notes__
+    )
+    assert recorder._lifecycle_state == "idle"
 
 
 def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:

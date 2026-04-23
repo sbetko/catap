@@ -19,6 +19,7 @@ from catap._recording_support import (
     _DEFAULT_MAX_PENDING_BUFFERS,
     _add_secondary_failure,
     _combine_errors,
+    _translate_exception,
     _validate_max_pending_buffers,
     _validate_recording_target,
 )
@@ -94,6 +95,8 @@ class AudioRecorder:
         self._total_frames = 0
         self._dropped_buffers = 0
         self._dropped_frames = 0
+        self._io_proc_failure: RuntimeError | None = None
+        self._io_proc_failure_count = 0
 
         # Stream format (populated on start).
         self._sample_rate = 44100.0
@@ -150,6 +153,8 @@ class AudioRecorder:
             self._total_frames = 0
             self._dropped_buffers = 0
             self._dropped_frames = 0
+            self._io_proc_failure = None
+            self._io_proc_failure_count = 0
 
     def _record_accepted_frames(self, num_frames: int) -> None:
         with self._stats_lock:
@@ -167,6 +172,33 @@ class AudioRecorder:
             self._dropped_buffers = 0
             self._dropped_frames = 0
         return dropped_buffers, dropped_frames
+
+    def _record_io_proc_failure(self, exc: Exception) -> None:
+        """Remember callback failures without raising into Core Audio."""
+        with self._stats_lock:
+            self._io_proc_failure_count += 1
+            if self._io_proc_failure is None:
+                failure = _translate_exception(
+                    RuntimeError,
+                    f"Audio callback failed: {exc}",
+                    exc,
+                )
+                assert isinstance(failure, RuntimeError)
+                self._io_proc_failure = failure
+
+    def _consume_io_proc_failure(self) -> RuntimeError | None:
+        """Return and clear the first callback failure captured this run."""
+        with self._stats_lock:
+            failure = self._io_proc_failure
+            failure_count = self._io_proc_failure_count
+            self._io_proc_failure = None
+            self._io_proc_failure_count = 0
+
+        if failure is not None and failure_count > 1:
+            failure.add_note(
+                f"Audio callback failed {failure_count} times; first failure shown."
+            )
+        return failure
 
     def _io_proc(
         self,
@@ -227,9 +259,9 @@ class AudioRecorder:
                     ):
                         self._record_accepted_frames(num_frames)
 
-        except Exception:
+        except Exception as exc:
             # Must not raise from a Core Audio callback.
-            pass
+            self._record_io_proc_failure(exc)
 
         return 0  # noErr
 
@@ -337,6 +369,10 @@ class AudioRecorder:
             self._worker.stop()
         except (OSError, RuntimeError) as exc:
             cleanup_errors.append(exc)
+
+        callback_failure = self._consume_io_proc_failure()
+        if callback_failure is not None:
+            cleanup_errors.append(callback_failure)
 
         self._capture_session = None
 

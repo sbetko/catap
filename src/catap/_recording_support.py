@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 type _RecordingFailure = OSError | RuntimeError
@@ -42,7 +42,7 @@ def _add_secondary_failure(
 
 def _combine_errors(
     summary: str,
-    errors: list[_RecordingFailure],
+    errors: Sequence[_RecordingFailure],
 ) -> _RecordingFailure:
     """Annotate the primary error with summary and secondary tracebacks."""
     primary = errors[0]
