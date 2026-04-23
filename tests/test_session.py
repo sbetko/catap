@@ -73,6 +73,13 @@ class _StartFailingRecorder(_FakeRecorder):
         raise OSError("boom")
 
 
+class _StopFailingRecorder(_FakeRecorder):
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self.is_recording = False
+        raise OSError("stop boom")
+
+
 class _MissingTapRecorder(_FakeRecorder):
     def start(self) -> None:
         self.start_calls += 1
@@ -89,6 +96,7 @@ class _FakeSessionBackend:
         recorder_cls: type[_FakeRecorder] = _FakeRecorder,
         created_tap_ids: list[int] | None = None,
         destroyed_tap_ids: list[int] | None = None,
+        destroy_error: OSError | None = None,
     ) -> None:
         self.process_lookup = process_lookup or {}
         self.recorder_cls = recorder_cls
@@ -96,6 +104,7 @@ class _FakeSessionBackend:
         self.destroyed_tap_ids = (
             destroyed_tap_ids if destroyed_tap_ids is not None else []
         )
+        self.destroy_error = destroy_error
         self.created_recorders: list[_FakeRecorder] = []
         self.taps_described: list[int] = []
         self.process_resolver: Callable[[str], AudioProcess | None] | None = None
@@ -142,6 +151,8 @@ class _FakeSessionBackend:
 
     def destroy_process_tap(self, tap_id: int) -> None:
         self.destroyed_tap_ids.append(tap_id)
+        if self.destroy_error is not None:
+            raise self.destroy_error
 
     def create_recorder(
         self,
@@ -477,3 +488,53 @@ def test_record_tap_propagates_stale_tap_error(
     assert len(backend.created_recorders) == 1
     assert backend.created_recorders[0].start_calls == 1
     assert destroyed_tap_ids == []
+
+
+def test_stop_combines_recorder_and_tap_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _FakeSessionBackend(
+        recorder_cls=_StopFailingRecorder,
+        destroy_error=OSError("destroy boom"),
+    )
+    _install_backend(monkeypatch, backend)
+
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+    session.start()
+
+    with pytest.raises(OSError, match="stop boom") as exc_info:
+        session.stop()
+
+    assert session.tap_id is None
+    assert backend.destroyed_tap_ids == [77]
+    notes = getattr(exc_info.value, "__notes__", [])
+    assert "Failed to close recording session" in notes
+    assert any("destroy boom" in note for note in notes)
+
+
+def test_close_combines_recorder_and_tap_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _FakeSessionBackend(
+        recorder_cls=_StopFailingRecorder,
+        destroy_error=OSError("destroy boom"),
+    )
+    _install_backend(monkeypatch, backend)
+
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+    session.start()
+
+    with pytest.raises(OSError, match="stop boom") as exc_info:
+        session.close()
+
+    assert session.tap_id is None
+    assert backend.destroyed_tap_ids == [77]
+    notes = getattr(exc_info.value, "__notes__", [])
+    assert "Failed to close recording session" in notes
+    assert any("destroy boom" in note for note in notes)

@@ -49,7 +49,7 @@ class _WorkerState:
     """Worker state shared by the RT callback and background thread."""
 
     buffer_pool: deque[_PoolBuffer]
-    work_queue: queue.Queue[_WorkerItem] | None
+    work_queue: queue.Queue[_WorkerItem]
     output_file: BinaryIO | None = None
     wav_file: wave.Wave_write | None = None
     pcm_converter: PcmAudioConverter | None = None
@@ -108,11 +108,7 @@ class _AudioWorker:
         if state is None:
             return
 
-        if (
-            state.work_queue is not None
-            and state.thread is not None
-            and state.thread.is_alive()
-        ):
+        if state.thread is not None and state.thread.is_alive():
             state.work_queue.put(None)
 
         if state.thread is not None:
@@ -167,13 +163,8 @@ class _AudioWorker:
         if state is None:
             return True
 
-        work_queue = state.work_queue
-        if work_queue is None:
-            state.buffer_pool.append(buf)
-            return True
-
         try:
-            work_queue.put_nowait((buf, num_frames, byte_count))
+            state.work_queue.put_nowait((buf, num_frames, byte_count))
         except queue.Full:
             self._record_dropped_frames(num_frames)
             state.buffer_pool.append(buf)
@@ -246,8 +237,6 @@ class _AudioWorker:
         on_data: Callable[[bytes, int], None] | None,
     ) -> None:
         """Drain queued audio outside the Core Audio callback thread."""
-        assert state.work_queue is not None
-
         try:
             while True:
                 item = state.work_queue.get()

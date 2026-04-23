@@ -10,6 +10,7 @@ from typing import Self
 
 from catap._recording_support import (
     _DEFAULT_MAX_PENDING_BUFFERS,
+    _combine_errors,
     _validate_max_pending_buffers,
     _validate_recording_target,
 )
@@ -87,6 +88,7 @@ class RecordingSession:
         on_data: Callable[[bytes, int], None] | None = None,
         *,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
+        _backend: _SessionBackend | None = None,
     ) -> None:
         """
         Create a managed recording session.
@@ -111,7 +113,9 @@ class RecordingSession:
         self.output_path = _validate_recording_target(output_path, on_data)
         self._on_data = on_data
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
-        self._backend = _DEFAULT_SESSION_BACKEND
+        self._backend = (
+            _DEFAULT_SESSION_BACKEND if _backend is None else _backend
+        )
 
         self.source_process: AudioProcess | None = None
         self.source_tap: AudioTap | None = None
@@ -159,8 +163,8 @@ class RecordingSession:
             output_path=output_path,
             on_data=on_data,
             max_pending_buffers=max_pending_buffers,
+            _backend=backend,
         )
-        session._backend = backend
         session.source_process = resolved_process
         return session
 
@@ -196,8 +200,8 @@ class RecordingSession:
             output_path=output_path,
             on_data=on_data,
             max_pending_buffers=max_pending_buffers,
+            _backend=backend,
         )
-        session._backend = backend
         session.excluded_processes = tuple(excluded_processes)
         return session
 
@@ -225,8 +229,8 @@ class RecordingSession:
             output_path=output_path,
             on_data=on_data,
             max_pending_buffers=max_pending_buffers,
+            _backend=backend,
         )
-        session._backend = backend
         session._existing_tap_id = tap_id
         session._owns_tap = False
         session.source_tap = source_tap
@@ -336,10 +340,11 @@ class RecordingSession:
 
         destroy_error = self._destroy_tap()
 
-        if stop_error is not None:
-            raise stop_error
-        if destroy_error is not None:
-            raise destroy_error
+        errors = [
+            error for error in (stop_error, destroy_error) if error is not None
+        ]
+        if errors:
+            raise _combine_errors("Failed to close recording session", errors)
 
     def close(self) -> None:
         """
@@ -356,10 +361,11 @@ class RecordingSession:
 
         destroy_error = self._destroy_tap()
 
-        if stop_error is not None:
-            raise stop_error
-        if destroy_error is not None:
-            raise destroy_error
+        errors = [
+            error for error in (stop_error, destroy_error) if error is not None
+        ]
+        if errors:
+            raise _combine_errors("Failed to close recording session", errors)
 
     def record_for(self, duration: float) -> Self:
         """
