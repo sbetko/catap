@@ -511,7 +511,7 @@ def test_stop_combines_recorder_and_tap_cleanup_failures(
     assert session.tap_id is None
     assert backend.destroyed_tap_ids == [77]
     notes = getattr(exc_info.value, "__notes__", [])
-    assert "Failed to close recording session" in notes
+    assert "Failed to stop recording session" in notes
     assert any("destroy boom" in note for note in notes)
 
 

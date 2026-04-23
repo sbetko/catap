@@ -344,7 +344,7 @@ class RecordingSession:
             error for error in (stop_error, destroy_error) if error is not None
         ]
         if errors:
-            raise _combine_errors("Failed to close recording session", errors)
+            raise _combine_errors("Failed to stop recording session", errors)
 
     def close(self) -> None:
         """
