@@ -63,8 +63,14 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "PERF", "PT"]
 combine-as-imports = true
 
 [tool.pytest.ini_options]
-addopts = "-q --strict-markers"
+addopts = "-q -ra"
 testpaths = ["tests"]
+strict_config = true
+strict_markers = true
+strict_parametrization_ids = true
+strict_xfail = true
+filterwarnings = ["error"]
+faulthandler_timeout = "30"
 markers = [
     "integration: opt-in tests that exercise the real macOS Core Audio bridge",
 ]

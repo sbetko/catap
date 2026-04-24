@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import wave
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -56,15 +57,19 @@ def _read_tone_farm_manifest(
 
 
 def _stop_tone_farm(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-
-    process.terminate()
     try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=1)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+    finally:
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                with suppress(OSError):
+                    pipe.close()
 
 
 def test_list_audio_processes_smoke() -> None:
