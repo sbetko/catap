@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-04-24
+
+- Added strict tap stream format validation before capture starts. Unsupported
+  Core Audio layouts now raise `UnsupportedTapFormatError` instead of risking
+  plausible but corrupt WAV output.
+- Reject non-linear PCM, big-endian PCM, non-packed PCM, non-interleaved audio,
+  unsigned integer PCM, padded frames, invalid rates/channels/bit depths, and
+  floating-point formats other than packed float32.
+- Treat malformed callback buffers as capture failures instead of guessing:
+  multi-buffer `AudioBufferList` layouts, missing data pointers, mismatched or
+  missing channel counts, and partial-frame byte counts are surfaced on stop.
+- Make WAV output transactional. Recorders now write to a sibling temporary file
+  and publish it only after clean shutdown, preserving existing output files on
+  failed startup or failed writes.
+- Stop active capture sessions before destroying Core Audio resources and clear
+  started state after stop attempts so cleanup paths are more deterministic.
+- Reject non-integer `max_pending_buffers` values such as `True`, floats, and
+  strings.
+- Expanded pytest coverage around Core Audio lifecycle cleanup, recorder format
+  handling, malformed callback buffers, output-file safety, public exports, and
+  session queue-bound validation.
+
 ## [0.3.0] - 2026-04-23
 
 - Refactored the recorder into focused internal capture-engine, worker, support,
