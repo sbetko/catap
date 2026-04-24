@@ -25,6 +25,7 @@ def test_module_has_expected_exports() -> None:
     assert "AudioTap" in module.__all__
     assert "AudioTapNotFoundError" in module.__all__
     assert "AudioRecorder" in module.__all__
+    assert "UnsupportedTapFormatError" in module.__all__
     assert "RecordingSession" in module.__all__
     assert "list_audio_devices" in module.__all__
     assert "find_audio_device_by_uid" in module.__all__
@@ -51,6 +52,7 @@ def test_public_exports_reference_expected_symbols() -> None:
     assert module.AudioDevice is device_module.AudioDevice
     assert module.AudioDeviceStream is device_module.AudioDeviceStream
     assert module.AudioRecorder is recorder_module.AudioRecorder
+    assert module.UnsupportedTapFormatError is recorder_module.UnsupportedTapFormatError
     assert module.TapDescription is tap_module.TapDescription
     assert module.TapMuteBehavior is tap_module.TapMuteBehavior
     assert (

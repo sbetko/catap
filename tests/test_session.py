@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -402,6 +402,25 @@ def test_record_process_rejects_non_positive_max_pending_buffers(
             "Music",
             output_path="recording.wav",
             max_pending_buffers=0,
+        )
+
+
+@pytest.mark.parametrize("value", [True, 1.5, "8"])
+def test_record_process_rejects_non_integer_max_pending_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    _install_backend(
+        monkeypatch,
+        _FakeSessionBackend(process_lookup={"Music": process}),
+    )
+
+    with pytest.raises(TypeError, match="max_pending_buffers must be an integer"):
+        session_module.record_process(
+            "Music",
+            output_path="recording.wav",
+            max_pending_buffers=cast(Any, value),
         )
 
 

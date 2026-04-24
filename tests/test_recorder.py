@@ -14,18 +14,27 @@ import pytest
 
 import catap._capture_engine as capture_module
 import catap._recording_worker as worker_module
-from catap.bindings._audiotoolbox import AudioStreamBasicDescription
+from catap.bindings._audiotoolbox import (
+    AudioBuffer,
+    AudioBufferList,
+    AudioStreamBasicDescription,
+    kAudioFormatFlagIsFloat,
+    kAudioFormatFlagIsPacked,
+    kAudioFormatLinearPCM,
+)
 from catap.bindings.tap import AudioTapNotFoundError
-from catap.recorder import AudioRecorder
+from catap.recorder import AudioRecorder, UnsupportedTapFormatError
 
 
 def _stub_tap_format(tap_id: int) -> AudioStreamBasicDescription:
     del tap_id
     asbd = AudioStreamBasicDescription()
     asbd.mSampleRate = 48_000
+    asbd.mFormatID = kAudioFormatLinearPCM
     asbd.mChannelsPerFrame = 2
     asbd.mBitsPerChannel = 32
-    asbd.mFormatFlags = 0
+    asbd.mBytesPerFrame = 8
+    asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
     return asbd
 
 
@@ -72,6 +81,67 @@ def _make_worker_config(
         output_bits_per_sample=output_bits_per_sample,
         convert_float_output=convert_float_output,
     )
+
+
+def _audio_buffer_list_pointer(
+    *buffers: tuple[bytes, int],
+) -> tuple[Any, list[object]]:
+    class _TestAudioBufferList(ctypes.Structure):
+        _fields_ = [
+            ("mNumberBuffers", ctypes.c_uint32),
+            ("mBuffers", AudioBuffer * len(buffers)),
+        ]
+
+    buffer_list = _TestAudioBufferList()
+    buffer_list.mNumberBuffers = len(buffers)
+    keepalive: list[object] = [buffer_list]
+
+    for index, (data, channels) in enumerate(buffers):
+        data_buffer = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        keepalive.append(data_buffer)
+        buffer_list.mBuffers[index].mNumberChannels = channels
+        buffer_list.mBuffers[index].mDataByteSize = len(data)
+        buffer_list.mBuffers[index].mData = ctypes.cast(data_buffer, ctypes.c_void_p)
+
+    return (
+        ctypes.cast(ctypes.pointer(buffer_list), ctypes.POINTER(AudioBufferList)),
+        keepalive,
+    )
+
+
+class _CapturingWorker:
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[bytes, int, int]] = []
+        self.pool_buffers: list[ctypes.Array] = []
+
+    def acquire_pool_buffer(self, needed: int) -> ctypes.Array:
+        buf = (ctypes.c_char * needed)()
+        self.pool_buffers.append(buf)
+        return buf
+
+    def enqueue_audio_data(
+        self,
+        buf: ctypes.Array,
+        num_frames: int,
+        byte_count: int,
+    ) -> bool:
+        self.enqueued.append(
+            (bytes(memoryview(buf)[:byte_count]), num_frames, byte_count)
+        )
+        return True
+
+
+def _recording_recorder_with_worker(
+    fake_worker: _CapturingWorker,
+) -> AudioRecorder:
+    recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
+    recorder._worker = cast(Any, fake_worker)
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+    recorder._num_channels = 2
+    recorder._bits_per_sample = 16
+    recorder._bytes_per_frame = 4
+    return recorder
 
 
 def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
@@ -149,6 +219,12 @@ def test_recorder_requires_output_path_or_callback() -> None:
 def test_recorder_rejects_non_positive_max_pending_buffers() -> None:
     with pytest.raises(ValueError, match="max_pending_buffers must be greater than 0"):
         AudioRecorder(123, "recording.wav", max_pending_buffers=0)
+
+
+@pytest.mark.parametrize("value", [True, 1.5, "8"])
+def test_recorder_rejects_non_integer_max_pending_buffers(value: object) -> None:
+    with pytest.raises(TypeError, match="max_pending_buffers must be an integer"):
+        AudioRecorder(123, "recording.wav", max_pending_buffers=cast(Any, value))
 
 
 def test_worker_invokes_callback_off_thread() -> None:
@@ -314,6 +390,54 @@ def test_failed_start_does_not_clobber_existing_output_file(
     assert output_path.read_bytes() == original_bytes
 
 
+def test_failed_device_start_does_not_clobber_existing_output_file(tmp_path) -> None:
+    output_path = tmp_path / "existing.wav"
+    original_bytes = b"keep-this-audio"
+    output_path.write_bytes(original_bytes)
+
+    class _StartFailingCaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+            *,
+            default: capture_module._TapStreamFormat,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id, default
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                32,
+                False,
+                bytes_per_frame=8,
+                is_interleaved=True,
+            )
+
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+        ) -> capture_module._TapCaptureSession:
+            del tap_id, callback
+            return capture_module._TapCaptureSession(55, ctypes.c_void_p(77))
+
+        def start(self, session: capture_module._TapCaptureSession) -> None:
+            del session
+            raise OSError("device start failed")
+
+        def close(self, session: capture_module._TapCaptureSession) -> None:
+            del session
+
+    recorder = AudioRecorder(123, output_path)
+    recorder._capture_engine = cast(Any, _StartFailingCaptureEngine())
+
+    with pytest.raises(OSError, match="device start failed"):
+        recorder.start()
+
+    assert output_path.read_bytes() == original_bytes
+    assert list(tmp_path.glob(".existing.wav.*.tmp")) == []
+    assert recorder._lifecycle_state == "idle"
+
+
 def test_failed_start_unwinds_cleanup_for_non_oserror_exceptions(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -450,9 +574,10 @@ def test_stop_preserves_write_failure_cause(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    output_path = tmp_path / "recording.wav"
     worker = _make_worker()
     config = _make_worker_config(
-        output_path=tmp_path / "recording.wav",
+        output_path=output_path,
         sample_rate=48_000,
         num_channels=2,
         bits_per_sample=32,
@@ -482,6 +607,8 @@ def test_stop_preserves_write_failure_cause(
     assert any(
         "Failed to finalize audio worker" in note for note in exc_info.value.__notes__
     )
+    assert not output_path.exists()
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
 
 
 def test_stop_preserves_finalize_failure_cause(
@@ -539,6 +666,278 @@ def test_io_proc_failure_is_reported_on_stop() -> None:
         "Failed to stop recording cleanly" in note for note in exc_info.value.__notes__
     )
     assert recorder._lifecycle_state == "idle"
+
+
+def test_start_rejects_non_interleaved_tap_format() -> None:
+    class _FakeCaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+            *,
+            default: capture_module._TapStreamFormat,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id, default
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                32,
+                True,
+                bytes_per_frame=4,
+                is_interleaved=False,
+                is_signed_integer=False,
+            )
+
+        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+            raise AssertionError("capture should not open for unsupported formats")
+
+    recorder = AudioRecorder(123, "recording.wav")
+    recorder._capture_engine = cast(Any, _FakeCaptureEngine())
+
+    with pytest.raises(UnsupportedTapFormatError, match="non-interleaved"):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_start_rejects_non_linear_pcm_tap_format() -> None:
+    class _FakeCaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+            *,
+            default: capture_module._TapStreamFormat,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id, default
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                32,
+                True,
+                bytes_per_frame=8,
+                format_id=int.from_bytes(b"aac ", "big"),
+                is_signed_integer=False,
+            )
+
+        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+            raise AssertionError("capture should not open for unsupported formats")
+
+    recorder = AudioRecorder(123, "recording.wav")
+    recorder._capture_engine = cast(Any, _FakeCaptureEngine())
+
+    with pytest.raises(UnsupportedTapFormatError, match="only linear PCM"):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_start_rejects_big_endian_tap_format() -> None:
+    class _FakeCaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+            *,
+            default: capture_module._TapStreamFormat,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id, default
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                16,
+                False,
+                bytes_per_frame=4,
+                is_big_endian=True,
+                is_signed_integer=True,
+            )
+
+        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+            raise AssertionError("capture should not open for unsupported formats")
+
+    recorder = AudioRecorder(123, "recording.wav")
+    recorder._capture_engine = cast(Any, _FakeCaptureEngine())
+
+    with pytest.raises(UnsupportedTapFormatError, match="big-endian"):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_start_rejects_unsigned_integer_tap_format() -> None:
+    class _FakeCaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+            *,
+            default: capture_module._TapStreamFormat,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id, default
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                16,
+                False,
+                bytes_per_frame=4,
+                is_signed_integer=False,
+            )
+
+        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+            raise AssertionError("capture should not open for unsupported formats")
+
+    recorder = AudioRecorder(123, "recording.wav")
+    recorder._capture_engine = cast(Any, _FakeCaptureEngine())
+
+    with pytest.raises(UnsupportedTapFormatError, match="signed integer PCM"):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_start_rejects_padded_tap_frames() -> None:
+    class _FakeCaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+            *,
+            default: capture_module._TapStreamFormat,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id, default
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                24,
+                False,
+                bytes_per_frame=8,
+                is_interleaved=True,
+            )
+
+        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+            raise AssertionError("capture should not open for unsupported formats")
+
+    recorder = AudioRecorder(123, "recording.wav")
+    recorder._capture_engine = cast(Any, _FakeCaptureEngine())
+
+    with pytest.raises(
+        UnsupportedTapFormatError,
+        match="expected packed interleaved 6-byte frames, got 8",
+    ):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_io_proc_copies_single_interleaved_buffer_to_worker() -> None:
+    fake_worker = _CapturingWorker()
+    recorder = _recording_recorder_with_worker(fake_worker)
+    data = struct.pack("<4h", 1, 2, 3, 4)
+    input_data, _keepalive = _audio_buffer_list_pointer((data, 2))
+
+    status = recorder._io_proc(
+        0,
+        cast(Any, None),
+        input_data,
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+    )
+
+    assert status == 0
+    assert fake_worker.enqueued == [(data, 2, len(data))]
+    assert recorder.frames_recorded == 2
+
+
+def test_io_proc_reports_multi_buffer_layout_instead_of_writing_planar_audio() -> None:
+    fake_worker = _CapturingWorker()
+    recorder = _recording_recorder_with_worker(fake_worker)
+    left = struct.pack("<2h", 1, 3)
+    right = struct.pack("<2h", 2, 4)
+    input_data, _keepalive = _audio_buffer_list_pointer((left, 1), (right, 1))
+
+    status = recorder._io_proc(
+        0,
+        cast(Any, None),
+        input_data,
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+    )
+
+    assert status == 0
+    assert fake_worker.enqueued == []
+    failure = recorder._consume_io_proc_failure()
+    assert failure is not None
+    assert isinstance(failure.__cause__, UnsupportedTapFormatError)
+    assert "expected one interleaved buffer, got 2" in str(failure)
+
+
+def test_io_proc_reports_partial_frame_instead_of_writing_truncated_audio() -> None:
+    fake_worker = _CapturingWorker()
+    recorder = _recording_recorder_with_worker(fake_worker)
+    input_data, _keepalive = _audio_buffer_list_pointer((b"\x01\x02\x03", 2))
+
+    status = recorder._io_proc(
+        0,
+        cast(Any, None),
+        input_data,
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+    )
+
+    assert status == 0
+    assert fake_worker.enqueued == []
+    failure = recorder._consume_io_proc_failure()
+    assert failure is not None
+    assert isinstance(failure.__cause__, UnsupportedTapFormatError)
+    assert "not a whole number of frames" in str(failure)
+
+
+def test_io_proc_reports_missing_data_pointer_instead_of_ignoring_bytes() -> None:
+    fake_worker = _CapturingWorker()
+    recorder = _recording_recorder_with_worker(fake_worker)
+    input_data, _keepalive = _audio_buffer_list_pointer((b"\x00\x01\x02\x03", 2))
+    input_data.contents.mBuffers[0].mData = None
+
+    status = recorder._io_proc(
+        0,
+        cast(Any, None),
+        input_data,
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+    )
+
+    assert status == 0
+    assert fake_worker.enqueued == []
+    failure = recorder._consume_io_proc_failure()
+    assert failure is not None
+    assert isinstance(failure.__cause__, UnsupportedTapFormatError)
+    assert "without a data pointer" in str(failure)
+
+
+def test_io_proc_reports_missing_channel_count_instead_of_guessing() -> None:
+    fake_worker = _CapturingWorker()
+    recorder = _recording_recorder_with_worker(fake_worker)
+    input_data, _keepalive = _audio_buffer_list_pointer((b"\x00\x01\x02\x03", 0))
+
+    status = recorder._io_proc(
+        0,
+        cast(Any, None),
+        input_data,
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+        cast(Any, None),
+    )
+
+    assert status == 0
+    assert fake_worker.enqueued == []
+    failure = recorder._consume_io_proc_failure()
+    assert failure is not None
+    assert isinstance(failure.__cause__, UnsupportedTapFormatError)
+    assert "expected 2, got 0" in str(failure)
 
 
 def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:

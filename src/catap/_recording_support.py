@@ -26,6 +26,8 @@ def _validate_recording_target(
 
 def _validate_max_pending_buffers(value: int) -> int:
     """Validate and normalize the recorder queue bound."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("max_pending_buffers must be an integer")
     if value <= 0:
         raise ValueError("max_pending_buffers must be greater than 0")
     return value

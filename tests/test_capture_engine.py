@@ -11,6 +11,9 @@ import catap._capture_engine as capture_module
 from catap.bindings._audiotoolbox import (
     AudioStreamBasicDescription,
     kAudioFormatFlagIsFloat,
+    kAudioFormatFlagIsNonInterleaved,
+    kAudioFormatFlagIsPacked,
+    kAudioFormatLinearPCM,
 )
 from catap.bindings._coreaudio import kAudioHardwareBadObjectError
 from catap.bindings.tap import AudioTapNotFoundError
@@ -25,9 +28,11 @@ def test_describe_tap_stream_uses_tap_format(
 ) -> None:
     asbd = AudioStreamBasicDescription()
     asbd.mSampleRate = 96_000.0
+    asbd.mFormatID = kAudioFormatLinearPCM
     asbd.mChannelsPerFrame = 6
     asbd.mBitsPerChannel = 32
-    asbd.mFormatFlags = kAudioFormatFlagIsFloat
+    asbd.mBytesPerFrame = 24
+    asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
     monkeypatch.setattr(capture_module, "_get_tap_format", lambda tap_id: asbd)
 
     stream_format = capture_module._TapCaptureEngine().describe_tap_stream(
@@ -35,7 +40,39 @@ def test_describe_tap_stream_uses_tap_format(
         default=capture_module._TapStreamFormat(44_100.0, 2, 16, False),
     )
 
-    assert stream_format == capture_module._TapStreamFormat(96_000.0, 6, 32, True)
+    assert stream_format == capture_module._TapStreamFormat(
+        96_000.0,
+        6,
+        32,
+        True,
+        bytes_per_frame=24,
+        is_interleaved=True,
+        is_signed_integer=False,
+    )
+
+
+def test_describe_tap_stream_detects_non_interleaved_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asbd = AudioStreamBasicDescription()
+    asbd.mSampleRate = 48_000.0
+    asbd.mFormatID = kAudioFormatLinearPCM
+    asbd.mChannelsPerFrame = 2
+    asbd.mBitsPerChannel = 32
+    asbd.mBytesPerFrame = 4
+    asbd.mFormatFlags = (
+        kAudioFormatFlagIsFloat
+        | kAudioFormatFlagIsPacked
+        | kAudioFormatFlagIsNonInterleaved
+    )
+    monkeypatch.setattr(capture_module, "_get_tap_format", lambda tap_id: asbd)
+
+    stream_format = capture_module._TapCaptureEngine().describe_tap_stream(
+        123,
+        default=capture_module._TapStreamFormat(44_100.0, 2, 16, False),
+    )
+
+    assert stream_format.is_interleaved is False
 
 
 def test_describe_tap_stream_returns_default_for_unavailable_format(
@@ -202,6 +239,58 @@ def test_stop_skips_unstarted_session(monkeypatch: pytest.MonkeyPatch) -> None:
 
     capture_module._TapCaptureEngine().stop(session)
 
+    assert session.started is False
+
+
+def test_stop_clears_started_state_even_when_core_audio_stop_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_AudioDeviceStop",
+        lambda device_id, io_proc_id: 10,
+    )
+
+    with pytest.raises(OSError, match="Failed to stop audio device: status 10"):
+        capture_module._TapCaptureEngine().stop(session)
+
+    assert session.started is False
+
+
+def test_close_stops_started_session_before_destroying_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
+    calls: list[str] = []
+
+    def stop_device(device_id: int, io_proc_id: ctypes.c_void_p) -> int:
+        calls.append(f"stop:{device_id}:{io_proc_id.value}")
+        return 0
+
+    def destroy_io_proc(device_id: int, io_proc_id: ctypes.c_void_p) -> None:
+        calls.append(f"destroy-io:{device_id}:{io_proc_id.value}")
+
+    def destroy_aggregate_device(device_id: int) -> None:
+        calls.append(f"destroy-device:{device_id}")
+
+    monkeypatch.setattr(capture_module, "_AudioDeviceStop", stop_device)
+    monkeypatch.setattr(capture_module, "_destroy_io_proc", destroy_io_proc)
+    monkeypatch.setattr(
+        capture_module, "_destroy_aggregate_device", destroy_aggregate_device
+    )
+
+    capture_module._TapCaptureEngine().close(session)
+
+    assert calls == ["stop:55:77", "destroy-io:55:77", "destroy-device:55"]
     assert session.started is False
 
 

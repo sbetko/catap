@@ -56,8 +56,10 @@ class AudioBufferList(ctypes.Structure):
 kAudioFormatLinearPCM = int.from_bytes(b"lpcm", "big")
 kAudioFileWAVEType = int.from_bytes(b"WAVE", "big")
 kAudioFormatFlagIsFloat = 1 << 0
+kAudioFormatFlagIsBigEndian = 1 << 1
 kAudioFormatFlagIsSignedInteger = 1 << 2
 kAudioFormatFlagIsPacked = 1 << 3
+kAudioFormatFlagIsNonInterleaved = 1 << 5
 kExtAudioFileProperty_ClientDataFormat = int.from_bytes(b"cfmt", "big")
 
 _EMPTY_VIEW = memoryview(b"")

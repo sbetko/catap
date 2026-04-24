@@ -45,7 +45,7 @@ from catap.bindings.tap import (
     list_audio_taps,
 )
 from catap.bindings.tap_description import TapDescription, TapMuteBehavior
-from catap.recorder import AudioRecorder
+from catap.recorder import AudioRecorder, UnsupportedTapFormatError
 from catap.session import (
     AudioProcessNotFoundError,
     RecordingSession,
@@ -72,6 +72,7 @@ __all__ = [
     "RecordingSession",
     "TapDescription",
     "TapMuteBehavior",
+    "UnsupportedTapFormatError",
     "create_process_tap",
     "destroy_process_tap",
     "find_audio_device_by_name",

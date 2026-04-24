@@ -13,7 +13,12 @@ from catap._recording_support import _add_secondary_failure, _combine_errors
 from catap.bindings._audiotoolbox import (
     AudioBufferList,
     AudioStreamBasicDescription,
+    kAudioFormatFlagIsBigEndian,
     kAudioFormatFlagIsFloat,
+    kAudioFormatFlagIsNonInterleaved,
+    kAudioFormatFlagIsPacked,
+    kAudioFormatFlagIsSignedInteger,
+    kAudioFormatLinearPCM,
 )
 from catap.bindings._coreaudio import (
     _CoreAudio,
@@ -182,6 +187,12 @@ class _TapStreamFormat:
     num_channels: int
     bits_per_sample: int
     is_float: bool
+    bytes_per_frame: int | None = None
+    is_interleaved: bool = True
+    format_id: int = kAudioFormatLinearPCM
+    is_big_endian: bool = False
+    is_packed: bool = True
+    is_signed_integer: bool = True
 
 
 @dataclass(slots=True)
@@ -214,6 +225,16 @@ class _TapCaptureEngine:
             num_channels=asbd.mChannelsPerFrame,
             bits_per_sample=asbd.mBitsPerChannel,
             is_float=bool(asbd.mFormatFlags & kAudioFormatFlagIsFloat),
+            bytes_per_frame=asbd.mBytesPerFrame,
+            is_interleaved=not bool(
+                asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved
+            ),
+            format_id=asbd.mFormatID,
+            is_big_endian=bool(asbd.mFormatFlags & kAudioFormatFlagIsBigEndian),
+            is_packed=bool(asbd.mFormatFlags & kAudioFormatFlagIsPacked),
+            is_signed_integer=bool(
+                asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger
+            ),
         )
 
     def open_tap_capture(
@@ -275,12 +296,19 @@ class _TapCaptureEngine:
         """Stop a running capture session."""
         if not session.started:
             return
-        _stop_audio_device(session.aggregate_device_id, session.io_proc_id)
-        session.started = False
+        try:
+            _stop_audio_device(session.aggregate_device_id, session.io_proc_id)
+        finally:
+            session.started = False
 
     def close(self, session: _TapCaptureSession) -> None:
         """Destroy the IOProc and aggregate device for a capture session."""
         cleanup_errors: list[OSError] = []
+
+        try:
+            self.stop(session)
+        except OSError as exc:
+            cleanup_errors.append(exc)
 
         try:
             _destroy_io_proc(session.aggregate_device_id, session.io_proc_id)

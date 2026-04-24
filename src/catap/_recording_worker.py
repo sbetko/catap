@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import os
 import queue
+import tempfile
 import threading
 import wave
 from collections import deque
@@ -54,6 +56,8 @@ class _WorkerState:
     wav_file: wave.Wave_write | None = None
     pcm_converter: PcmAudioConverter | None = None
     thread: threading.Thread | None = None
+    final_output_path: Path | None = None
+    temporary_output_path: Path | None = None
     failures: list[_WorkerFailure] = field(default_factory=list)
     # Keep the two sink failures independent so one broken sink does not
     # silence the other for the rest of the capture.
@@ -102,7 +106,7 @@ class _AudioWorker:
         state = self._create_state(config)
         self._state = state
 
-    def stop(self) -> None:
+    def stop(self, *, publish: bool = True) -> None:
         """Flush and stop the background worker."""
         state = self._state
         if state is None:
@@ -128,6 +132,22 @@ class _AudioWorker:
                     "callback."
                 )
             )
+
+        if state.temporary_output_path is not None:
+            if worker_errors or not publish:
+                self._discard_temporary_output(state)
+            else:
+                try:
+                    assert state.final_output_path is not None
+                    state.temporary_output_path.replace(state.final_output_path)
+                except OSError as exc:
+                    worker_errors.append(
+                        _translate_exception(
+                            OSError,
+                            f"Failed to publish WAV file: {exc}",
+                            exc,
+                        )
+                    )
 
         if worker_errors:
             raise _combine_errors("Failed to finalize audio worker", worker_errors)
@@ -189,7 +209,19 @@ class _AudioWorker:
 
         with contextlib.ExitStack() as stack:
             if config.output_path is not None:
-                output_file = stack.enter_context(config.output_path.open("wb"))
+                fd, temporary_name = tempfile.mkstemp(
+                    dir=config.output_path.parent,
+                    prefix=f".{config.output_path.name}.",
+                    suffix=".tmp",
+                )
+                try:
+                    output_file = stack.enter_context(os.fdopen(fd, "wb"))
+                except Exception:
+                    os.close(fd)
+                    raise
+                temporary_output_path = Path(temporary_name)
+                stack.callback(self._unlink_path, temporary_output_path)
+
                 wav_file = wave.open(output_file, "wb")  # noqa: SIM115
                 stack.callback(wav_file.close)
                 wav_file.setnchannels(config.num_channels)
@@ -217,6 +249,8 @@ class _AudioWorker:
                 state.output_file = output_file
                 state.wav_file = wav_file
                 state.pcm_converter = pcm_converter
+                state.final_output_path = config.output_path
+                state.temporary_output_path = temporary_output_path
 
             thread = threading.Thread(
                 target=self._worker_loop,
@@ -230,6 +264,15 @@ class _AudioWorker:
             stack.pop_all()
 
         return state
+
+    @staticmethod
+    def _unlink_path(path: Path) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+
+    def _discard_temporary_output(self, state: _WorkerState) -> None:
+        if state.temporary_output_path is not None:
+            self._unlink_path(state.temporary_output_path)
 
     def _worker_loop(
         self,

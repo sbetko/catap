@@ -27,7 +27,11 @@ from catap._recording_worker import (
     _AudioWorker,
     _WorkerConfig,
 )
-from catap.bindings._audiotoolbox import AudioBuffer
+from catap.bindings._audiotoolbox import AudioBuffer, kAudioFormatLinearPCM
+
+
+class UnsupportedTapFormatError(ValueError):
+    """Raised when a tap exposes an audio layout catap cannot safely record."""
 
 
 class AudioRecorder:
@@ -102,6 +106,7 @@ class AudioRecorder:
         self._sample_rate = 44100.0
         self._num_channels = 2
         self._bits_per_sample = 32
+        self._bytes_per_frame = 8
         self._output_bits_per_sample = 32
         self._convert_float_output = True
         self._is_float = True
@@ -116,14 +121,92 @@ class AudioRecorder:
             num_channels=self._num_channels,
             bits_per_sample=self._bits_per_sample,
             is_float=self._is_float,
+            bytes_per_frame=self._bytes_per_frame,
+            is_interleaved=True,
+            is_signed_integer=False,
         )
 
     def _apply_stream_format(self, stream_format: _TapStreamFormat) -> None:
         """Apply tap stream metadata to recorder state."""
+        self._validate_stream_format(stream_format)
         self._sample_rate = stream_format.sample_rate
         self._num_channels = stream_format.num_channels
         self._bits_per_sample = stream_format.bits_per_sample
+        self._bytes_per_frame = (
+            stream_format.bytes_per_frame
+            if stream_format.bytes_per_frame is not None
+            else self._packed_bytes_per_frame(
+                stream_format.num_channels,
+                stream_format.bits_per_sample,
+            )
+        )
         self._is_float = stream_format.is_float
+
+    @staticmethod
+    def _packed_bytes_per_frame(num_channels: int, bits_per_sample: int) -> int:
+        return num_channels * (bits_per_sample // 8)
+
+    def _validate_stream_format(self, stream_format: _TapStreamFormat) -> None:
+        """Reject tap formats that would otherwise produce corrupt output."""
+        if stream_format.format_id != kAudioFormatLinearPCM:
+            raise UnsupportedTapFormatError(
+                "Unsupported tap format: only linear PCM streams are currently "
+                f"supported, got format id {stream_format.format_id}"
+            )
+        if stream_format.sample_rate <= 0:
+            raise UnsupportedTapFormatError(
+                f"Unsupported tap sample rate: {stream_format.sample_rate!r}"
+            )
+        if stream_format.num_channels <= 0:
+            raise UnsupportedTapFormatError(
+                f"Unsupported tap channel count: {stream_format.num_channels}"
+            )
+        if stream_format.bits_per_sample <= 0 or stream_format.bits_per_sample % 8:
+            raise UnsupportedTapFormatError(
+                f"Unsupported tap bit depth: {stream_format.bits_per_sample}"
+            )
+        if stream_format.is_big_endian:
+            raise UnsupportedTapFormatError(
+                "Unsupported tap byte order: big-endian PCM is not currently "
+                "supported"
+            )
+        if not stream_format.is_packed:
+            raise UnsupportedTapFormatError(
+                "Unsupported tap format: non-packed PCM is not currently supported"
+            )
+        if stream_format.is_float and stream_format.bits_per_sample != 32:
+            raise UnsupportedTapFormatError(
+                "Unsupported floating-point tap format: only packed float32 is "
+                "currently supported"
+            )
+        if not stream_format.is_float and not stream_format.is_signed_integer:
+            raise UnsupportedTapFormatError(
+                "Unsupported integer tap format: only signed integer PCM is "
+                "currently supported"
+            )
+        if not stream_format.is_interleaved:
+            raise UnsupportedTapFormatError(
+                "Unsupported tap layout: non-interleaved audio buffers are not "
+                "currently supported"
+            )
+
+        bytes_per_frame = (
+            stream_format.bytes_per_frame
+            if stream_format.bytes_per_frame is not None
+            else self._packed_bytes_per_frame(
+                stream_format.num_channels,
+                stream_format.bits_per_sample,
+            )
+        )
+        expected_bytes_per_frame = self._packed_bytes_per_frame(
+            stream_format.num_channels,
+            stream_format.bits_per_sample,
+        )
+        if bytes_per_frame != expected_bytes_per_frame:
+            raise UnsupportedTapFormatError(
+                "Unsupported tap format: expected packed interleaved "
+                f"{expected_bytes_per_frame}-byte frames, got {bytes_per_frame}"
+            )
 
     @property
     def _aggregate_device_id(self) -> int | None:
@@ -223,6 +306,11 @@ class AudioRecorder:
 
             if num_buffers == 0:
                 return 0
+            if num_buffers != 1:
+                raise UnsupportedTapFormatError(
+                    "Unsupported AudioBufferList layout: expected one "
+                    f"interleaved buffer, got {num_buffers}"
+                )
 
             for i in range(num_buffers):
                 # AudioBufferList has a variable-length mBuffers array; index
@@ -234,16 +322,29 @@ class AudioRecorder:
                 )
                 buffer = buffer_ptr.contents
 
-                if buffer.mData and buffer.mDataByteSize > 0:
-                    byte_count = buffer.mDataByteSize
+                byte_count = buffer.mDataByteSize
+                if byte_count > 0:
+                    if not buffer.mData:
+                        raise UnsupportedTapFormatError(
+                            "Audio buffer reported bytes without a data pointer"
+                        )
+                    if buffer.mNumberChannels != self._num_channels:
+                        raise UnsupportedTapFormatError(
+                            "Unsupported audio buffer channel count: expected "
+                            f"{self._num_channels}, got {buffer.mNumberChannels}"
+                        )
 
-                    bytes_per_frame = buffer.mNumberChannels * (
-                        self._bits_per_sample // 8
-                    )
+                    bytes_per_frame = self._bytes_per_frame
                     if bytes_per_frame > 0:
                         num_frames = byte_count // bytes_per_frame
                     else:
                         num_frames = 0
+                    if num_frames == 0 or byte_count % bytes_per_frame:
+                        raise UnsupportedTapFormatError(
+                            "Audio buffer byte count is not a whole number of "
+                            f"frames: {byte_count} bytes for "
+                            f"{bytes_per_frame}-byte frames"
+                        )
 
                     buf = self._worker.acquire_pool_buffer(byte_count)
                     if buf is None:
@@ -306,7 +407,7 @@ class AudioRecorder:
                 cleanup.append(lambda: self._capture_engine.close(capture_session))
 
                 self._worker.start(self._make_worker_config())
-                cleanup.append(self._worker.stop)
+                cleanup.append(lambda: self._worker.stop(publish=False))
 
                 with self._lifecycle_lock:
                     self._is_recording = True
