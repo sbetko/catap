@@ -221,30 +221,6 @@ uv sync --group dev
 uv run python scripts/catap_core_lab.py
 ```
 
-## Headless signal fixtures
-
-For automated testing, `catap` includes internal devtools that
-spawn identifiable pure-sine tone-producing processes and analyze recorded
-mixes.
-
-```bash
-uv run python -m catap._devtools.tone_farm \
-  --count 4 \
-  --manifest /tmp/catap-tone-farm.json
-```
-
-The farm prints and optionally writes a JSON manifest mapping each tone ID to
-its PID, Core Audio process object ID, frequency, amplitude, waveform, and
-channel mode. By default the manager keeps the tones alive until interrupted by
-renewing finite playback chunks; pass `--seconds N` for a finite run. After
-recording a WAV, validate the expected signals with:
-
-```bash
-uv run python -m catap._devtools.tone_analyzer recording.wav \
-  --manifest /tmp/catap-tone-farm.json \
-  --json
-```
-
 ## Development
 
 ```bash
@@ -272,6 +248,9 @@ CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
 This opt-in smoke test exercises the real macOS Core Audio bridge without
 making the default test suite flaky. It covers both process enumeration and a
 short real recording that verifies tap startup, shutdown, and WAV finalization.
+
+Advanced signal-oracle testing with the internal tone fixtures is documented in
+[`docs/headless-signal-fixtures.md`](docs/headless-signal-fixtures.md).
 
 See [`RELEASE.md`](RELEASE.md) for the release checklist.
 

@@ -7,7 +7,7 @@ import contextlib
 import signal
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 from catap import (
@@ -34,6 +34,7 @@ _OUTPUT_HINT = [
 
 
 class _DisplayProcess(Protocol):
+    audio_object_id: int
     name: str
     pid: int
     bundle_id: str | None
@@ -45,6 +46,18 @@ def _positive_float(value: str) -> float:
         parsed = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"{value!r} is not a valid number") from exc
+
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a valid integer") from exc
 
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
@@ -86,7 +99,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help=(
             "Application name to record (partial match, case-insensitive). "
-            "Required unless --system is set."
+            "Required unless --system, --pid, or --audio-object-id is set."
         ),
     )
     record_parser.add_argument(
@@ -113,11 +126,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Mute the app while recording (app recording only)",
     )
     record_parser.add_argument(
+        "--pid",
+        type=_positive_int,
+        help="Record the audio process with this OS process ID",
+    )
+    record_parser.add_argument(
+        "--audio-object-id",
+        "--audio-id",
+        dest="audio_object_id",
+        type=_positive_int,
+        help="Record the process with this Core Audio process object ID",
+    )
+    record_parser.add_argument(
         "--exclude",
         "-e",
         action="append",
         default=[],
         help="App names to exclude from system recording (repeatable)",
+    )
+    record_parser.add_argument(
+        "--exclude-pid",
+        action="append",
+        type=_positive_int,
+        default=[],
+        help="OS process IDs to exclude from system recording (repeatable)",
+    )
+    record_parser.add_argument(
+        "--exclude-audio-object-id",
+        "--exclude-audio-id",
+        dest="exclude_audio_object_id",
+        action="append",
+        type=_positive_int,
+        default=[],
+        help=(
+            "Core Audio process object IDs to exclude from system recording "
+            "(repeatable)"
+        ),
     )
 
     return parser
@@ -162,7 +206,10 @@ def _list_apps(show_all: bool) -> int:
 def _describe_process(process: _DisplayProcess) -> str:
     bundle = process.bundle_id or "N/A"
     status = "outputting" if process.is_outputting else "idle"
-    return f"{process.name} (PID: {process.pid}, Bundle ID: {bundle}, {status})"
+    return (
+        f"{process.name} (PID: {process.pid}, "
+        f"Audio ID: {process.audio_object_id}, Bundle ID: {bundle}, {status})"
+    )
 
 
 def _print_ambiguous_process_error(
@@ -175,6 +222,70 @@ def _print_ambiguous_process_error(
     if len(exc.matches) > 10:
         message_lines.append(f"  ... and {len(exc.matches) - 10} more")
     print("\n".join(message_lines), file=sys.stderr)
+
+
+def _print_ambiguous_selector_error(
+    selector: str, matches: Sequence[_DisplayProcess]
+) -> None:
+    message_lines = [f"Multiple audio processes match {selector}:"]
+    message_lines.extend(
+        f"  - {_describe_process(process)}" for process in matches[:10]
+    )
+    if len(matches) > 10:
+        message_lines.append(f"  ... and {len(matches) - 10} more")
+    print("\n".join(message_lines), file=sys.stderr)
+
+
+def _print_missing_process_error(
+    message: str,
+    all_processes: Sequence[_DisplayProcess],
+) -> None:
+    message_lines = [message]
+    if all_processes:
+        message_lines.append("")
+        message_lines.append("Available audio processes:")
+        message_lines.extend(
+            f"  - {_describe_process(listed_process)}"
+            for listed_process in all_processes[:10]
+        )
+        if len(all_processes) > 10:
+            message_lines.append(f"  ... and {len(all_processes) - 10} more")
+    print("\n".join(message_lines), file=sys.stderr)
+
+
+def _lookup_process_by_selector(
+    selector: str,
+    predicate: Callable[[AudioProcess], bool],
+) -> tuple[AudioProcess | None, Sequence[AudioProcess] | None]:
+    try:
+        all_processes = list_audio_processes()
+    except OSError as exc:
+        print(f"Error looking up audio processes: {exc}", file=sys.stderr)
+        return None, None
+
+    matches = [
+        process
+        for process in all_processes
+        if predicate(process)
+    ]
+    if len(matches) > 1:
+        _print_ambiguous_selector_error(selector, matches)
+        return None, None
+    if matches:
+        return matches[0], all_processes
+    return None, all_processes
+
+
+def _build_app_tap_for_process(process: AudioProcess, mute: bool) -> TapDescription:
+    print(
+        f"Recording from: {process.name} "
+        f"(PID: {process.pid}, Audio ID: {process.audio_object_id})",
+        flush=True,
+    )
+    if mute:
+        print("Muting app audio during recording", flush=True)
+
+    return build_process_tap_description(process, mute=mute)
 
 
 def _build_app_tap(app_name: str, mute: bool) -> TapDescription | None:
@@ -196,27 +307,72 @@ def _build_app_tap(app_name: str, mute: bool) -> TapDescription | None:
             print(f"Error listing audio processes: {exc}", file=sys.stderr)
             return None
 
-        message_lines = [f"No audio process found matching '{app_name}'"]
-        if all_processes:
-            message_lines.append("")
-            message_lines.append("Available audio processes:")
-            message_lines.extend(
-                f"  - {_describe_process(listed_process)}"
-                for listed_process in all_processes[:10]
-            )
-            if len(all_processes) > 10:
-                message_lines.append(f"  ... and {len(all_processes) - 10} more")
-        print("\n".join(message_lines), file=sys.stderr)
+        _print_missing_process_error(
+            f"No audio process found matching '{app_name}'",
+            all_processes,
+        )
         return None
 
-    print(f"Recording from: {process.name} (PID: {process.pid})", flush=True)
-    if mute:
-        print("Muting app audio during recording", flush=True)
-
-    return build_process_tap_description(process, mute=mute)
+    return _build_app_tap_for_process(process, mute)
 
 
-def _build_system_tap(exclude: list[str]) -> TapDescription | None:
+def _build_app_tap_by_pid(pid: int, mute: bool) -> TapDescription | None:
+    process, all_processes = _lookup_process_by_selector(
+        f"PID {pid}",
+        lambda listed_process: listed_process.pid == pid,
+    )
+    if all_processes is None:
+        return None
+    if process is None:
+        _print_missing_process_error(
+            f"No audio process found with PID {pid}",
+            all_processes,
+        )
+        return None
+    return _build_app_tap_for_process(process, mute)
+
+
+def _build_app_tap_by_audio_object_id(
+    audio_object_id: int, mute: bool
+) -> TapDescription | None:
+    process, all_processes = _lookup_process_by_selector(
+        f"Audio ID {audio_object_id}",
+        lambda listed_process: listed_process.audio_object_id == audio_object_id,
+    )
+    if all_processes is None:
+        return None
+    if process is None:
+        _print_missing_process_error(
+            f"No audio process found with Audio ID {audio_object_id}",
+            all_processes,
+        )
+        return None
+    return _build_app_tap_for_process(process, mute)
+
+
+def _append_excluded_process(
+    excluded_processes: list[AudioProcess],
+    process: AudioProcess,
+) -> None:
+    if any(
+        excluded.audio_object_id == process.audio_object_id
+        for excluded in excluded_processes
+    ):
+        return
+    excluded_processes.append(process)
+    print(
+        f"Excluding: {process.name} "
+        f"(PID: {process.pid}, Audio ID: {process.audio_object_id})",
+        flush=True,
+    )
+
+
+def _build_system_tap(
+    exclude: list[str],
+    *,
+    exclude_pids: Sequence[int] = (),
+    exclude_audio_object_ids: Sequence[int] = (),
+) -> TapDescription | None:
     excluded_processes: list[AudioProcess] = []
     for excluded_app_name in exclude:
         try:
@@ -229,13 +385,45 @@ def _build_system_tap(exclude: list[str]) -> TapDescription | None:
             return None
 
         if process:
-            excluded_processes.append(process)
-            print(f"Excluding: {process.name} (PID: {process.pid})", flush=True)
+            _append_excluded_process(excluded_processes, process)
         else:
             print(
                 f"Warning: No audio process found matching '{excluded_app_name}'",
                 file=sys.stderr,
             )
+
+    for excluded_pid in exclude_pids:
+        process, all_processes = _lookup_process_by_selector(
+            f"PID {excluded_pid}",
+            lambda listed_process, pid=excluded_pid: listed_process.pid == pid,
+        )
+        if all_processes is None:
+            return None
+        if process is None:
+            print(
+                f"Warning: No audio process found with PID {excluded_pid}",
+                file=sys.stderr,
+            )
+            continue
+        _append_excluded_process(excluded_processes, process)
+
+    for excluded_audio_object_id in exclude_audio_object_ids:
+        process, all_processes = _lookup_process_by_selector(
+            f"Audio ID {excluded_audio_object_id}",
+            lambda listed_process, audio_id=excluded_audio_object_id: (
+                listed_process.audio_object_id == audio_id
+            ),
+        )
+        if all_processes is None:
+            return None
+        if process is None:
+            print(
+                "Warning: No audio process found with Audio ID "
+                f"{excluded_audio_object_id}",
+                file=sys.stderr,
+            )
+            continue
+        _append_excluded_process(excluded_processes, process)
 
     print("Recording all system audio", flush=True)
     return build_system_tap_description(excluded_processes)
@@ -321,19 +509,57 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.system:
                 if args.app_name:
                     parser.error("record: APP_NAME cannot be used with --system")
+                if args.pid is not None or args.audio_object_id is not None:
+                    parser.error(
+                        "record: --pid and --audio-object-id cannot be used "
+                        "with --system"
+                    )
                 if args.mute:
                     parser.error(
                         "record: --mute can only be used when recording a single app"
                     )
-                tap_desc = _build_system_tap(args.exclude)
+                tap_desc = _build_system_tap(
+                    args.exclude,
+                    exclude_pids=args.exclude_pid,
+                    exclude_audio_object_ids=args.exclude_audio_object_id,
+                )
                 if tap_desc is None:
                     return 1
             else:
-                if not args.app_name:
-                    parser.error("record: APP_NAME is required unless --system is set")
-                if args.exclude:
-                    parser.error("record: --exclude requires --system")
-                tap_desc = _build_app_tap(args.app_name, args.mute)
+                process_selector_count = sum(
+                    (
+                        args.app_name is not None,
+                        args.pid is not None,
+                        args.audio_object_id is not None,
+                    )
+                )
+                if process_selector_count == 0:
+                    parser.error(
+                        "record: APP_NAME, --pid, or --audio-object-id is "
+                        "required unless --system is set"
+                    )
+                if process_selector_count > 1:
+                    parser.error(
+                        "record: choose only one of APP_NAME, --pid, or "
+                        "--audio-object-id"
+                    )
+                if (
+                    args.exclude
+                    or args.exclude_pid
+                    or args.exclude_audio_object_id
+                ):
+                    parser.error("record: --exclude options require --system")
+
+                if args.pid is not None:
+                    tap_desc = _build_app_tap_by_pid(args.pid, args.mute)
+                elif args.audio_object_id is not None:
+                    tap_desc = _build_app_tap_by_audio_object_id(
+                        args.audio_object_id,
+                        args.mute,
+                    )
+                else:
+                    assert args.app_name is not None
+                    tap_desc = _build_app_tap(args.app_name, args.mute)
                 if tap_desc is None:
                     return 1
 
