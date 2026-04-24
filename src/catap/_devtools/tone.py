@@ -7,7 +7,7 @@ import math
 import struct
 import warnings
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +135,7 @@ class TonePlayer:
         device_id: int | None = None,
         sample_fn: SampleFn = pure_sine_sample,
         apply_fade: bool = False,
+        channel_gains: Sequence[float] | None = None,
     ) -> None:
         _load_avfoundation()
 
@@ -145,6 +146,12 @@ class TonePlayer:
         self._amplitude = amplitude
         self._sample_fn = sample_fn
         self._apply_fade = apply_fade
+        if channel_gains is None:
+            self._channel_gains = tuple(1.0 for _ in range(channels))
+        elif len(channel_gains) != channels:
+            raise ValueError("channel_gains length must match channels")
+        else:
+            self._channel_gains = tuple(float(gain) for gain in channel_gains)
 
         self._engine = _AVAudioEngine.alloc().init()
         self._player = _AVAudioPlayerNode.alloc().init()
@@ -203,7 +210,12 @@ class TonePlayer:
                     if self._apply_fade
                     else 1.0
                 )
-                channel[frame_index] = self._amplitude * gain * self._sample_fn(phase)
+                channel[frame_index] = (
+                    self._amplitude
+                    * self._channel_gains[channel_index]
+                    * gain
+                    * self._sample_fn(phase)
+                )
                 phase += phase_step
                 if phase >= _TAU:
                     phase -= _TAU
