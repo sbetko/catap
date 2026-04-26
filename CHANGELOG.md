@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-04-26
+
+- Added Python 3.11 support by replacing 3.12-only type-alias syntax and
+  broadening package metadata.
+
 ## [0.4.0] - 2026-04-24
 
 - Added strict tap stream format validation before capture starts. Unsupported

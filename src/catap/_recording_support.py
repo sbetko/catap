@@ -5,8 +5,9 @@ from __future__ import annotations
 import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TypeAlias
 
-type _RecordingFailure = OSError | RuntimeError
+_RecordingFailure: TypeAlias = OSError | RuntimeError
 
 _DEFAULT_MAX_PENDING_BUFFERS = 256
 

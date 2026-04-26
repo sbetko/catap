@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 from Foundation import NSArray, NSDictionary, NSNumber  # ty: ignore[unresolved-import]
 
@@ -45,8 +45,8 @@ class AudioTimeStamp(ctypes.Structure):
 
 
 if TYPE_CHECKING:
-    type AudioTimeStampPtr = ctypes._Pointer[AudioTimeStamp]
-    type AudioBufferListPtr = ctypes._Pointer[AudioBufferList]
+    AudioTimeStampPtr: TypeAlias = ctypes._Pointer[AudioTimeStamp]
+    AudioBufferListPtr: TypeAlias = ctypes._Pointer[AudioBufferList]
 else:
     AudioTimeStampPtr = ctypes.c_void_p
     AudioBufferListPtr = ctypes.c_void_p

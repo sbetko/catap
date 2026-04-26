@@ -13,7 +13,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TypeAlias
 
 from catap._recording_support import _combine_errors, _translate_exception
 from catap.bindings._audiotoolbox import (
@@ -25,9 +25,9 @@ from catap.bindings._audiotoolbox import (
 # ``ctypes.memmove`` rejects bytearray/memoryview as source or destination,
 # and the worker's AudioConverter path can consume the ctypes buffers directly
 # without an extra copy.
-type _PoolBuffer = ctypes.Array  # ctypes.c_char * N instance
-type _WorkerItem = tuple[_PoolBuffer, int, int] | None
-type _WorkerFailure = OSError | RuntimeError
+_PoolBuffer: TypeAlias = ctypes.Array  # ctypes.c_char * N instance
+_WorkerItem: TypeAlias = tuple[_PoolBuffer, int, int] | None
+_WorkerFailure: TypeAlias = OSError | RuntimeError
 
 _DEFAULT_POOL_BUFFER_SIZE = 4096
 

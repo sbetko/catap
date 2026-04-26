@@ -6,7 +6,7 @@ from any application without loopback drivers or virtual audio devices.
 ## Install
 
 ```bash
-pip install catap            # macOS 14.2+, Python 3.12+
+pip install catap            # macOS 14.2+, Python 3.11+
 ```
 
 `catap` is macOS-only. On other platforms, imports raise an `ImportError`.
