@@ -1,6 +1,6 @@
 [project]
 name = "catap"
-version = "0.4.1"
+version = "0.4.2"
 description = "Python wrapper for Apple's Core Audio Tap API"
 readme = "README.md"
 license = "MIT"

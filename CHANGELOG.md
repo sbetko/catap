@@ -2,10 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## [0.4.2] - 2026-04-27
 
 - Added CI coverage for free-threaded CPython 3.13t and 3.14t on macOS.
-- Hardened recorder buffer-pool handoff for free-threaded Python builds.
+- Replaced the recorder buffer-pool `deque` with `queue.SimpleQueue` to avoid
+  relying on CPython deque atomicity in free-threaded builds.
 - Documented local free-threaded test commands and the opt-in real-recording
   smoke check.
 
