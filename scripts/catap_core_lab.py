@@ -425,9 +425,7 @@ class ToneHelper:
             raise OSError(f"Failed to launch helper tone: {exc}") from exc
 
         device_text = f" on {device_label}" if device_label else ""
-        self.status.set(
-            f"tone live{device_text}   ·   pid {self.process.pid}"
-        )
+        self.status.set(f"tone live{device_text}   ·   pid {self.process.pid}")
 
     def stop(self, *, silent: bool = False) -> None:
         process = self.process
@@ -509,7 +507,7 @@ class PlaybackHelper:
 
 
 class EnvBar(ttk.Frame):
-    def __init__(self, parent: tk.Widget) -> None:
+    def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent, style="Env.TFrame", padding=(12, 7))
         version = getattr(catap, "__version__", "—")
         py = (
@@ -522,8 +520,8 @@ class EnvBar(ttk.Frame):
         text = f"catap {version}   ·   Python {py}   ·   macOS {mac}   ·   {arch}"
         ttk.Label(self, text=text, style="Env.TLabel").pack(side=tk.LEFT)
         ttk.Label(self, text="      state: ", style="Env.TLabel").pack(side=tk.LEFT)
-        self.state = tk.StringVar(value="tap —   ·   rec idle   ·   tone idle")
-        ttk.Label(self, textvariable=self.state, style="EnvValue.TLabel").pack(
+        self._state_text = tk.StringVar(value="tap —   ·   rec idle   ·   tone idle")
+        ttk.Label(self, textvariable=self._state_text, style="EnvValue.TLabel").pack(
             side=tk.LEFT
         )
 
@@ -539,7 +537,7 @@ class EnvBar(ttk.Frame):
         rec = "rec live" if recorder_active else "rec idle"
         tone = "tone live" if tone_active else "tone idle"
         play = "play live" if playback_active else "play idle"
-        self.state.set(f"{tap}   ·   {rec}   ·   {tone}   ·   {play}")
+        self._state_text.set(f"{tap}   ·   {rec}   ·   {tone}   ·   {play}")
 
 
 class CoreLabApp:
@@ -673,9 +671,9 @@ class CoreLabApp:
 
         filter_frame = ttk.Frame(process_box, style="Inner.TFrame")
         filter_frame.grid(row=1, column=0, sticky="ew", pady=(10, 8))
-        ttk.Button(
-            filter_frame, text="refresh", command=self._refresh_processes
-        ).pack(side=tk.LEFT)
+        ttk.Button(filter_frame, text="refresh", command=self._refresh_processes).pack(
+            side=tk.LEFT
+        )
         ttk.Checkbutton(
             filter_frame,
             text="show idle",
@@ -1300,9 +1298,7 @@ class CoreLabApp:
         state = "readonly" if device_stream_mode else tk.DISABLED
         self.device_combo.config(state=state)
         self.stream_combo.config(state=state)
-        self.mono_check.config(
-            state=tk.DISABLED if device_stream_mode else tk.NORMAL
-        )
+        self.mono_check.config(state=tk.DISABLED if device_stream_mode else tk.NORMAL)
         if device_stream_mode:
             self.tap_is_mono.set(False)
 
@@ -1520,10 +1516,7 @@ class CoreLabApp:
         is_recording = self.recorder is not None and self.recorder.is_recording
         is_playing = self.playback_helper.is_playing
         can_play = (
-            path is not None
-            and path.exists()
-            and not is_recording
-            and not is_playing
+            path is not None and path.exists() and not is_recording and not is_playing
         )
         self.btn_play_rec.config(state=tk.NORMAL if can_play else tk.DISABLED)
         self.btn_stop_playback.config(state=tk.NORMAL if is_playing else tk.DISABLED)

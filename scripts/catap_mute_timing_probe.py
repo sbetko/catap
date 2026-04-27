@@ -42,15 +42,10 @@ from catap import (
     destroy_process_tap,
     list_audio_processes,
 )
-from catap._devtools.tone import TonePlayer
-from catap.bindings._coreaudio import (
-    get_property_bytes,
-    kAudioObjectSystemObject,
-)
-from catap.recorder import (
-    AudioBufferList,
+from catap._capture_engine import (
+    AudioBufferListPtr,
     AudioDeviceIOProcType,
-    AudioTimeStamp,
+    AudioTimeStampPtr,
     _AudioDeviceCreateIOProcID,
     _AudioDeviceDestroyIOProcID,
     _AudioDeviceStart,
@@ -58,6 +53,11 @@ from catap.recorder import (
     _create_aggregate_device_for_tap,
     _destroy_aggregate_device,
     _get_tap_uid,
+)
+from catap._devtools.tone import TonePlayer
+from catap.bindings._coreaudio import (
+    get_property_bytes,
+    kAudioObjectSystemObject,
 )
 
 # Experimental Core Audio property selectors used only by this probe.
@@ -154,9 +154,7 @@ class HelperMonitor:
             event = HelperEvent(
                 event=str(payload["event"]),
                 audible=(
-                    None
-                    if payload.get("audible") is None
-                    else bool(payload["audible"])
+                    None if payload.get("audible") is None else bool(payload["audible"])
                 ),
                 muted=(
                     None if payload.get("muted") is None else bool(payload["muted"])
@@ -293,9 +291,7 @@ def _observe_phase(
 
     events = monitor.events()
     changes = [
-        event
-        for event in events[start_index:]
-        if event.event == "state_changed"
+        event for event in events[start_index:] if event.event == "state_changed"
     ]
     user_audible = _prompt_user_audible(name) if interactive else None
     return PhaseReport(
@@ -350,9 +346,11 @@ def _prompt_before_phase(name: str, description: str) -> None:
 def _prompt_user_audible(name: str) -> bool:
     """Ask the user whether the helper tone is audible after a phase."""
     while True:
-        answer = input(
-            f"After {name}, is the tone audible on your speakers? [y/n/q] "
-        ).strip().casefold()
+        answer = (
+            input(f"After {name}, is the tone audible on your speakers? [y/n/q] ")
+            .strip()
+            .casefold()
+        )
         if answer in {"y", "yes"}:
             return True
         if answer in {"n", "no"}:
@@ -395,11 +393,7 @@ def _report_table(
         None,
     )
     first_user_muted_index = next(
-        (
-            index
-            for index, phase in enumerate(phases)
-            if phase.user_audible is False
-        ),
+        (index for index, phase in enumerate(phases) if phase.user_audible is False),
         None,
     )
     first_user_muted = (
@@ -429,19 +423,18 @@ def _report_table(
             file=out,
         )
         print(
-            f"First user-heard unmute phase: "
-            f"{first_user_unmuted or 'not observed'}",
+            f"First user-heard unmute phase: {first_user_unmuted or 'not observed'}",
             file=out,
         )
 
 
 def _no_op_io_proc(
     _device: int,
-    _now: ctypes.POINTER(AudioTimeStamp),
-    _input_data: ctypes.POINTER(AudioBufferList),
-    _input_time: ctypes.POINTER(AudioTimeStamp),
-    _output_data: ctypes.POINTER(AudioBufferList),
-    _output_time: ctypes.POINTER(AudioTimeStamp),
+    _now: AudioTimeStampPtr,
+    _input_data: AudioBufferListPtr,
+    _input_time: AudioTimeStampPtr,
+    _output_data: AudioBufferListPtr,
+    _output_time: AudioTimeStampPtr,
     _client_data: ctypes.c_void_p,
 ) -> int:
     return 0
@@ -634,8 +627,7 @@ def _controller_main(args: argparse.Namespace) -> int:
         if interactive:
             _prompt_before_phase(
                 "destroy_aggregate_device",
-                "Destroys the aggregate device while leaving the tap itself in "
-                "place.",
+                "Destroys the aggregate device while leaving the tap itself in place.",
             )
         phase_index = monitor.event_count()
         _destroy_aggregate_device(aggregate_device_id)
