@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+import pytest
+
 import catap.bindings.tap_description as tap_description_module
 from catap.bindings.device import AudioDeviceStream
 
@@ -270,3 +272,19 @@ def test_device_stream_factory_preserves_stream_zero(monkeypatch: Any) -> None:
 
     assert included.device_uid == "BuiltInSpeakerDevice"
     assert included.stream == 0
+
+
+def test_device_stream_factory_rejects_input_stream(monkeypatch: Any) -> None:
+    _install_fake_tap_description(monkeypatch)
+
+    stream = _make_audio_device_stream(
+        device_uid="BuiltInMicDevice",
+        device_name="Built-in Microphone",
+        stream_index=0,
+        direction="input",
+    )
+
+    with pytest.raises(ValueError, match="require an output stream"):
+        tap_description_module.TapDescription.of_processes_for_device_stream(
+            [11], stream
+        )

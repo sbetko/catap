@@ -100,9 +100,7 @@ def test_list_audio_taps_returns_visible_taps_sorted(
         assert selector == tap_module.kAudioTapPropertyDescription
         return descriptions[object_id]
 
-    monkeypatch.setattr(
-        tap_module, "_get_audio_object_ids", _get_audio_object_ids
-    )
+    monkeypatch.setattr(tap_module, "_get_audio_object_ids", _get_audio_object_ids)
     monkeypatch.setattr(
         tap_module,
         "_get_audio_object_cfstring_property",
@@ -149,9 +147,7 @@ def test_list_audio_taps_preserves_stream_zero(
         assert object_id == 100
         return descriptions[object_id]
 
-    monkeypatch.setattr(
-        tap_module, "_get_audio_object_ids", _get_audio_object_ids
-    )
+    monkeypatch.setattr(tap_module, "_get_audio_object_ids", _get_audio_object_ids)
     monkeypatch.setattr(
         tap_module,
         "_get_audio_object_cfstring_property",
@@ -191,6 +187,24 @@ def test_get_tap_description_raises_audio_tap_not_found_for_bad_object(
 ) -> None:
     stale_error = OSError("bad object")
     stale_error.status = tap_module.kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        tap_module,
+        "_get_audio_object_objc_property",
+        lambda object_id, selector: (_ for _ in ()).throw(stale_error),
+    )
+
+    with pytest.raises(
+        tap_module.AudioTapNotFoundError,
+        match="Audio tap 77 is no longer available",
+    ):
+        tap_module.get_tap_description(77)
+
+
+def test_get_tap_description_raises_audio_tap_not_found_for_unknown_property(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_error = OSError("unknown property")
+    stale_error.status = tap_module.kAudioHardwareUnknownPropertyError  # type: ignore[attr-defined]
     monkeypatch.setattr(
         tap_module,
         "_get_audio_object_objc_property",

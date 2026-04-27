@@ -9,6 +9,7 @@ from catap.bindings._coreaudio import (
     get_property_objc_object as _get_audio_object_objc_property,
     get_property_object_ids as _get_audio_object_ids,
     kAudioHardwareBadObjectError,
+    kAudioHardwareUnknownPropertyError,
     kAudioObjectSystemObject,
 )
 from catap.bindings.tap_description import TapDescription
@@ -24,7 +25,10 @@ class AudioTapNotFoundError(OSError):
 
 def _raise_if_missing_tap(tap_id: int, exc: OSError) -> None:
     """Translate a stale-tap OSStatus into ``AudioTapNotFoundError``."""
-    if getattr(exc, "status", None) == kAudioHardwareBadObjectError:
+    if getattr(exc, "status", None) in {
+        kAudioHardwareBadObjectError,
+        kAudioHardwareUnknownPropertyError,
+    }:
         raise AudioTapNotFoundError(
             f"Audio tap {tap_id} is no longer available. "
             "It may have been destroyed by another process."

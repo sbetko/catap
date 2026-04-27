@@ -114,18 +114,6 @@ class AudioRecorder:
         # Keep reference to callback to prevent garbage collection.
         self._callback = AudioDeviceIOProcType(self._io_proc)
 
-    def _default_stream_format(self) -> _TapStreamFormat:
-        """Build the fallback stream format used before tap metadata is known."""
-        return _TapStreamFormat(
-            sample_rate=self._sample_rate,
-            num_channels=self._num_channels,
-            bits_per_sample=self._bits_per_sample,
-            is_float=self._is_float,
-            bytes_per_frame=self._bytes_per_frame,
-            is_interleaved=True,
-            is_signed_integer=False,
-        )
-
     def _apply_stream_format(self, stream_format: _TapStreamFormat) -> None:
         """Apply tap stream metadata to recorder state."""
         self._validate_stream_format(stream_format)
@@ -167,8 +155,7 @@ class AudioRecorder:
             )
         if stream_format.is_big_endian:
             raise UnsupportedTapFormatError(
-                "Unsupported tap byte order: big-endian PCM is not currently "
-                "supported"
+                "Unsupported tap byte order: big-endian PCM is not currently supported"
             )
         if not stream_format.is_packed:
             raise UnsupportedTapFormatError(
@@ -381,10 +368,7 @@ class AudioRecorder:
             self._lifecycle_state = "starting"
 
         try:
-            stream_format = self._capture_engine.describe_tap_stream(
-                self.tap_id,
-                default=self._default_stream_format(),
-            )
+            stream_format = self._capture_engine.describe_tap_stream(self.tap_id)
             self._apply_stream_format(stream_format)
 
             self._output_bits_per_sample = (

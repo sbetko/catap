@@ -23,6 +23,7 @@ kAudioObjectPropertyScopeGlobal = int.from_bytes(b"glob", "big")
 kAudioObjectPropertyScopeInput = int.from_bytes(b"inpt", "big")
 kAudioObjectPropertyScopeOutput = int.from_bytes(b"outp", "big")
 kAudioObjectPropertyElementMain = 0
+kAudioHardwareUnknownPropertyError = int.from_bytes(b"who?", "big")
 kAudioHardwareBadObjectError = int.from_bytes(b"!obj", "big")
 
 _PropertyAddress = ctypes.c_uint32 * 3  # (selector, scope, element)

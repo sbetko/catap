@@ -27,9 +27,7 @@ class _FakeTapDescription:
         return cls(list(processes))
 
     @classmethod
-    def stereo_global_tap_excluding(
-        cls, processes: list[int]
-    ) -> _FakeTapDescription:
+    def stereo_global_tap_excluding(cls, processes: list[int]) -> _FakeTapDescription:
         return cls(list(processes), exclusive=True)
 
 
@@ -269,6 +267,32 @@ def test_recording_session_start_cleans_up_tap_on_failure(
     assert len(backend.created_recorders) == 1
     assert backend.created_recorders[0].start_calls == 1
     assert destroyed_tap_ids == [77]
+
+
+def test_recording_session_start_reports_tap_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed_tap_ids: list[int] = []
+    backend = _FakeSessionBackend(
+        recorder_cls=_StartFailingRecorder,
+        destroyed_tap_ids=destroyed_tap_ids,
+        destroy_error=OSError("destroy boom"),
+    )
+    _install_backend(monkeypatch, backend)
+
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+
+    with pytest.raises(OSError, match="boom") as exc_info:
+        session.start()
+
+    assert session.tap_id is None
+    assert destroyed_tap_ids == [77]
+    notes = getattr(exc_info.value, "__notes__", [])
+    assert any("Cleanup failure during session startup" in note for note in notes)
+    assert any("destroy boom" in note for note in notes)
 
 
 def test_record_system_audio_tracks_excluded_processes(

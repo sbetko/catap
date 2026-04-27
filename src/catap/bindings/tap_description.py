@@ -77,10 +77,15 @@ class TapDescription:
         """Normalize a target device UID and stream index."""
         if isinstance(device, str):
             if stream is None:
-                raise ValueError(
-                    "stream must be provided when targeting a device UID"
-                )
+                raise ValueError("stream must be provided when targeting a device UID")
             return device, stream
+
+        if device.direction != "output":
+            raise ValueError(
+                "device-targeted process taps require an output stream; "
+                f"got {device.direction!r} stream {device.stream_index} on "
+                f"{device.device_name or device.device_uid!r}"
+            )
 
         return device.device_uid, device.stream_index
 
@@ -112,7 +117,7 @@ class TapDescription:
         stream: int | None = None,
     ) -> TapDescription:
         """
-        Create a tap for processes routed to a specific hardware device stream.
+        Create a tap for processes routed to a specific output device stream.
 
         Pass either an ``AudioDeviceStream`` from ``list_audio_devices()`` or a
         raw ``device_uid`` plus ``stream`` index.
@@ -131,7 +136,7 @@ class TapDescription:
         stream: int | None = None,
     ) -> TapDescription:
         """
-        Create a tap for one hardware stream while excluding selected processes.
+        Create a tap for one output device stream while excluding selected processes.
 
         Pass either an ``AudioDeviceStream`` from ``list_audio_devices()`` or a
         raw ``device_uid`` plus ``stream`` index.

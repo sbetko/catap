@@ -210,15 +210,15 @@ class _TapCaptureEngine:
     def describe_tap_stream(
         self,
         tap_id: int,
-        *,
-        default: _TapStreamFormat,
     ) -> _TapStreamFormat:
-        """Return the tap format, falling back to defaults when unavailable."""
+        """Return the tap format reported by Core Audio."""
         try:
             asbd = _get_tap_format(tap_id)
         except OSError as exc:
             _raise_if_missing_tap(tap_id, exc)
-            return default
+            raise OSError(
+                f"Failed to read audio format for tap {tap_id}: {exc}"
+            ) from exc
 
         return _TapStreamFormat(
             sample_rate=asbd.mSampleRate,
@@ -232,9 +232,7 @@ class _TapCaptureEngine:
             format_id=asbd.mFormatID,
             is_big_endian=bool(asbd.mFormatFlags & kAudioFormatFlagIsBigEndian),
             is_packed=bool(asbd.mFormatFlags & kAudioFormatFlagIsPacked),
-            is_signed_integer=bool(
-                asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger
-            ),
+            is_signed_integer=bool(asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger),
         )
 
     def open_tap_capture(

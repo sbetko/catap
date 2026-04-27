@@ -35,10 +35,7 @@ def test_describe_tap_stream_uses_tap_format(
     asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
     monkeypatch.setattr(capture_module, "_get_tap_format", lambda tap_id: asbd)
 
-    stream_format = capture_module._TapCaptureEngine().describe_tap_stream(
-        123,
-        default=capture_module._TapStreamFormat(44_100.0, 2, 16, False),
-    )
+    stream_format = capture_module._TapCaptureEngine().describe_tap_stream(123)
 
     assert stream_format == capture_module._TapStreamFormat(
         96_000.0,
@@ -67,30 +64,22 @@ def test_describe_tap_stream_detects_non_interleaved_format(
     )
     monkeypatch.setattr(capture_module, "_get_tap_format", lambda tap_id: asbd)
 
-    stream_format = capture_module._TapCaptureEngine().describe_tap_stream(
-        123,
-        default=capture_module._TapStreamFormat(44_100.0, 2, 16, False),
-    )
+    stream_format = capture_module._TapCaptureEngine().describe_tap_stream(123)
 
     assert stream_format.is_interleaved is False
 
 
-def test_describe_tap_stream_returns_default_for_unavailable_format(
+def test_describe_tap_stream_raises_for_unavailable_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    default = capture_module._TapStreamFormat(44_100.0, 2, 16, False)
     monkeypatch.setattr(
         capture_module,
         "_get_tap_format",
         lambda tap_id: (_ for _ in ()).throw(OSError("format unavailable")),
     )
 
-    stream_format = capture_module._TapCaptureEngine().describe_tap_stream(
-        123,
-        default=default,
-    )
-
-    assert stream_format is default
+    with pytest.raises(OSError, match="Failed to read audio format for tap 123"):
+        capture_module._TapCaptureEngine().describe_tap_stream(123)
 
 
 def test_describe_tap_stream_raises_stale_tap_error(
@@ -105,10 +94,7 @@ def test_describe_tap_stream_raises_stale_tap_error(
     )
 
     with pytest.raises(AudioTapNotFoundError, match="Audio tap 123 is no longer"):
-        capture_module._TapCaptureEngine().describe_tap_stream(
-            123,
-            default=capture_module._TapStreamFormat(44_100.0, 2, 16, False),
-        )
+        capture_module._TapCaptureEngine().describe_tap_stream(123)
 
 
 def test_open_tap_capture_creates_aggregate_device_and_io_proc(

@@ -51,9 +51,7 @@ def _make_worker(
             else record_dropped_frames
         ),
         consume_dropped_stats=(
-            (lambda: (0, 0))
-            if consume_dropped_stats is None
-            else consume_dropped_stats
+            (lambda: (0, 0)) if consume_dropped_stats is None else consume_dropped_stats
         ),
     )
 
@@ -346,17 +344,14 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
 
     buf_type = ctypes.c_char * 2
     assert (
-        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x00\x01"), 1, 2)
-        is True
+        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x00\x01"), 1, 2) is True
     )
     assert callback_started.wait(timeout=1)
     assert (
-        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x02\x03"), 1, 2)
-        is True
+        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x02\x03"), 1, 2) is True
     )
     assert (
-        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x04\x05"), 2, 2)
-        is False
+        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x04\x05"), 2, 2) is False
     )
 
     allow_callback_to_finish.set()
@@ -454,10 +449,8 @@ def test_failed_device_start_does_not_clobber_existing_output_file(tmp_path) -> 
         def describe_tap_stream(
             self,
             tap_id: int,
-            *,
-            default: capture_module._TapStreamFormat,
         ) -> capture_module._TapStreamFormat:
-            del tap_id, default
+            del tap_id
             return capture_module._TapStreamFormat(
                 48_000.0,
                 2,
@@ -536,6 +529,11 @@ def test_start_raises_audio_tap_not_found_error_for_stale_tap(
     stale_error = OSError("tap disappeared")
     stale_error.status = int.from_bytes(b"!obj", "big")  # type: ignore[attr-defined]
 
+    monkeypatch.setattr(
+        capture_module,
+        "_get_tap_format",
+        lambda tap_id: (_ for _ in ()).throw(stale_error),
+    )
     monkeypatch.setattr(
         capture_module,
         "_get_tap_uid",
@@ -728,10 +726,8 @@ def test_start_rejects_non_interleaved_tap_format() -> None:
         def describe_tap_stream(
             self,
             tap_id: int,
-            *,
-            default: capture_module._TapStreamFormat,
         ) -> capture_module._TapStreamFormat:
-            del tap_id, default
+            del tap_id
             return capture_module._TapStreamFormat(
                 48_000.0,
                 2,
@@ -759,10 +755,8 @@ def test_start_rejects_non_linear_pcm_tap_format() -> None:
         def describe_tap_stream(
             self,
             tap_id: int,
-            *,
-            default: capture_module._TapStreamFormat,
         ) -> capture_module._TapStreamFormat:
-            del tap_id, default
+            del tap_id
             return capture_module._TapStreamFormat(
                 48_000.0,
                 2,
@@ -790,10 +784,8 @@ def test_start_rejects_big_endian_tap_format() -> None:
         def describe_tap_stream(
             self,
             tap_id: int,
-            *,
-            default: capture_module._TapStreamFormat,
         ) -> capture_module._TapStreamFormat:
-            del tap_id, default
+            del tap_id
             return capture_module._TapStreamFormat(
                 48_000.0,
                 2,
@@ -821,10 +813,8 @@ def test_start_rejects_unsigned_integer_tap_format() -> None:
         def describe_tap_stream(
             self,
             tap_id: int,
-            *,
-            default: capture_module._TapStreamFormat,
         ) -> capture_module._TapStreamFormat:
-            del tap_id, default
+            del tap_id
             return capture_module._TapStreamFormat(
                 48_000.0,
                 2,
@@ -851,10 +841,8 @@ def test_start_rejects_padded_tap_frames() -> None:
         def describe_tap_stream(
             self,
             tap_id: int,
-            *,
-            default: capture_module._TapStreamFormat,
         ) -> capture_module._TapStreamFormat:
-            del tap_id, default
+            del tap_id
             return capture_module._TapStreamFormat(
                 48_000.0,
                 2,
