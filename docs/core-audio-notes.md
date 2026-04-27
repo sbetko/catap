@@ -1,60 +1,114 @@
 # Core Audio Implementation Notes
 
-## Core Audio Headers
+This file records the Core Audio assumptions that `catap` relies on. Apple now
+publishes a Core Audio tap sample and symbol reference; the SDK headers remain
+useful for exact selector values, dictionary key strings, ownership notes, and
+details that are terse in the web docs.
 
-The Core Audio Tap API is documented in Apple's SDK headers, which contain
-more detail than the online docs:
+## Primary Sources
+
+- Apple's sample: [Capturing system audio with Core Audio taps](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps)
+- Apple's profiling guide: [Analyzing audio performance with Instruments](https://developer.apple.com/documentation/audiotoolbox/analyzing-audio-performance-with-instruments)
+- SDK headers:
 
 ```bash
-# Location (with Xcode Command Line Tools)
 $(xcrun --show-sdk-path)/System/Library/Frameworks/CoreAudio.framework/Headers/
-
-# Key files:
-# - AudioHardware.h          - Device APIs, aggregate devices, tap properties
-# - AudioHardwareTapping.h   - AudioHardwareCreateProcessTap (requires __OBJC__)
 ```
 
-## Undocumented / Hard-to-Find Details
+The most relevant headers are `AudioHardware.h`, `AudioHardwareTapping.h`, and
+`CATapDescription.h`.
 
-The following are in the headers but not clearly explained in Apple's online
-documentation:
+## Capture Flow
 
-### 1. Taps require an aggregate device to read audio
+`catap` follows the same object model as Apple's sample:
 
-This is the most critical discovery. You cannot register an
-`AudioDeviceIOProc` directly on a tap. You must:
+1. Build a `CATapDescription`.
+2. Create a tap with `AudioHardwareCreateProcessTap`.
+3. Create a private aggregate device that contains the tap.
+4. Register an `AudioDeviceIOProc` on the aggregate device, not on the tap.
+5. Start and stop the IOProc with `AudioDeviceStart` / `AudioDeviceStop`.
+6. Destroy the IOProc, aggregate device, and any tap owned by the session.
 
-1. Create tap with `AudioHardwareCreateProcessTap`
-2. Get tap UID via `kAudioTapPropertyUID` (`'tuid'`)
-3. Create aggregate device with tap in `kAudioAggregateDeviceTapListKey`
-   (`"taps"`)
-4. Register IOProc on the aggregate device
+Apple's sample creates the aggregate device first and then sets
+`kAudioAggregateDevicePropertyTapList`. `catap` currently supplies
+`kAudioAggregateDeviceTapListKey` in the create-description dictionary. Both
+surfaces are public: the sample documents the property path, while the header
+documents the create-time dictionary key.
 
-### 2. Tap property selectors (four-char codes)
+## Tap Properties
+
+The tap object has global-scope properties only. `catap` uses:
 
 ```python
-kAudioTapPropertyUID = int.from_bytes(b'tuid', 'big')         # Get tap's UUID string
-kAudioTapPropertyFormat = int.from_bytes(b'tfmt', 'big')      # Get AudioStreamBasicDescription
-kAudioTapPropertyDescription = int.from_bytes(b'tdsc', 'big') # Get/set CATapDescription
+kAudioTapPropertyUID = int.from_bytes(b"tuid", "big")
+kAudioTapPropertyFormat = int.from_bytes(b"tfmt", "big")
+kAudioTapPropertyDescription = int.from_bytes(b"tdsc", "big")
 ```
 
-### 3. Aggregate device dictionary keys for taps
+`kAudioTapPropertyFormat` returns the `AudioStreamBasicDescription` for audio
+that will be visible through an aggregate device containing the tap. Recording
+should fail if this property cannot be read; guessing a default format risks
+corrupt output.
+
+## Aggregate Device Keys
+
+The aggregate-device create dictionary uses string keys from `AudioHardware.h`:
 
 ```python
-# Keys for AudioHardwareCreateAggregateDevice dictionary
 "name"          # kAudioAggregateDeviceNameKey
 "uid"           # kAudioAggregateDeviceUIDKey
-"private"       # kAudioAggregateDeviceIsPrivateKey (1 = not visible system-wide)
-"taps"          # kAudioAggregateDeviceTapListKey (array of tap dictionaries)
+"private"       # kAudioAggregateDeviceIsPrivateKey
+"taps"          # kAudioAggregateDeviceTapListKey
 "tapautostart"  # kAudioAggregateDeviceTapAutoStartKey
-
-# Keys for each tap in the "taps" array
-"uid"           # kAudioSubTapUIDKey - the tap's UUID from kAudioTapPropertyUID
-"drift"         # kAudioSubTapDriftCompensationKey (1 = enable)
 ```
 
-## References
+Each tap entry uses:
 
-- [Capturing system audio with Core Audio taps](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps) — Apple's high-level guide
-- [AudioCap](https://github.com/insidegui/AudioCap) — Sample Swift implementation
-- [Core Audio Tap Example](https://gist.github.com/sudara/34f00efad69a7e8ceafa078ea0f76f6f) — Minimal Objective-C example
+```python
+"uid"    # kAudioSubTapUIDKey
+"drift"  # kAudioSubTapDriftCompensationKey
+```
+
+Private aggregate devices are scoped to the creating process and are not
+persistent across launches.
+
+## Device-Stream Taps
+
+`CATapDescription` has initializers for processes routed to a selected device
+stream. The header describes this as an output-device stream: the selected
+device UID and stream index identify the destination stream whose process audio
+will be captured. `catap` rejects discovered input streams for these helpers.
+
+## Permissions
+
+For app bundles, include `NSAudioCaptureUsageDescription` in `Info.plist` so
+macOS can present the audio-capture permission prompt. Apple's tap sample uses
+that usage-description key and normal sandbox entitlements; it does not include
+a separate system-audio-capture entitlement.
+
+When running from a terminal, macOS attributes capture to the terminal app, so
+Terminal, iTerm, or the launching host needs permission under System Settings >
+Privacy & Security > Screen & System Audio Recording.
+
+## Profiling
+
+Use Instruments' `Audio System Trace` template for live Core Audio runs. The
+tracks most relevant to `catap` are `Audio Client`, `Audio Statistics`, and
+`Audio Server`; they show IOProc timing, engine jitter, I/O cycle load,
+overloads, and related points of interest.
+
+## Empirical Notes
+
+Mute lifecycle behavior is still tracked in [mute-behavior.md](mute-behavior.md)
+because the observable transitions depend on tap lifetime, aggregate-device
+creation, and whether a client is actively reading the tap.
+
+Future audit targets:
+
+- Consider a fallback path that attaches taps with
+  `kAudioAggregateDevicePropertyTapList`, matching Apple's sample exactly, if
+  create-time tap dictionaries prove brittle across macOS releases.
+- Revisit `kAudioDevicePropertyIOProcStreamUsage` only if `catap` starts
+  building aggregate devices with multiple active streams.
+- Review CF/Objective-C ownership for object-valued Core Audio properties if
+  long-running tap discovery becomes a hot path.

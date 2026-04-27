@@ -36,10 +36,23 @@ callback failures, uses explicit locks.
 
 ## Profiling Status
 
-The old profiling scripts were removed during the recorder refactor because
-they depended on private implementation details that no longer exist. A future
-profiling harness should be written against the current architecture instead
-of preserving those old seams.
+Use Apple's `Audio System Trace` Instruments template for real Core Audio runs.
+It includes `Audio Client`, `Audio Statistics`, and `Audio Server` tracks that
+show IOProc timing, engine jitter, I/O cycle load, overloads, and related
+points of interest:
+
+```bash
+xcrun xctrace record \
+  --template "Audio System Trace" \
+  --all-processes \
+  --time-limit 20s \
+  --output /tmp/catap-audio.trace
+```
+
+Open the resulting trace in Instruments and check that callback work stays
+short, that file/user-callback work remains on the `catap-audio-worker` thread,
+and that the Audio Client/Server tracks do not show overloads during normal
+recording.
 
 Useful measurements for the next harness:
 
