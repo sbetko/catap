@@ -9,7 +9,6 @@ import queue
 import tempfile
 import threading
 import wave
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,7 +49,7 @@ class _WorkerConfig:
 class _WorkerState:
     """Worker state shared by the RT callback and background thread."""
 
-    buffer_pool: deque[_PoolBuffer]
+    buffer_pool: queue.SimpleQueue[_PoolBuffer]
     work_queue: queue.Queue[_WorkerItem]
     output_file: BinaryIO | None = None
     wav_file: wave.Wave_write | None = None
@@ -159,10 +158,8 @@ class _AudioWorker:
             return None
 
         try:
-            # The RT callback only pops while the worker thread only appends.
-            # CPython keeps those individual deque operations atomic.
-            buf = state.buffer_pool.pop()
-        except IndexError:
+            buf = state.buffer_pool.get_nowait()
+        except queue.Empty:
             return None
 
         if len(buf) < needed:
@@ -187,7 +184,7 @@ class _AudioWorker:
             state.work_queue.put_nowait((buf, num_frames, byte_count))
         except queue.Full:
             self._record_dropped_frames(num_frames)
-            state.buffer_pool.append(buf)
+            state.buffer_pool.put(buf)
             return False
 
         return True
@@ -200,10 +197,12 @@ class _AudioWorker:
             bytes_per_frame * 1024,
         )
         pool_type = ctypes.c_char * pool_buffer_size
+        buffer_pool: queue.SimpleQueue[_PoolBuffer] = queue.SimpleQueue()
+        for _ in range(config.max_pending_buffers):
+            buffer_pool.put(pool_type())
+
         state = _WorkerState(
-            buffer_pool=deque(
-                pool_type() for _ in range(config.max_pending_buffers)
-            ),
+            buffer_pool=buffer_pool,
             work_queue=queue.Queue(maxsize=config.max_pending_buffers),
         )
 
@@ -322,7 +321,7 @@ class _AudioWorker:
                                 )
                             )
                 finally:
-                    state.buffer_pool.append(buf)
+                    state.buffer_pool.put(buf)
         finally:
             self._close_resources(state)
 

@@ -14,13 +14,13 @@ The recorder uses a bounded queue. If the worker falls behind, new buffers are
 dropped instead of allowing memory use to grow without limit. Dropped buffers
 are reported when recording stops.
 
-The buffer pool is a `collections.deque`: the Core Audio callback pops buffers
-from one side, and the worker appends them back after processing. The current
-implementation relies on CPython's safety for individual deque `pop()` and
-`append()` operations. In CPython 3.14, these deque methods are generated from
-`@critical_section` Argument Clinic blocks and their wrappers enter
-`Py_BEGIN_CRITICAL_SECTION(deque)`. That supports this one-operation-at-a-time
-use of the deque, but multi-step invariants still use explicit locks.
+The buffer pool is a `queue.SimpleQueue`: the Core Audio callback takes an
+available buffer with `get_nowait()`, and the worker returns buffers with
+`put()`. This avoids a separate Python-level lock around pool mutations while
+still using a thread-safe primitive in free-threaded builds. The work queue is
+still bounded with `queue.Queue` so overload becomes dropped audio instead of
+unbounded memory growth. Multi-step recorder state, such as frame counters and
+callback failures, uses explicit locks.
 
 ## Known Tradeoffs
 

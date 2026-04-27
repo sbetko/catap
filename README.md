@@ -10,6 +10,7 @@ pip install catap            # macOS 14.2+, Python 3.11+
 ```
 
 `catap` is macOS-only. On other platforms, imports raise an `ImportError`.
+Free-threaded CPython 3.13t and 3.14t builds are supported on macOS.
 
 Tested by the author on an Apple Silicon M5 MacBook Pro running macOS Tahoe
 26.2. The package is intended for macOS 14.2 and newer, but Core Audio tap
@@ -237,6 +238,16 @@ uv run --group dev ty check --error-on-warning src tests
 uv run --group dev pytest
 uv run --group dev python -m build
 uv run --group dev twine check dist/*
+```
+
+Free-threaded checks:
+
+```bash
+uv python install 3.13t 3.14t
+uv run --python 3.13t --group dev pytest
+uv run --python 3.14t --group dev pytest
+CATAP_RUN_INTEGRATION=1 uv run --python 3.14t --group dev pytest \
+  tests/test_integration.py::test_record_system_audio_smoke
 ```
 
 ### Optional integration smoke test

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import queue
 import struct
 import threading
 import wave
@@ -259,6 +260,60 @@ def test_worker_thread_is_non_daemon() -> None:
     assert worker.thread.daemon is False
 
     worker.stop()
+
+
+def test_worker_buffer_pool_handles_concurrent_producers() -> None:
+    producer_count = 8
+    items_per_producer = 128
+    expected_frames = producer_count * items_per_producer
+    payload = b"\x01\x02\x03\x04"
+    received_frames = 0
+    received_lock = threading.Lock()
+    producer_errors: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
+    dropped_frames: list[int] = []
+
+    def on_data(data: bytes, num_frames: int) -> None:
+        nonlocal received_frames
+        assert data == payload
+        assert num_frames == 1
+        with received_lock:
+            received_frames += num_frames
+
+    worker = _make_worker(
+        record_dropped_frames=dropped_frames.append,
+        consume_dropped_stats=lambda: (len(dropped_frames), sum(dropped_frames)),
+    )
+    config = _make_worker_config(
+        on_data=on_data,
+        max_pending_buffers=expected_frames,
+    )
+    worker.start(config)
+    barrier = threading.Barrier(producer_count)
+
+    def produce() -> None:
+        try:
+            barrier.wait(timeout=1)
+            for _ in range(items_per_producer):
+                buf = worker.acquire_pool_buffer(len(payload))
+                assert buf is not None
+                ctypes.memmove(buf, payload, len(payload))
+                assert worker.enqueue_audio_data(buf, 1, len(payload)) is True
+        except BaseException as exc:
+            producer_errors.put(exc)
+
+    producers = [threading.Thread(target=produce) for _ in range(producer_count)]
+    for producer in producers:
+        producer.start()
+    for producer in producers:
+        producer.join()
+
+    worker.stop()
+
+    if not producer_errors.empty():
+        raise producer_errors.get()
+
+    assert received_frames == expected_frames
+    assert dropped_frames == []
 
 
 def test_worker_rejects_double_start(tmp_path) -> None:

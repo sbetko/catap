@@ -39,10 +39,47 @@ jobs:
       - name: Test
         run: uv run --group dev pytest
 
+  free-threaded:
+    name: Free-threaded (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        python-version: ["3.13t", "3.14t"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Install free-threaded Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Verify GIL remains disabled after imports
+        run: |
+          uv run --python ${{ matrix.python-version }} --group dev python - <<'PY'
+          import sys
+          import sysconfig
+
+          assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1
+          assert sys._is_gil_enabled() is False
+
+          import catap
+          import catap.recorder
+
+          assert sys._is_gil_enabled() is False
+          PY
+
+      - name: Test
+        run: uv run --python ${{ matrix.python-version }} --group dev pytest
+
   package:
     name: Build Package
     runs-on: ubuntu-latest
-    needs: quality
+    needs: [quality, free-threaded]
 
     steps:
       - name: Checkout

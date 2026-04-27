@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- Added CI coverage for free-threaded CPython 3.13t and 3.14t on macOS.
+- Hardened recorder buffer-pool handoff for free-threaded Python builds.
+- Documented local free-threaded test commands and the opt-in real-recording
+  smoke check.
+
 ## [0.4.1] - 2026-04-26
 
 - Added Python 3.11 support by replacing 3.12-only type-alias syntax and
