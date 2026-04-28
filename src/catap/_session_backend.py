@@ -90,7 +90,7 @@ class _CoreAudioSessionBackend:
         tap_description = TapDescription.stereo_global_tap_excluding(
             [process.audio_object_id for process in excluded]
         )
-        tap_description.name = "catap system recording"
+        tap_description.name = "catap global recording"
         tap_description.is_private = True
         tap_description.mute_behavior = TapMuteBehavior.UNMUTED
         return tap_description

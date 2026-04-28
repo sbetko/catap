@@ -57,7 +57,7 @@ def _resolve_processes(
 def build_process_tap_description(
     process: AudioProcess, *, mute: bool = False
 ) -> TapDescription:
-    """Build the private stereo-mixdown tap description catap uses for app capture."""
+    """Build the private stereo-mixdown tap description for one process."""
     return _DEFAULT_SESSION_BACKEND.build_process_tap_description(
         process,
         mute=mute,
@@ -67,7 +67,7 @@ def build_process_tap_description(
 def build_system_tap_description(
     excluded: Sequence[AudioProcess] = (),
 ) -> TapDescription:
-    """Build the private stereo global tap catap uses for system capture."""
+    """Build the private stereo global tap description for process output."""
     return _DEFAULT_SESSION_BACKEND.build_system_tap_description(excluded)
 
 
@@ -176,11 +176,11 @@ class RecordingSession:
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """
-        Create a managed session for recording system audio.
+        Create a managed session for recording a global process-output mix.
 
         Args:
             output_path: Path to write a WAV file, or None for streaming mode
-            exclude: Apps to exclude from the system capture
+            exclude: Apps to exclude from the global tap
             on_data: Optional streaming callback. See ``RecordingSession`` for
                 buffer format and threading details.
             max_pending_buffers: Queue bound for the background worker. See
@@ -444,9 +444,9 @@ def record_process(
     """
     Create a managed session for recording one application's audio.
 
-    This is the quickest way to capture a single app without manually creating
-    a tap or cleaning it up afterward. Pass ``max_pending_buffers`` to tune how
-    much audio can be queued while the background worker catches up.
+    The session owns tap creation, recorder startup, shutdown, and tap cleanup.
+    Pass ``max_pending_buffers`` to tune how much audio can be queued while the
+    background worker catches up.
     """
     return RecordingSession.from_process(
         process,
@@ -465,11 +465,11 @@ def record_system_audio(
     max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
-    Create a managed session for recording system audio.
+    Create a managed session for recording a global process-output mix.
 
-    This is the quickest way to capture the system mix without manually
-    building a global tap description. Pass ``max_pending_buffers`` to tune how
-    much audio can be queued while the background worker catches up.
+    The session owns tap creation, recorder startup, shutdown, and tap cleanup.
+    Pass ``max_pending_buffers`` to tune how much audio can be queued while the
+    background worker catches up.
     """
     return RecordingSession.from_system_audio(
         output_path=output_path,

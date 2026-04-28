@@ -14,7 +14,7 @@ Evidence labels:
 | --- | --- | --- | --- | --- |
 | Process enumeration | Reads Core Audio process objects and resolves names, PIDs, bundle IDs, and output state. | SDK header selectors; unit tests; integration smoke test. | Supported for the public enumeration API. | Process names come from AppKit when available and may be `"Unknown"` for helper or headless processes. |
 | Device enumeration | Lists devices and input/output streams, including default-device markers. | SDK header selectors; unit tests; integration smoke test. | Supported for static snapshots. | Device changes during active capture need dedicated runtime coverage. |
-| Tap descriptions | Builds process, system, and device-stream `CATapDescription` values through PyObjC. | Apple sample/docs; SDK header; unit tests. | Supported for the constructors `catap` exposes. | Not every mutable `CATapDescription` property has a high-level wrapper. |
+| Tap descriptions | Builds process, global, and device-stream `CATapDescription` values through PyObjC. | Apple sample/docs; SDK header; unit tests. | Supported for the constructors `catap` exposes. | Not every mutable `CATapDescription` property has a high-level Python property. macOS 26 `bundleIDs` and `processRestoreEnabled` are not exposed yet. |
 | Process tap lifecycle | Creates taps with `AudioHardwareCreateProcessTap` and destroys owned taps with `AudioHardwareDestroyProcessTap`. | Apple sample/docs; SDK header; unit tests; runtime audit. | Supported for taps owned by a `catap` recording session. | More route-change and source-exit cases remain to be tested. |
 | Tap UID lookup | Reads `kAudioTapPropertyUID` and uses the UID to attach the tap to an aggregate device. | Apple sample/docs; SDK header; runtime audit. | Supported for the recorder path. | None known for the current one-tap path. |
 | Tap format lookup | Reads `kAudioTapPropertyFormat` before recording and refuses to guess a fallback format. | Apple sample/docs; SDK header; unit tests; runtime audit. | Supported for reported linear PCM formats. | Formats beyond the tested interleaved PCM path stay fail-closed until exercised. |
@@ -36,6 +36,7 @@ These areas need more work before `catap` makes any claim about them:
 - Captures where the source process exits, restarts, or changes route mid-run.
 - Exhaustive mute semantics across every `CATapMuteBehavior`.
 - Non-interleaved, multi-buffer, compressed, or unusual tap formats.
+- `CATapDescription.bundleIDs` and process-restore behavior added in macOS 26.
 - Automated analysis of Instruments trace payloads.
 - Core Audio surface area outside what's listed above — devices, streams,
   controls, plug-ins, clocks, or AudioServerPlugIn drivers.

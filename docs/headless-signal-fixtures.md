@@ -16,7 +16,7 @@ frequency, amplitude, waveform, channel mode, and device metadata. By default
 the manager keeps tones running until interrupted; pass `--seconds N` for a
 finite run.
 
-Record the full system mix and validate all expected tones:
+Record a global process-output mix and validate all expected tones:
 
 ```bash
 uv run catap record --system --duration 5 --output /tmp/mix.wav

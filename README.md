@@ -1,8 +1,8 @@
 # catap
 
-A Python wrapper for Apple's Core Audio Tap API (macOS 14.2+). Capture app or
-system audio without third-party loopback drivers or user-managed virtual audio
-devices.
+Python bindings and recording utilities for Apple's Core Audio process-tap API
+(macOS 14.2+). `catap` captures outgoing process audio through Core Audio taps,
+without installing or selecting a third-party loopback driver.
 
 ## Install
 
@@ -11,8 +11,9 @@ pip install catap
 ```
 
 `catap` is macOS-only; importing it on other platforms raises `ImportError`.
-Free-threaded CPython 3.13t and 3.14t are supported. Targets macOS 14.2 and
-newer; primary development is on Apple Silicon and macOS Tahoe.
+It targets macOS 14.2 and newer. CI covers CPython 3.11 through 3.14 plus
+free-threaded CPython 3.13t and 3.14t on macOS. Current development is on
+Apple Silicon and macOS 26.2.
 
 ## Quick start
 
@@ -20,7 +21,7 @@ CLI:
 
 ```bash
 catap record Safari -d 10 -o safari.wav    # record an app for 10 seconds
-catap record --system -d 10 -o mix.wav     # record the full system mix
+catap record --system -d 10 -o mix.wav     # record a global process-output mix
 catap list-apps                            # see what's producing audio
 ```
 
@@ -37,19 +38,36 @@ print(f"Recorded {session.duration_seconds:.2f} seconds")
 
 ## What it does
 
-- Record a single app, the full system mix, or an existing visible tap.
-- Exclude selected apps from a system recording.
+- Record a single app, a global process-output mix, or an existing visible tap.
+- Exclude selected apps from a global recording.
 - Mute an app while recording it, so it's captured but not played aloud.
 - Target a specific output device stream when building a tap.
 - Write WAV files, or stream PCM buffers to your own callback.
 - Use a bounded audio queue: if the worker falls behind, buffers are dropped
   and the count is reported on stop, instead of growing memory without bound.
 
+## Support boundary
+
+`catap` is a process-output capture library. It is not a microphone/input-device
+recorder, an AudioServerPlugIn implementation, or a virtual audio driver.
+
+The current recorder path reads one tap through one private HAL aggregate
+device. It accepts packed, interleaved linear PCM tap formats and fails closed
+for non-interleaved, multi-buffer, compressed, padded, or otherwise unusual
+formats.
+
+The `--system` and `record_system_audio()` paths build a global Core Audio tap:
+they capture process output that Core Audio exposes to taps. Long-running
+captures across sleep/wake, route changes, source-process restarts, and default
+output-device changes are intentionally not claimed yet. See
+[`docs/core-audio-support-matrix.md`](docs/core-audio-support-matrix.md) for the
+full support matrix.
+
 ## Usage
 
 ### Command Line
 
-The CLI is small. These are the commands I use most often:
+Common commands:
 
 ```bash
 catap list-apps
@@ -128,18 +146,19 @@ tap_desc = TapDescription.stereo_mixdown_of_processes([process.audio_object_id])
 tap_desc.name = "My Recording"
 tap_desc.mute_behavior = TapMuteBehavior.UNMUTED  # or MUTED
 
-tap_id = create_process_tap(tap_desc)
-
-recorder = AudioRecorder(tap_id, "output.wav")
-recorder.start()
-
 import time
-time.sleep(5)
 
-recorder.stop()
-print(f"Recorded {recorder.duration_seconds:.2f} seconds")
-
-destroy_process_tap(tap_id)
+tap_id = create_process_tap(tap_desc)
+try:
+    recorder = AudioRecorder(tap_id, "output.wav")
+    recorder.start()
+    try:
+        time.sleep(5)
+    finally:
+        recorder.stop()
+    print(f"Recorded {recorder.duration_seconds:.2f} seconds")
+finally:
+    destroy_process_tap(tap_id)
 ```
 
 If another app has already created a non-private tap, you can discover it and
@@ -171,16 +190,17 @@ tap_desc.name = "Safari on default speakers"
 
 ## Permissions
 
-Core Audio Tap requires audio capture permission. macOS prompts the first
-time you record.
+Core Audio taps require system-audio recording permission. macOS prompts the
+first time an app starts recording from an aggregate device that contains a tap;
+if access was previously denied, enable it in System Settings.
 
 When you run from a terminal (for example `uv run catap record Spotify`),
 macOS attributes capture to the terminal app, so grant permission to
 Terminal, iTerm, or whichever host is launching `catap`.
 
 App bundles using Core Audio taps should include
-`NSAudioCaptureUsageDescription` in their `Info.plist`. Apple's sample uses
-that key plus normal sandbox entitlements; there is no separate
+`NSAudioCaptureUsageDescription` in their `Info.plist`. Sandboxed apps still
+need their normal sandbox configuration; Core Audio taps do not add a separate
 system-audio-capture entitlement.
 
 ## How it works
@@ -189,9 +209,9 @@ system-audio-capture entitlement.
    `kAudioHardwarePropertyProcessObjectList` to find audio processes.
 2. Tap creation: builds a `CATapDescription` through PyObjC and calls
    `AudioHardwareCreateProcessTap`.
-3. Aggregate device: creates a private Core Audio aggregate device that
-   contains the tap (Core Audio requires this before a tap can be read).
-   `catap` destroys the aggregate when recording stops.
+3. Aggregate device: creates a private Core Audio aggregate device containing
+   the tap, matching Apple's documented tap-capture path. `catap` destroys the
+   aggregate when recording stops.
 4. Audio capture: registers an `AudioDeviceIOProc` callback to receive
    audio buffers.
 5. WAV output: uses Core Audio `AudioConverter` to convert float32 audio to

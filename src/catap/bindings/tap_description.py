@@ -40,7 +40,7 @@ class TapMuteBehavior(IntEnum):
 
 class TapDescription:
     """
-    Python wrapper for CATapDescription.
+    Python handle for a CATapDescription Objective-C instance.
 
     Describes a tap that captures audio from processes.
     """

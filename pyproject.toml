@@ -1,7 +1,7 @@
 [project]
 name = "catap"
 version = "0.4.2"
-description = "Python wrapper for Apple's Core Audio Tap API"
+description = "Python bindings and recorder for Apple's Core Audio process taps"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -9,7 +9,15 @@ authors = [
     { name = "Sage Betko", email = "sage.betko@gmail.com" }
 ]
 requires-python = ">=3.11"
-keywords = ["audio", "macos", "core-audio", "recording", "tap", "capture"]
+keywords = [
+    "audio",
+    "macos",
+    "core-audio",
+    "recording",
+    "capture",
+    "process-audio",
+    "system-audio",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: MacOS X",

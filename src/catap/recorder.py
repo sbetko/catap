@@ -35,23 +35,28 @@ class UnsupportedTapFormatError(ValueError):
 
 
 class AudioRecorder:
-    """Records audio from a Core Audio tap to a WAV file.
+    """Record audio from a Core Audio tap.
 
-    This recorder creates an aggregate device containing the tap,
-    which is required by Core Audio to read audio data from taps.
+    This recorder reads the tap through a private aggregate device and can
+    write WAV output, call an ``on_data`` callback, or do both.
 
     Usage:
+        import time
+
         from catap import TapDescription, create_process_tap, destroy_process_tap
 
         tap_desc = TapDescription.stereo_mixdown_of_processes([process_id])
         tap_id = create_process_tap(tap_desc)
+        try:
+            recorder = AudioRecorder(tap_id, "output.wav")
+            recorder.start()
+            try:
+                time.sleep(5)
+            finally:
+                recorder.stop()
+        finally:
+            destroy_process_tap(tap_id)
 
-        recorder = AudioRecorder(tap_id, "output.wav")
-        recorder.start()
-        time.sleep(5)  # Record for 5 seconds
-        recorder.stop()
-
-        destroy_process_tap(tap_id)
     """
 
     def __init__(

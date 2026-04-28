@@ -132,7 +132,7 @@ class _FakeSessionBackend:
             [process.audio_object_id for process in excluded],
             exclusive=True,
         )
-        tap_description.name = "catap system recording"
+        tap_description.name = "catap global recording"
         tap_description.is_private = True
         tap_description.mute_behavior = "unmuted"
         return tap_description
@@ -311,7 +311,7 @@ def test_record_system_audio_tracks_excluded_processes(
     )
 
     assert session.excluded_processes == (music, zoom)
-    assert session.tap_description.name == "catap system recording"
+    assert session.tap_description.name == "catap global recording"
     assert session.tap_description.processes == [11, 12]
     assert session.tap_description.is_exclusive is True
     assert session.tap_description.is_private is True

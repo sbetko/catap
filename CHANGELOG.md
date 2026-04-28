@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+- Tightened README, CLI help, and package metadata around the process-tap support
+  boundary and unsupported capture scenarios.
+
 ## [0.4.2] - 2026-04-27
 
 - Added CI coverage for free-threaded CPython 3.13t and 3.14t on macOS.

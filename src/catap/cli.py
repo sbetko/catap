@@ -68,7 +68,7 @@ def _positive_int(value: str) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="catap",
-        description="catap - Python Core Audio Tap for capturing application audio.",
+        description="catap - Core Audio process-tap recording for macOS.",
     )
     parser.add_argument(
         "--version",
@@ -87,12 +87,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "-a",
         dest="show_all",
         action="store_true",
-        help="Show all audio processes, not just those outputting audio",
+        help="Show all audio processes, including idle processes",
     )
 
     record_parser = subparsers.add_parser(
         "record",
-        help="Record app audio or all system audio",
+        help="Record one process or a global process-output mix",
     )
     record_parser.add_argument(
         "app_name",
@@ -105,7 +105,7 @@ def _build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument(
         "--system",
         action="store_true",
-        help="Record all system audio",
+        help="Record a global process-output mix",
     )
     record_parser.add_argument(
         "--output",
@@ -142,14 +142,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "-e",
         action="append",
         default=[],
-        help="App names to exclude from system recording (repeatable)",
+        help="App names to exclude from global recording (repeatable)",
     )
     record_parser.add_argument(
         "--exclude-pid",
         action="append",
         type=_positive_int,
         default=[],
-        help="OS process IDs to exclude from system recording (repeatable)",
+        help="OS process IDs to exclude from global recording (repeatable)",
     )
     record_parser.add_argument(
         "--exclude-audio-object-id",
@@ -159,7 +159,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=[],
         help=(
-            "Core Audio process object IDs to exclude from system recording "
+            "Core Audio process object IDs to exclude from global recording "
             "(repeatable)"
         ),
     )
@@ -425,7 +425,7 @@ def _build_system_tap(
             continue
         _append_excluded_process(excluded_processes, process)
 
-    print("Recording all system audio", flush=True)
+    print("Recording global process-output mix", flush=True)
     return build_system_tap_description(excluded_processes)
 
 
