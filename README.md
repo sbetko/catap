@@ -7,16 +7,12 @@ devices.
 ## Install
 
 ```bash
-pip install catap            # macOS 14.2+, Python 3.11+
+pip install catap
 ```
 
-`catap` is macOS-only. On other platforms, imports raise an `ImportError`.
-Free-threaded CPython 3.13t and 3.14t builds are supported on macOS.
-
-Tested by the author on an Apple Silicon M5 MacBook Pro running macOS Tahoe
-26.2. The package is intended for macOS 14.2 and newer, and the implementation
-is cross-checked against Apple's current tap sample, symbol docs, and SDK
-headers. Reports from other Macs and macOS versions are welcome.
+`catap` is macOS-only; importing it on other platforms raises `ImportError`.
+Free-threaded CPython 3.13t and 3.14t are supported. Targets macOS 14.2 and
+newer; primary development is on Apple Silicon and macOS Tahoe.
 
 ## Quick start
 
@@ -39,21 +35,21 @@ session.record_for(10)
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
 
-## What It Can Do
+## What it does
 
 - Record a single app, the full system mix, or an existing visible tap.
 - Exclude selected apps from a system recording.
-- Mute an app while recording it, so it is captured but not played aloud.
-- Build taps for a specific output device stream.
+- Mute an app while recording it, so it's captured but not played aloud.
+- Target a specific output device stream when building a tap.
 - Write WAV files, or stream PCM buffers to your own callback.
-- Keep the audio queue bounded. If the worker falls behind, dropped buffers are
-  reported when recording stops.
+- Use a bounded audio queue: if the worker falls behind, buffers are dropped
+  and the count is reported on stop, instead of growing memory without bound.
 
 ## Usage
 
 ### Command Line
 
-The CLI is intentionally small. These are the commands I use most often:
+The CLI is small. These are the commands I use most often:
 
 ```bash
 catap list-apps
@@ -77,11 +73,11 @@ session.record_for(5)
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
 
-If you use `on_data=...`, the callback runs on catap's background worker
-thread so the Core Audio callback can stay lightweight.
+If you pass `on_data=...`, the callback runs on `catap`'s background worker
+thread so the Core Audio callback stays lightweight.
 
-If you want to control the recording lifetime yourself, use the session as a
-context manager:
+To control the recording lifetime yourself, use the session as a context
+manager:
 
 ```python
 import time
@@ -93,27 +89,25 @@ with record_process("Safari", output_path="output.wav", mute=False) as session:
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
 
-If you want streaming-only mode, pass `on_data=...` and omit `output_path`.
+For streaming-only mode, pass `on_data=...` and omit `output_path`.
 
 By default, `catap` queues up to 256 pending audio buffers before treating a
-slow writer or callback as a capture failure. You can tune this with
+slow writer or callback as a capture failure. Tune this with
 `max_pending_buffers=...` on `record_process`, `record_system_audio`,
 `RecordingSession`, or `AudioRecorder`.
 
-If a process query matches more than one audio process, `catap` reports the
-candidate processes instead of picking one arbitrarily.
+A name query that matches multiple processes raises with the candidates in
+the error rather than picking one arbitrarily.
 
 ### Mute Behavior
 
-For `record_process(..., mute=True)`, the app stays muted for the lifetime of
-the recording session. The two underlying modes (`MUTED` and
-`MUTED_WHEN_TAPPED`) have different lifecycle semantics. See
-[`docs/mute-behavior.md`](docs/mute-behavior.md) for empirical probe results
-and when each mode transitions between audible and inaudible.
+With `record_process(..., mute=True)`, the app stays muted for the lifetime
+of the recording session. The two underlying modes (`MUTED` and
+`MUTED_WHEN_TAPPED`) have different lifecycle semantics; see
+[`docs/mute-behavior.md`](docs/mute-behavior.md) for probe results and the
+points at which each mode transitions between audible and silent.
 
 ### Low-level API
-
-For advanced use cases, the low-level API is still available:
 
 ```python
 from catap import (
@@ -177,51 +171,42 @@ tap_desc.name = "Safari on default speakers"
 
 ## Permissions
 
-Core Audio Tap requires audio capture permissions. The first time you record,
-macOS will prompt for permission.
+Core Audio Tap requires audio capture permission. macOS prompts the first
+time you record.
 
-If you run from a terminal (for example `uv run catap record Spotify`), macOS
-attributes audio capture to that terminal app. Grant permission to Terminal,
-iTerm, or whichever host app is launching `catap`.
+When you run from a terminal (for example `uv run catap record Spotify`),
+macOS attributes capture to the terminal app, so grant permission to
+Terminal, iTerm, or whichever host is launching `catap`.
 
-App bundles that use Core Audio taps should include
-`NSAudioCaptureUsageDescription` in their `Info.plist`. Apple's tap sample uses
-that usage-description key and normal sandbox entitlements; it does not include
-a separate system-audio-capture entitlement.
+App bundles using Core Audio taps should include
+`NSAudioCaptureUsageDescription` in their `Info.plist`. Apple's sample uses
+that key plus normal sandbox entitlements; there is no separate
+system-audio-capture entitlement.
 
-### Permission Troubleshooting
+## How it works
 
-If recording fails with permission errors:
-
-1. Check System Settings > Privacy & Security > Screen & System Audio Recording
-2. Ensure the app launching `catap` has permission (Terminal, iTerm, etc.)
-3. Retry recording from the same terminal app after granting access
-
-## How It Works
-
-1. Process enumeration: uses Core Audio's `kAudioHardwarePropertyProcessObjectList`
-   to find audio processes.
-2. Tap creation: creates a `CATapDescription` via PyObjC and calls
+1. Process enumeration: reads
+   `kAudioHardwarePropertyProcessObjectList` to find audio processes.
+2. Tap creation: builds a `CATapDescription` through PyObjC and calls
    `AudioHardwareCreateProcessTap`.
-3. Aggregate device setup: creates a private Core Audio aggregate device that
-   contains the tap. Core Audio requires this before a tap can be read; `catap`
-   destroys the temporary aggregate device when recording stops.
-4. Audio capture: registers an `AudioDeviceIOProc` callback to receive audio
-   buffers.
+3. Aggregate device: creates a private Core Audio aggregate device that
+   contains the tap (Core Audio requires this before a tap can be read).
+   `catap` destroys the aggregate when recording stops.
+4. Audio capture: registers an `AudioDeviceIOProc` callback to receive
+   audio buffers.
 5. WAV output: uses Core Audio `AudioConverter` to convert float32 audio to
-   16-bit PCM before writing WAV output.
+   16-bit PCM for the WAV file.
 
-For Core Audio implementation notes and audit assumptions, see
-[`docs/core-audio-notes.md`](docs/core-audio-notes.md).
-
-For the recorder's callback and queueing design, see
+The supported Core Audio surface is enumerated in
+[`docs/core-audio-support-matrix.md`](docs/core-audio-support-matrix.md).
+Recorder callback and queueing design is in
 [`docs/performance.md`](docs/performance.md).
 
 ## Interactive lab
 
-For a Tkinter lab that exercises process browsing, mute modes, callback
-streaming, shared-tap attachment, device-stream-targeted taps, and a built-in
-helper tone launcher, run:
+A Tkinter app that exercises process browsing, mute modes, callback
+streaming, shared-tap attachment, device-stream-targeted taps, and a
+helper-tone launcher:
 
 ```bash
 uv sync --group dev
@@ -256,17 +241,16 @@ CATAP_RUN_INTEGRATION=1 uv run --python 3.14t --group dev pytest \
   tests/test_integration.py::test_record_system_audio_smoke
 ```
 
-### Optional integration smoke test
+### Integration smoke test
 
 ```bash
 CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
 ```
 
-This opt-in smoke test exercises the real macOS Core Audio bridge without
-making the default test suite flaky. It covers both process enumeration and a
-short real recording that verifies tap startup, shutdown, and WAV finalization.
+Opt-in. Exercises the real macOS Core Audio bridge: process enumeration and
+a short recording that covers tap startup, shutdown, and WAV finalization.
 
-Advanced signal-oracle testing with the internal tone fixtures is documented in
+Signal-oracle testing with the internal tone fixtures is documented in
 [`docs/headless-signal-fixtures.md`](docs/headless-signal-fixtures.md).
 
 See [`RELEASE.md`](RELEASE.md) for the release checklist.

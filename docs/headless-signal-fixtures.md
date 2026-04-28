@@ -1,6 +1,6 @@
 # Headless Signal Fixtures
 
-`catap` includes internal devtools for automated and integration testing with
+`catap` ships internal devtools for driving integration tests against
 deterministic audio sources.
 
 Start a farm of independent tone-producing processes:
@@ -13,7 +13,7 @@ uv run python -m catap._devtools.tone_farm \
 
 The manifest maps each tone ID to its PID, Core Audio process object ID,
 frequency, amplitude, waveform, channel mode, and device metadata. By default
-the manager keeps tones alive until interrupted; pass `--seconds N` for a
+the manager keeps tones running until interrupted; pass `--seconds N` for a
 finite run.
 
 Record the full system mix and validate all expected tones:
@@ -26,8 +26,8 @@ uv run python -m catap._devtools.tone_analyzer /tmp/mix.wav \
   --json
 ```
 
-macOS may report these headless worker processes as `Unknown`, so name-based
-CLI targeting can be ambiguous. Use manifest identifiers for exact targeting:
+macOS often reports these headless worker processes as `Unknown`, so
+name-based CLI targeting is ambiguous. Use manifest identifiers instead:
 
 ```bash
 catap record \
@@ -41,10 +41,10 @@ catap record --system \
   --output /tmp/mix-without-tone-001.wav
 ```
 
-The same exact-targeting flow also supports `--pid` and `--exclude-pid` when
-the OS process ID is the more convenient selector.
+The same exact-targeting flow also supports `--pid` and `--exclude-pid`
+when the OS process ID is more convenient.
 
-For opt-in CI or local integration coverage:
+Opt-in CI or local integration coverage:
 
 ```bash
 CATAP_RUN_TONE_INTEGRATION=1 \
@@ -52,5 +52,5 @@ CATAP_RUN_TONE_INTEGRATION=1 \
 ```
 
 That test starts the tone farm, records one fixture process by Core Audio
-process object ID, and verifies that the selected tone is present while another
-fixture tone is absent.
+process object ID, and verifies that the selected tone is present and
+another fixture tone is absent.
