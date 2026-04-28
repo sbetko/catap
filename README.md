@@ -1,5 +1,10 @@
 # catap
 
+[![CI](https://github.com/sbetko/catap/actions/workflows/ci.yml/badge.svg)](https://github.com/sbetko/catap/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/catap.svg)](https://pypi.org/project/catap/)
+[![Python versions](https://img.shields.io/pypi/pyversions/catap.svg)](https://pypi.org/project/catap/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Python bindings and recording utilities for Apple's Core Audio process-tap API
 (macOS 14.2+). `catap` captures outgoing process audio through Core Audio taps,
 without installing or selecting a third-party loopback driver.
