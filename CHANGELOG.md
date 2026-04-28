@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.3] - 2026-04-28
 
 - Tightened README, CLI help, and package metadata around the process-tap support
   boundary and unsupported capture scenarios.
