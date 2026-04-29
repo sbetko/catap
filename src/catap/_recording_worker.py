@@ -69,31 +69,25 @@ _EMPTY_TIMING_SNAPSHOT = _AudioBufferTimingSnapshot(
 _WorkerItem: TypeAlias = tuple[_PoolBuffer, int, int, _AudioBufferTimingSnapshot] | None
 
 
-class _BoundedAudioQueue:
-    """Non-blocking bounded audio queue optimized for the IOProc producer."""
+class _AudioWorkQueue:
+    """Simple audio queue optimized for the IOProc producer."""
 
-    __slots__ = ("_available", "_queue")
+    __slots__ = ("_queue",)
 
-    def __init__(self, max_pending_items: int) -> None:
-        self._available = threading.BoundedSemaphore(max_pending_items)
+    def __init__(self) -> None:
         self._queue: queue.SimpleQueue[_WorkerItem] = queue.SimpleQueue()
 
-    def put_audio_nowait(
+    def put_audio(
         self,
         item: tuple[_PoolBuffer, int, int, _AudioBufferTimingSnapshot],
     ) -> None:
-        if not self._available.acquire(blocking=False):
-            raise queue.Full
         self._queue.put(item)
 
     def put_stop(self) -> None:
         self._queue.put(None)
 
     def get(self) -> _WorkerItem:
-        item = self._queue.get()
-        if item is not None:
-            self._available.release()
-        return item
+        return self._queue.get()
 
     def qsize(self) -> int:
         return self._queue.qsize()
@@ -133,7 +127,7 @@ class _WorkerState:
     """Worker state shared by the RT callback and background thread."""
 
     buffer_pool: queue.SimpleQueue[_PoolBuffer]
-    work_queue: _BoundedAudioQueue
+    work_queue: _AudioWorkQueue
     output_file: BinaryIO | None = None
     wav_file: wave.Wave_write | None = None
     pcm_converter: PcmAudioConverter | None = None
@@ -264,13 +258,34 @@ class _AudioWorker:
         if state is None:
             return True
 
+        state.work_queue.put_audio((buf, num_frames, byte_count, timing))
+        return True
+
+    def enqueue_copied_audio_data(
+        self,
+        source: ctypes.c_void_p,
+        num_frames: int,
+        byte_count: int,
+        timing: _AudioBufferTimingSnapshot = _EMPTY_TIMING_SNAPSHOT,
+    ) -> bool:
+        """Copy audio into a pooled buffer and queue it without blocking."""
+        state = self._state
+        if state is None:
+            return True
+
         try:
-            state.work_queue.put_audio_nowait((buf, num_frames, byte_count, timing))
-        except queue.Full:
+            buf = state.buffer_pool.get_nowait()
+        except queue.Empty:
             self._record_dropped_frames(num_frames)
-            state.buffer_pool.put(buf)
             return False
 
+        if len(buf) < byte_count:
+            # Resize is rare (only on buffer-size change). Still technically an
+            # allocation on the RT thread, but bounded to a few occurrences.
+            buf = (ctypes.c_char * byte_count)()
+
+        ctypes.memmove(buf, source, byte_count)
+        state.work_queue.put_audio((buf, num_frames, byte_count, timing))
         return True
 
     def _create_state(self, config: _WorkerConfig) -> _WorkerState:
@@ -288,7 +303,7 @@ class _AudioWorker:
 
         state = _WorkerState(
             buffer_pool=buffer_pool,
-            work_queue=_BoundedAudioQueue(config.max_pending_buffers),
+            work_queue=_AudioWorkQueue(),
         )
 
         with contextlib.ExitStack() as stack:

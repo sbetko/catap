@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import queue
 import struct
+import sys
 import threading
 import wave
 from collections.abc import Callable
@@ -15,6 +17,7 @@ import pytest
 
 import catap._capture_engine as capture_module
 import catap._recording_worker as worker_module
+import catap.recorder as recorder_module
 from catap.audio_buffer import (
     AudioBuffer as PublicAudioBuffer,
     AudioStreamFormat,
@@ -158,6 +161,19 @@ class _CapturingWorker:
     ) -> bool:
         self.enqueued.append(
             (bytes(memoryview(buf)[:byte_count]), num_frames, byte_count)
+        )
+        self.timings.append(timing)
+        return True
+
+    def enqueue_copied_audio_data(
+        self,
+        source: ctypes.c_void_p,
+        num_frames: int,
+        byte_count: int,
+        timing: worker_module._AudioBufferTimingSnapshot,
+    ) -> bool:
+        self.enqueued.append(
+            (ctypes.string_at(source, byte_count), num_frames, byte_count)
         )
         self.timings.append(timing)
         return True
@@ -516,16 +532,14 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
     config = _make_worker_config(on_buffer=on_buffer, max_pending_buffers=1)
     worker.start(config)
 
-    buf_type = ctypes.c_char * 2
-    assert (
-        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x00\x01"), 1, 2) is True
-    )
+    first = (ctypes.c_char * 2).from_buffer_copy(b"\x00\x01")
+    assert worker.enqueue_copied_audio_data(ctypes.cast(first, ctypes.c_void_p), 1, 2)
     assert callback_started.wait(timeout=1)
-    assert (
-        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x02\x03"), 1, 2) is True
-    )
-    assert (
-        worker.enqueue_audio_data(buf_type.from_buffer_copy(b"\x04\x05"), 2, 2) is False
+    second = (ctypes.c_char * 2).from_buffer_copy(b"\x02\x03")
+    assert not worker.enqueue_copied_audio_data(
+        ctypes.cast(second, ctypes.c_void_p),
+        2,
+        2,
     )
 
     allow_callback_to_finish.set()
@@ -1225,3 +1239,50 @@ def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:
 
     assert observed == sorted(observed)
     assert observed[-1] == total_updates
+
+
+def test_realtime_switch_interval_is_reference_counted() -> None:
+    original = sys.getswitchinterval()
+    try:
+        sys.setswitchinterval(0.005)
+
+        recorder_module._enter_realtime_switch_interval()
+        assert sys.getswitchinterval() == pytest.approx(
+            recorder_module._REALTIME_SWITCH_INTERVAL_SECONDS
+        )
+
+        recorder_module._enter_realtime_switch_interval()
+        recorder_module._exit_realtime_switch_interval()
+        assert sys.getswitchinterval() == pytest.approx(
+            recorder_module._REALTIME_SWITCH_INTERVAL_SECONDS
+        )
+
+        recorder_module._exit_realtime_switch_interval()
+        assert sys.getswitchinterval() == pytest.approx(0.005)
+    finally:
+        while recorder_module._switch_interval_users:
+            recorder_module._exit_realtime_switch_interval()
+        sys.setswitchinterval(original)
+
+
+def test_realtime_gc_pause_is_reference_counted() -> None:
+    was_enabled = gc.isenabled()
+    try:
+        gc.enable()
+
+        recorder_module._enter_realtime_gc_pause()
+        assert gc.isenabled() is False
+
+        recorder_module._enter_realtime_gc_pause()
+        recorder_module._exit_realtime_gc_pause()
+        assert gc.isenabled() is False
+
+        recorder_module._exit_realtime_gc_pause()
+        assert gc.isenabled() is True
+    finally:
+        while recorder_module._gc_pause_users:
+            recorder_module._exit_realtime_gc_pause()
+        if was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
