@@ -38,10 +38,7 @@ from catap.audio_buffer import (
     AudioStreamFormat,
     _format_id_to_fourcc,
 )
-from catap.bindings._audiotoolbox import (
-    AudioBuffer as _CoreAudioAudioBuffer,
-    kAudioFormatLinearPCM,
-)
+from catap.bindings._audiotoolbox import kAudioFormatLinearPCM
 
 
 class UnsupportedTapFormatError(ValueError):
@@ -367,54 +364,44 @@ class AudioRecorder:
                 output_time=self._timestamp_snapshot(output_time),
             )
 
-            for i in range(num_buffers):
-                # AudioBufferList has a variable-length mBuffers array; index
-                # past the first slot via pointer arithmetic.
-                buffer_offset = ctypes.sizeof(_CoreAudioAudioBuffer) * i
-                buffer_ptr = ctypes.cast(
-                    ctypes.addressof(buffer_list.mBuffers) + buffer_offset,
-                    ctypes.POINTER(_CoreAudioAudioBuffer),
+            buffer = buffer_list.mBuffers[0]
+            byte_count = buffer.mDataByteSize
+            if byte_count > 0:
+                if not buffer.mData:
+                    raise UnsupportedTapFormatError(
+                        "Audio buffer reported bytes without a data pointer"
+                    )
+                if buffer.mNumberChannels != self._num_channels:
+                    raise UnsupportedTapFormatError(
+                        "Unsupported audio buffer channel count: expected "
+                        f"{self._num_channels}, got {buffer.mNumberChannels}"
                 )
-                buffer = buffer_ptr.contents
 
-                byte_count = buffer.mDataByteSize
-                if byte_count > 0:
-                    if not buffer.mData:
-                        raise UnsupportedTapFormatError(
-                            "Audio buffer reported bytes without a data pointer"
-                        )
-                    if buffer.mNumberChannels != self._num_channels:
-                        raise UnsupportedTapFormatError(
-                            "Unsupported audio buffer channel count: expected "
-                            f"{self._num_channels}, got {buffer.mNumberChannels}"
-                        )
+                bytes_per_frame = self._bytes_per_frame
+                num_frames = (
+                    byte_count // bytes_per_frame if bytes_per_frame > 0 else 0
+                )
+                if num_frames == 0 or byte_count % bytes_per_frame:
+                    raise UnsupportedTapFormatError(
+                        "Audio buffer byte count is not a whole number of "
+                        f"frames: {byte_count} bytes for "
+                        f"{bytes_per_frame}-byte frames"
+                    )
 
-                    bytes_per_frame = self._bytes_per_frame
-                    if bytes_per_frame > 0:
-                        num_frames = byte_count // bytes_per_frame
-                    else:
-                        num_frames = 0
-                    if num_frames == 0 or byte_count % bytes_per_frame:
-                        raise UnsupportedTapFormatError(
-                            "Audio buffer byte count is not a whole number of "
-                            f"frames: {byte_count} bytes for "
-                            f"{bytes_per_frame}-byte frames"
-                        )
+                buf = self._worker.acquire_pool_buffer(byte_count)
+                if buf is None:
+                    self._record_dropped_frames(num_frames)
+                    return 0
 
-                    buf = self._worker.acquire_pool_buffer(byte_count)
-                    if buf is None:
-                        self._record_dropped_frames(num_frames)
-                        continue
+                ctypes.memmove(buf, buffer.mData, byte_count)
 
-                    ctypes.memmove(buf, buffer.mData, byte_count)
-
-                    if self._worker.enqueue_audio_data(
-                        buf,
-                        num_frames,
-                        byte_count,
-                        timing,
-                    ):
-                        self._record_accepted_frames(num_frames)
+                if self._worker.enqueue_audio_data(
+                    buf,
+                    num_frames,
+                    byte_count,
+                    timing,
+                ):
+                    self._record_accepted_frames(num_frames)
 
         except Exception as exc:
             # Must not raise from a Core Audio callback.

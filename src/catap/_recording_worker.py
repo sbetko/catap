@@ -69,6 +69,36 @@ _EMPTY_TIMING_SNAPSHOT = _AudioBufferTimingSnapshot(
 _WorkerItem: TypeAlias = tuple[_PoolBuffer, int, int, _AudioBufferTimingSnapshot] | None
 
 
+class _BoundedAudioQueue:
+    """Non-blocking bounded audio queue optimized for the IOProc producer."""
+
+    __slots__ = ("_available", "_queue")
+
+    def __init__(self, max_pending_items: int) -> None:
+        self._available = threading.BoundedSemaphore(max_pending_items)
+        self._queue: queue.SimpleQueue[_WorkerItem] = queue.SimpleQueue()
+
+    def put_audio_nowait(
+        self,
+        item: tuple[_PoolBuffer, int, int, _AudioBufferTimingSnapshot],
+    ) -> None:
+        if not self._available.acquire(blocking=False):
+            raise queue.Full
+        self._queue.put(item)
+
+    def put_stop(self) -> None:
+        self._queue.put(None)
+
+    def get(self) -> _WorkerItem:
+        item = self._queue.get()
+        if item is not None:
+            self._available.release()
+        return item
+
+    def qsize(self) -> int:
+        return self._queue.qsize()
+
+
 def _public_timestamp(snapshot: _AudioTimestampSnapshot) -> AudioTimestamp:
     return AudioTimestamp(
         sample_time=snapshot.sample_time,
@@ -103,7 +133,7 @@ class _WorkerState:
     """Worker state shared by the RT callback and background thread."""
 
     buffer_pool: queue.SimpleQueue[_PoolBuffer]
-    work_queue: queue.Queue[_WorkerItem]
+    work_queue: _BoundedAudioQueue
     output_file: BinaryIO | None = None
     wav_file: wave.Wave_write | None = None
     pcm_converter: PcmAudioConverter | None = None
@@ -165,7 +195,7 @@ class _AudioWorker:
             return
 
         if state.thread is not None and state.thread.is_alive():
-            state.work_queue.put(None)
+            state.work_queue.put_stop()
 
         if state.thread is not None:
             state.thread.join()
@@ -235,7 +265,7 @@ class _AudioWorker:
             return True
 
         try:
-            state.work_queue.put_nowait((buf, num_frames, byte_count, timing))
+            state.work_queue.put_audio_nowait((buf, num_frames, byte_count, timing))
         except queue.Full:
             self._record_dropped_frames(num_frames)
             state.buffer_pool.put(buf)
@@ -258,7 +288,7 @@ class _AudioWorker:
 
         state = _WorkerState(
             buffer_pool=buffer_pool,
-            work_queue=queue.Queue(maxsize=config.max_pending_buffers),
+            work_queue=_BoundedAudioQueue(config.max_pending_buffers),
         )
 
         with contextlib.ExitStack() as stack:
