@@ -96,8 +96,23 @@ session.record_for(5)
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
 
-If you pass `on_data=...`, the callback runs on `catap`'s background worker
-thread so the Core Audio callback stays lightweight.
+If you pass `on_buffer=...`, the callback runs on `catap`'s background worker
+thread so the Core Audio callback stays lightweight. The callback receives an
+`AudioBuffer` with owned `bytes`, frame count, stream format metadata, and
+Core Audio timing metadata:
+
+```python
+from catap import AudioBuffer, record_process
+
+def on_buffer(buffer: AudioBuffer) -> None:
+    print(buffer.frame_count, buffer.format.sample_rate, buffer.timing.input_time.host_time)
+
+session = record_process("Safari", on_buffer=on_buffer)
+session.record_for(5)
+```
+
+Once recording has started, `session.stream_format` exposes the callback
+`AudioStreamFormat` without waiting for the next buffer.
 
 To control the recording lifetime yourself, use the session as a context
 manager:
@@ -112,7 +127,7 @@ with record_process("Safari", output_path="output.wav", mute=False) as session:
 print(f"Recorded {session.duration_seconds:.2f} seconds")
 ```
 
-For streaming-only mode, pass `on_data=...` and omit `output_path`.
+For streaming-only mode, pass `on_buffer=...` and omit `output_path`.
 
 By default, `catap` queues up to 256 pending audio buffers before treating a
 slow writer or callback as a capture failure. Tune this with

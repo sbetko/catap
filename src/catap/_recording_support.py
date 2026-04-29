@@ -7,6 +7,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypeAlias
 
+from catap.audio_buffer import AudioBuffer
+
 _RecordingFailure: TypeAlias = OSError | RuntimeError
 
 _DEFAULT_MAX_PENDING_BUFFERS = 256
@@ -14,13 +16,13 @@ _DEFAULT_MAX_PENDING_BUFFERS = 256
 
 def _validate_recording_target(
     output_path: str | Path | None,
-    on_data: Callable[[bytes, int], None] | None,
+    on_buffer: Callable[[AudioBuffer], None] | None,
 ) -> Path | None:
     """Normalize the recording target and reject target-less captures."""
     normalized_output_path = Path(output_path) if output_path else None
-    if normalized_output_path is None and on_data is None:
+    if normalized_output_path is None and on_buffer is None:
         raise ValueError(
-            "output_path must be provided unless on_data is set for streaming mode"
+            "output_path must be provided unless on_buffer is set for streaming mode"
         )
     return normalized_output_path
 

@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import BinaryIO, TypeAlias
 
 from catap._recording_support import _combine_errors, _translate_exception
+from catap.audio_buffer import (
+    AudioBuffer,
+    AudioBufferTiming,
+    AudioStreamFormat,
+    AudioTimestamp,
+)
 from catap.bindings._audiotoolbox import (
     PcmAudioConverter,
     make_linear_pcm_asbd,
@@ -25,10 +31,59 @@ from catap.bindings._audiotoolbox import (
 # and the worker's AudioConverter path can consume the ctypes buffers directly
 # without an extra copy.
 _PoolBuffer: TypeAlias = ctypes.Array  # ctypes.c_char * N instance
-_WorkerItem: TypeAlias = tuple[_PoolBuffer, int, int] | None
 _WorkerFailure: TypeAlias = OSError | RuntimeError
 
 _DEFAULT_POOL_BUFFER_SIZE = 4096
+
+
+@dataclass(frozen=True, slots=True)
+class _AudioTimestampSnapshot:
+    """Validity-decoded timestamp fields captured on the IOProc thread."""
+
+    sample_time: float | None
+    host_time: int | None
+    rate_scalar: float | None
+    word_clock_time: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AudioBufferTimingSnapshot:
+    """Timestamp snapshots for one queued callback buffer."""
+
+    now: _AudioTimestampSnapshot
+    input_time: _AudioTimestampSnapshot
+    output_time: _AudioTimestampSnapshot
+
+
+_EMPTY_TIMESTAMP_SNAPSHOT = _AudioTimestampSnapshot(
+    sample_time=None,
+    host_time=None,
+    rate_scalar=None,
+    word_clock_time=None,
+)
+_EMPTY_TIMING_SNAPSHOT = _AudioBufferTimingSnapshot(
+    now=_EMPTY_TIMESTAMP_SNAPSHOT,
+    input_time=_EMPTY_TIMESTAMP_SNAPSHOT,
+    output_time=_EMPTY_TIMESTAMP_SNAPSHOT,
+)
+_WorkerItem: TypeAlias = tuple[_PoolBuffer, int, int, _AudioBufferTimingSnapshot] | None
+
+
+def _public_timestamp(snapshot: _AudioTimestampSnapshot) -> AudioTimestamp:
+    return AudioTimestamp(
+        sample_time=snapshot.sample_time,
+        host_time=snapshot.host_time,
+        rate_scalar=snapshot.rate_scalar,
+        word_clock_time=snapshot.word_clock_time,
+    )
+
+
+def _public_timing(snapshot: _AudioBufferTimingSnapshot) -> AudioBufferTiming:
+    return AudioBufferTiming(
+        now=_public_timestamp(snapshot.now),
+        input_time=_public_timestamp(snapshot.input_time),
+        output_time=_public_timestamp(snapshot.output_time),
+    )
 
 
 @dataclass(slots=True)
@@ -36,11 +91,9 @@ class _WorkerConfig:
     """Immutable worker configuration derived from recorder stream state."""
 
     output_path: Path | None
-    on_data: Callable[[bytes, int], None] | None
+    on_buffer: Callable[[AudioBuffer], None] | None
     max_pending_buffers: int
-    sample_rate: float
-    num_channels: int
-    bits_per_sample: int
+    stream_format: AudioStreamFormat
     output_bits_per_sample: int
     convert_float_output: bool
 
@@ -127,7 +180,7 @@ class _AudioWorker:
                     "Dropped "
                     f"{dropped_buffers} audio buffer(s) "
                     f"({dropped_frames} frame(s)) because the background worker "
-                    "fell behind. Try a faster output path or a lighter on_data "
+                    "fell behind. Try a faster output path or a lighter on_buffer "
                     "callback."
                 )
             )
@@ -174,6 +227,7 @@ class _AudioWorker:
         buf: _PoolBuffer,
         num_frames: int,
         byte_count: int,
+        timing: _AudioBufferTimingSnapshot = _EMPTY_TIMING_SNAPSHOT,
     ) -> bool:
         """Queue audio work without blocking the Core Audio callback thread."""
         state = self._state
@@ -181,7 +235,7 @@ class _AudioWorker:
             return True
 
         try:
-            state.work_queue.put_nowait((buf, num_frames, byte_count))
+            state.work_queue.put_nowait((buf, num_frames, byte_count, timing))
         except queue.Full:
             self._record_dropped_frames(num_frames)
             state.buffer_pool.put(buf)
@@ -191,7 +245,8 @@ class _AudioWorker:
 
     def _create_state(self, config: _WorkerConfig) -> _WorkerState:
         """Create worker-owned queueing state and start the worker thread."""
-        bytes_per_frame = max(1, config.num_channels * (config.bits_per_sample // 8))
+        stream_format = config.stream_format
+        bytes_per_frame = max(1, stream_format.bytes_per_frame)
         pool_buffer_size = max(
             _DEFAULT_POOL_BUFFER_SIZE,
             bytes_per_frame * 1024,
@@ -223,22 +278,22 @@ class _AudioWorker:
 
                 wav_file = wave.open(output_file, "wb")  # noqa: SIM115
                 stack.callback(wav_file.close)
-                wav_file.setnchannels(config.num_channels)
+                wav_file.setnchannels(stream_format.num_channels)
                 wav_file.setsampwidth(config.output_bits_per_sample // 8)
-                wav_file.setframerate(int(config.sample_rate))
+                wav_file.setframerate(int(stream_format.sample_rate))
 
                 pcm_converter: PcmAudioConverter | None = None
                 if config.convert_float_output:
                     pcm_converter = PcmAudioConverter(
                         make_linear_pcm_asbd(
-                            config.sample_rate,
-                            config.num_channels,
-                            config.bits_per_sample,
+                            stream_format.sample_rate,
+                            stream_format.num_channels,
+                            stream_format.bits_per_sample,
                             is_float=True,
                         ),
                         make_linear_pcm_asbd(
-                            config.sample_rate,
-                            config.num_channels,
+                            stream_format.sample_rate,
+                            stream_format.num_channels,
                             config.output_bits_per_sample,
                             is_float=False,
                         ),
@@ -253,7 +308,7 @@ class _AudioWorker:
 
             thread = threading.Thread(
                 target=self._worker_loop,
-                args=(state, config.on_data),
+                args=(state, config.on_buffer, stream_format),
                 name="catap-audio-worker",
                 daemon=False,
             )
@@ -276,7 +331,8 @@ class _AudioWorker:
     def _worker_loop(
         self,
         state: _WorkerState,
-        on_data: Callable[[bytes, int], None] | None,
+        on_buffer: Callable[[AudioBuffer], None] | None,
+        stream_format: AudioStreamFormat,
     ) -> None:
         """Drain queued audio outside the Core Audio callback thread."""
         try:
@@ -285,20 +341,25 @@ class _AudioWorker:
                 if item is None:
                     break
 
-                buf, num_frames, byte_count = item
+                buf, num_frames, byte_count, timing = item
 
                 try:
-                    if on_data is not None and not state.callback_failed:
-                        # User may stash the buffer, so hand them a private copy
-                        # rather than a pool-owned view.
+                    if on_buffer is not None and not state.callback_failed:
                         try:
-                            on_data(bytes(memoryview(buf)[:byte_count]), num_frames)
+                            on_buffer(
+                                AudioBuffer(
+                                    data=bytes(memoryview(buf)[:byte_count]),
+                                    frame_count=num_frames,
+                                    format=stream_format,
+                                    timing=_public_timing(timing),
+                                )
+                            )
                         except Exception as exc:
                             state.callback_failed = True
                             state.failures.append(
                                 _translate_exception(
                                     RuntimeError,
-                                    f"Audio data callback failed: {exc}",
+                                    f"Audio buffer callback failed: {exc}",
                                     exc,
                                 )
                             )

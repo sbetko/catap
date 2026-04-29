@@ -13,7 +13,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-from catap import record_process, record_system_audio
+from catap import AudioBuffer, record_process, record_system_audio
 
 _DROP_RE = re.compile(
     r"Dropped (?P<buffers>\d+) audio buffer\(s\) "
@@ -111,12 +111,12 @@ def run_probe(args: argparse.Namespace) -> LiveProbeResult:
     bytes_seen = 0
     slow_callback_seconds = args.slow_callback_ms / 1000.0
 
-    def on_data(data: bytes, num_frames: int) -> None:
+    def on_buffer(buffer: AudioBuffer) -> None:
         nonlocal frames_seen, bytes_seen
         started = time.perf_counter()
         callback_times.append(started)
-        frames_seen += num_frames
-        bytes_seen += len(data)
+        frames_seen += buffer.frame_count
+        bytes_seen += buffer.byte_count
         if slow_callback_seconds > 0:
             time.sleep(slow_callback_seconds)
         callback_work_times.append(time.perf_counter() - started)
@@ -125,14 +125,14 @@ def run_probe(args: argparse.Namespace) -> LiveProbeResult:
         session = record_process(
             args.process,
             output_path=args.output,
-            on_data=on_data,
+            on_buffer=on_buffer,
             max_pending_buffers=args.max_pending_buffers,
         )
         source = f"process:{args.process}"
     else:
         session = record_system_audio(
             output_path=args.output,
-            on_data=on_data,
+            on_buffer=on_buffer,
             max_pending_buffers=args.max_pending_buffers,
         )
         source = "system"
@@ -146,8 +146,10 @@ def run_probe(args: argparse.Namespace) -> LiveProbeResult:
     try:
         session.start()
         capture_started = time.perf_counter()
-        sample_rate = session.sample_rate
-        num_channels = session.num_channels
+        stream_format = session.stream_format
+        if stream_format is not None:
+            sample_rate = stream_format.sample_rate
+            num_channels = stream_format.num_channels
 
         deadline = capture_started + args.seconds
         while True:
@@ -270,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--slow-callback-ms",
         type=_non_negative_float,
         default=0.0,
-        help="Sleep in on_data for this many milliseconds per buffer",
+        help="Sleep in on_buffer for this many milliseconds per buffer",
     )
     parser.add_argument(
         "--max-pending-buffers",

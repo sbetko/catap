@@ -124,8 +124,7 @@ def test_record_system_audio_smoke(tmp_path) -> None:
     session.record_for(0.2)
 
     assert output_path.exists()
-    assert session.sample_rate is not None
-    assert session.num_channels is not None
+    assert session.stream_format is not None
     assert session.duration_seconds >= 0.0
 
     with wave.open(str(output_path), "rb") as wav_file:

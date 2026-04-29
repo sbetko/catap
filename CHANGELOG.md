@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+- BREAKING: Replaced streaming callbacks from `on_data(data, num_frames)` with
+  `on_buffer(buffer: AudioBuffer)`. The next release should be `0.5.0`, not
+  `0.4.4`.
+- Added callback metadata types: `AudioBuffer`, `AudioStreamFormat`,
+  `AudioTimestamp`, and `AudioBufferTiming`.
+- Added `stream_format` accessors on `AudioRecorder` and `RecordingSession`;
+  use fields such as `stream_format.sample_rate` instead of scalar format
+  convenience properties.
+
+  ```python
+  # Before
+  def on_data(data: bytes, num_frames: int) -> None:
+      ...
+
+  # After
+  def on_buffer(buffer: AudioBuffer) -> None:
+      data = buffer.data
+      num_frames = buffer.frame_count
+  ```
+
 ## [0.4.3] - 2026-04-28
 
 - Tightened README, CLI help, and package metadata around the process-tap support

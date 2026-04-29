@@ -19,6 +19,7 @@ from catap._session_backend import (
     _RecorderLike,
     _SessionBackend,
 )
+from catap.audio_buffer import AudioBuffer, AudioStreamFormat
 from catap.bindings.process import (
     AmbiguousAudioProcessError,
     AudioProcess,
@@ -85,7 +86,7 @@ class RecordingSession:
         self,
         tap_description: TapDescription,
         output_path: str | Path | None = None,
-        on_data: Callable[[bytes, int], None] | None = None,
+        on_buffer: Callable[[AudioBuffer], None] | None = None,
         *,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
         _backend: _SessionBackend | None = None,
@@ -96,22 +97,20 @@ class RecordingSession:
         Args:
             tap_description: Tap description to create when recording starts
             output_path: Path to write a WAV file, or None for streaming mode
-            on_data: Optional callback invoked with ``(raw_bytes, num_frames)``
-                for each captured buffer. The bytes are the tap's native
-                format (typically 32-bit float, little-endian, interleaved);
-                inspect the session's ``sample_rate``, ``num_channels``, and
-                ``is_float`` to interpret them. Runs on catap's background
-                worker thread, not on Core Audio's real-time callback thread.
+            on_buffer: Optional callback invoked with an ``AudioBuffer`` for
+                each captured buffer. The buffer's data is owned and safe to
+                retain. Runs on catap's background worker thread, not on Core
+                Audio's real-time callback thread.
             max_pending_buffers: Maximum number of audio buffers to queue for
                 the background worker before new buffers are dropped and the
                 capture fails on stop. Higher values trade memory for tolerance
-                of slow disk writes or ``on_data`` callbacks.
+                of slow disk writes or ``on_buffer`` callbacks.
         Raises:
-            ValueError: If neither ``output_path`` nor ``on_data`` is provided
+            ValueError: If neither ``output_path`` nor ``on_buffer`` is provided
         """
         self.tap_description = tap_description
-        self.output_path = _validate_recording_target(output_path, on_data)
-        self._on_data = on_data
+        self.output_path = _validate_recording_target(output_path, on_buffer)
+        self._on_buffer = on_buffer
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
         self._backend = _DEFAULT_SESSION_BACKEND if _backend is None else _backend
 
@@ -131,7 +130,7 @@ class RecordingSession:
         output_path: str | Path | None = None,
         *,
         mute: bool = False,
-        on_data: Callable[[bytes, int], None] | None = None,
+        on_buffer: Callable[[AudioBuffer], None] | None = None,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """
@@ -141,7 +140,7 @@ class RecordingSession:
             process: Application name or AudioProcess to record
             output_path: Path to write a WAV file, or None for streaming mode
             mute: Mute app playback while still capturing audio
-            on_data: Optional streaming callback. See ``RecordingSession`` for
+            on_buffer: Optional streaming callback. See ``RecordingSession`` for
                 buffer format and threading details.
             max_pending_buffers: Queue bound for the background worker. See
                 ``RecordingSession`` for details.
@@ -159,7 +158,7 @@ class RecordingSession:
         session = cls(
             tap_description,
             output_path=output_path,
-            on_data=on_data,
+            on_buffer=on_buffer,
             max_pending_buffers=max_pending_buffers,
             _backend=backend,
         )
@@ -172,7 +171,7 @@ class RecordingSession:
         output_path: str | Path | None = None,
         *,
         exclude: Sequence[str | AudioProcess] = (),
-        on_data: Callable[[bytes, int], None] | None = None,
+        on_buffer: Callable[[AudioBuffer], None] | None = None,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """
@@ -181,7 +180,7 @@ class RecordingSession:
         Args:
             output_path: Path to write a WAV file, or None for streaming mode
             exclude: Apps to exclude from the global tap
-            on_data: Optional streaming callback. See ``RecordingSession`` for
+            on_buffer: Optional streaming callback. See ``RecordingSession`` for
                 buffer format and threading details.
             max_pending_buffers: Queue bound for the background worker. See
                 ``RecordingSession`` for details.
@@ -196,7 +195,7 @@ class RecordingSession:
         session = cls(
             tap_description,
             output_path=output_path,
-            on_data=on_data,
+            on_buffer=on_buffer,
             max_pending_buffers=max_pending_buffers,
             _backend=backend,
         )
@@ -209,7 +208,7 @@ class RecordingSession:
         tap: int | AudioTap,
         output_path: str | Path | None = None,
         *,
-        on_data: Callable[[bytes, int], None] | None = None,
+        on_buffer: Callable[[AudioBuffer], None] | None = None,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """Create a managed session that records from an existing tap."""
@@ -225,7 +224,7 @@ class RecordingSession:
         session = cls(
             tap_description,
             output_path=output_path,
-            on_data=on_data,
+            on_buffer=on_buffer,
             max_pending_buffers=max_pending_buffers,
             _backend=backend,
         )
@@ -259,30 +258,16 @@ class RecordingSession:
         return self._recorder.duration_seconds
 
     @property
-    def sample_rate(self) -> float | None:
-        """Sample rate in Hz, once known."""
+    def stream_format(self) -> AudioStreamFormat | None:
+        """Native callback stream format, once known."""
         if self._recorder is None:
             return None
-        return self._recorder.sample_rate
+        return self._recorder.stream_format
 
     @property
     def max_pending_buffers(self) -> int:
         """Maximum number of queued audio buffers before overflow."""
         return self._max_pending_buffers
-
-    @property
-    def num_channels(self) -> int | None:
-        """Number of channels, once known."""
-        if self._recorder is None:
-            return None
-        return self._recorder.num_channels
-
-    @property
-    def is_float(self) -> bool | None:
-        """True if the audio format is float32, once known."""
-        if self._recorder is None:
-            return None
-        return self._recorder.is_float
 
     def start(self) -> None:
         """
@@ -305,7 +290,7 @@ class RecordingSession:
             recorder = self._backend.create_recorder(
                 tap_id,
                 self.output_path,
-                on_data=self._on_data,
+                on_buffer=self._on_buffer,
                 max_pending_buffers=self._max_pending_buffers,
             )
             self._tap_id = tap_id
@@ -438,7 +423,7 @@ def record_process(
     output_path: str | Path | None = None,
     *,
     mute: bool = False,
-    on_data: Callable[[bytes, int], None] | None = None,
+    on_buffer: Callable[[AudioBuffer], None] | None = None,
     max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
@@ -452,7 +437,7 @@ def record_process(
         process,
         output_path=output_path,
         mute=mute,
-        on_data=on_data,
+        on_buffer=on_buffer,
         max_pending_buffers=max_pending_buffers,
     )
 
@@ -461,7 +446,7 @@ def record_system_audio(
     output_path: str | Path | None = None,
     *,
     exclude: Sequence[str | AudioProcess] = (),
-    on_data: Callable[[bytes, int], None] | None = None,
+    on_buffer: Callable[[AudioBuffer], None] | None = None,
     max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
@@ -474,7 +459,7 @@ def record_system_audio(
     return RecordingSession.from_system_audio(
         output_path=output_path,
         exclude=exclude,
-        on_data=on_data,
+        on_buffer=on_buffer,
         max_pending_buffers=max_pending_buffers,
     )
 
@@ -483,7 +468,7 @@ def record_tap(
     tap: int | AudioTap,
     output_path: str | Path | None = None,
     *,
-    on_data: Callable[[bytes, int], None] | None = None,
+    on_buffer: Callable[[AudioBuffer], None] | None = None,
     max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
@@ -495,7 +480,7 @@ def record_tap(
     return RecordingSession.from_tap(
         tap,
         output_path=output_path,
-        on_data=on_data,
+        on_buffer=on_buffer,
         max_pending_buffers=max_pending_buffers,
     )
 

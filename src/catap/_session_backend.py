@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
+from catap.audio_buffer import AudioBuffer, AudioStreamFormat
 from catap.bindings.hardware import create_process_tap, destroy_process_tap
 from catap.bindings.process import AudioProcess, find_process_by_name
 from catap.bindings.tap import get_tap_description
@@ -19,9 +20,7 @@ class _RecorderLike(Protocol):
     is_recording: bool
     frames_recorded: int
     duration_seconds: float
-    sample_rate: float
-    num_channels: int
-    is_float: bool
+    stream_format: AudioStreamFormat | None
 
     def start(self) -> None: ...
 
@@ -55,7 +54,7 @@ class _SessionBackend(Protocol):
         self,
         tap_id: int,
         output_path: Path | None,
-        on_data: Callable[[bytes, int], None] | None = None,
+        on_buffer: Callable[[AudioBuffer], None] | None = None,
         *,
         max_pending_buffers: int,
     ) -> _RecorderLike: ...
@@ -108,14 +107,14 @@ class _CoreAudioSessionBackend:
         self,
         tap_id: int,
         output_path: Path | None,
-        on_data: Callable[[bytes, int], None] | None = None,
+        on_buffer: Callable[[AudioBuffer], None] | None = None,
         *,
         max_pending_buffers: int,
     ) -> AudioRecorder:
         return AudioRecorder(
             tap_id,
             output_path,
-            on_data=on_data,
+            on_buffer=on_buffer,
             max_pending_buffers=max_pending_buffers,
         )
 

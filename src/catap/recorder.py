@@ -14,6 +14,10 @@ from catap._capture_engine import (
     _TapCaptureEngine,
     _TapCaptureSession,
     _TapStreamFormat,
+    kAudioTimeStampHostTimeValid,
+    kAudioTimeStampRateScalarValid,
+    kAudioTimeStampSampleTimeValid,
+    kAudioTimeStampWordClockTimeValid,
 )
 from catap._recording_support import (
     _DEFAULT_MAX_PENDING_BUFFERS,
@@ -24,10 +28,20 @@ from catap._recording_support import (
     _validate_recording_target,
 )
 from catap._recording_worker import (
+    _AudioBufferTimingSnapshot,
+    _AudioTimestampSnapshot,
     _AudioWorker,
     _WorkerConfig,
 )
-from catap.bindings._audiotoolbox import AudioBuffer, kAudioFormatLinearPCM
+from catap.audio_buffer import (
+    AudioBuffer,
+    AudioStreamFormat,
+    _format_id_to_fourcc,
+)
+from catap.bindings._audiotoolbox import (
+    AudioBuffer as _CoreAudioAudioBuffer,
+    kAudioFormatLinearPCM,
+)
 
 
 class UnsupportedTapFormatError(ValueError):
@@ -38,7 +52,7 @@ class AudioRecorder:
     """Record audio from a Core Audio tap.
 
     This recorder reads the tap through a private aggregate device and can
-    write WAV output, call an ``on_data`` callback, or do both.
+    write WAV output, call an ``on_buffer`` callback, or do both.
 
     Usage:
         import time
@@ -63,7 +77,7 @@ class AudioRecorder:
         self,
         tap_id: int,
         output_path: str | Path | None = None,
-        on_data: Callable[[bytes, int], None] | None = None,
+        on_buffer: Callable[[AudioBuffer], None] | None = None,
         *,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> None:
@@ -72,22 +86,20 @@ class AudioRecorder:
         Args:
             tap_id: AudioObjectID of the tap to record from
             output_path: Path to write the WAV file, or None for streaming mode
-            on_data: Optional callback invoked with ``(raw_bytes, num_frames)``
-                for each captured buffer. The bytes are the tap's native format
-                (typically 32-bit float, little-endian, interleaved); inspect
-                ``sample_rate``, ``num_channels``, and ``is_float`` to interpret
-                them. The callback runs on catap's background worker thread, so
+            on_buffer: Optional callback invoked with an ``AudioBuffer`` for
+                each captured buffer. The bytes are owned and safe to retain.
+                The callback runs on catap's background worker thread, so
                 Core Audio's real-time callback stays lightweight.
             max_pending_buffers: Maximum number of audio buffers to queue for
                 the background worker before new buffers are dropped and the
                 capture fails on stop. Higher values trade memory for tolerance
-                of slow disk writes or ``on_data`` callbacks.
+                of slow disk writes or ``on_buffer`` callbacks.
         Raises:
-            ValueError: If neither ``output_path`` nor ``on_data`` is provided
+            ValueError: If neither ``output_path`` nor ``on_buffer`` is provided
         """
         self.tap_id = tap_id
-        self.output_path = _validate_recording_target(output_path, on_data)
-        self._on_data = on_data
+        self.output_path = _validate_recording_target(output_path, on_buffer)
+        self._on_buffer = on_buffer
 
         self._capture_engine = _TapCaptureEngine()
         self._capture_session: _TapCaptureSession | None = None
@@ -115,6 +127,7 @@ class AudioRecorder:
         self._output_bits_per_sample = 32
         self._convert_float_output = True
         self._is_float = True
+        self._stream_format: AudioStreamFormat | None = None
 
         # Keep reference to callback to prevent garbage collection.
         self._callback = AudioDeviceIOProcType(self._io_proc)
@@ -134,6 +147,13 @@ class AudioRecorder:
             )
         )
         self._is_float = stream_format.is_float
+        self._stream_format = AudioStreamFormat(
+            sample_rate=self._sample_rate,
+            num_channels=self._num_channels,
+            bits_per_sample=self._bits_per_sample,
+            sample_type="float" if self._is_float else "signed_integer",
+            format_id=_format_id_to_fourcc(stream_format.format_id),
+        )
 
     @staticmethod
     def _packed_bytes_per_frame(num_channels: int, bits_per_sample: int) -> int:
@@ -212,13 +232,15 @@ class AudioRecorder:
 
     def _make_worker_config(self) -> _WorkerConfig:
         """Build worker configuration from the current stream format."""
+        stream_format = self._stream_format
+        if stream_format is None:
+            raise RuntimeError("Stream format is not known until recording starts")
+
         return _WorkerConfig(
             output_path=self.output_path,
-            on_data=self._on_data,
+            on_buffer=self._on_buffer,
             max_pending_buffers=self._max_pending_buffers,
-            sample_rate=self._sample_rate,
-            num_channels=self._num_channels,
-            bits_per_sample=self._bits_per_sample,
+            stream_format=stream_format,
             output_bits_per_sample=self._output_bits_per_sample,
             convert_float_output=self._convert_float_output,
         )
@@ -275,6 +297,42 @@ class AudioRecorder:
             )
         return failure
 
+    @staticmethod
+    def _timestamp_snapshot(timestamp: AudioTimeStampPtr) -> _AudioTimestampSnapshot:
+        """Copy validity-decoded timestamp fields off the Core Audio pointer."""
+        if not timestamp:
+            return _AudioTimestampSnapshot(
+                sample_time=None,
+                host_time=None,
+                rate_scalar=None,
+                word_clock_time=None,
+            )
+
+        value = timestamp.contents
+        flags = value.mFlags
+        return _AudioTimestampSnapshot(
+            sample_time=(
+                value.mSampleTime
+                if flags & kAudioTimeStampSampleTimeValid
+                else None
+            ),
+            host_time=(
+                value.mHostTime
+                if flags & kAudioTimeStampHostTimeValid
+                else None
+            ),
+            rate_scalar=(
+                value.mRateScalar
+                if flags & kAudioTimeStampRateScalarValid
+                else None
+            ),
+            word_clock_time=(
+                value.mWordClockTime
+                if flags & kAudioTimeStampWordClockTimeValid
+                else None
+            ),
+        )
+
     def _io_proc(
         self,
         device: int,
@@ -303,14 +361,19 @@ class AudioRecorder:
                     "Unsupported AudioBufferList layout: expected one "
                     f"interleaved buffer, got {num_buffers}"
                 )
+            timing = _AudioBufferTimingSnapshot(
+                now=self._timestamp_snapshot(now),
+                input_time=self._timestamp_snapshot(input_time),
+                output_time=self._timestamp_snapshot(output_time),
+            )
 
             for i in range(num_buffers):
                 # AudioBufferList has a variable-length mBuffers array; index
                 # past the first slot via pointer arithmetic.
-                buffer_offset = ctypes.sizeof(AudioBuffer) * i
+                buffer_offset = ctypes.sizeof(_CoreAudioAudioBuffer) * i
                 buffer_ptr = ctypes.cast(
                     ctypes.addressof(buffer_list.mBuffers) + buffer_offset,
-                    ctypes.POINTER(AudioBuffer),
+                    ctypes.POINTER(_CoreAudioAudioBuffer),
                 )
                 buffer = buffer_ptr.contents
 
@@ -349,6 +412,7 @@ class AudioRecorder:
                         buf,
                         num_frames,
                         byte_count,
+                        timing,
                     ):
                         self._record_accepted_frames(num_frames)
 
@@ -491,21 +555,11 @@ class AudioRecorder:
         return total_frames / self._sample_rate
 
     @property
-    def sample_rate(self) -> float:
-        """Sample rate in Hz."""
-        return self._sample_rate
+    def stream_format(self) -> AudioStreamFormat | None:
+        """Native callback stream format, once the tap has been described."""
+        return self._stream_format
 
     @property
     def max_pending_buffers(self) -> int:
         """Maximum number of queued audio buffers before overflow."""
         return self._max_pending_buffers
-
-    @property
-    def num_channels(self) -> int:
-        """Number of audio channels."""
-        return self._num_channels
-
-    @property
-    def is_float(self) -> bool:
-        """True if audio format is float32."""
-        return self._is_float

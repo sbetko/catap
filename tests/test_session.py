@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 
 import catap.session as session_module
+from catap.audio_buffer import AudioStreamFormat
 from catap.bindings.process import AmbiguousAudioProcessError, AudioProcess
 from catap.bindings.tap import AudioTap, AudioTapNotFoundError
 from catap.bindings.tap_description import TapDescription
@@ -36,22 +37,26 @@ class _FakeRecorder:
         self,
         tap_id: int,
         output_path: Path | None,
-        on_data: object = None,
+        on_buffer: object = None,
         *,
         max_pending_buffers: int = 256,
     ) -> None:
         self.tap_id = tap_id
         self.output_path = output_path
-        self.on_data = on_data
+        self.on_buffer = on_buffer
         self.max_pending_buffers = max_pending_buffers
         self.is_recording = False
         self.start_calls = 0
         self.stop_calls = 0
         self.frames_recorded = 24_000
         self.duration_seconds = 0.5
-        self.sample_rate = 48_000.0
-        self.num_channels = 2
-        self.is_float = True
+        self.stream_format = AudioStreamFormat(
+            sample_rate=48_000.0,
+            num_channels=2,
+            bits_per_sample=32,
+            sample_type="float",
+            format_id="lpcm",
+        )
 
     def start(self) -> None:
         self.start_calls += 1
@@ -156,14 +161,14 @@ class _FakeSessionBackend:
         self,
         tap_id: int,
         output_path: Path | None,
-        on_data: object = None,
+        on_buffer: object = None,
         *,
         max_pending_buffers: int = 256,
     ) -> _FakeRecorder:
         recorder = self.recorder_cls(
             tap_id,
             output_path,
-            on_data,
+            on_buffer,
             max_pending_buffers=max_pending_buffers,
         )
         self.created_recorders.append(recorder)
@@ -215,6 +220,22 @@ def test_record_process_context_manager_manages_lifecycle(
     assert recorder.start_calls == 1
     assert recorder.stop_calls == 1
     assert destroyed_tap_ids == [77]
+
+
+def test_recording_session_exposes_stream_format_once_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    backend = _FakeSessionBackend(process_lookup={"Music": process})
+    _install_backend(monkeypatch, backend)
+
+    session = session_module.record_process("Music", output_path="recording.wav")
+
+    assert session.stream_format is None
+
+    with session:
+        recorder = backend.created_recorders[0]
+        assert session.stream_format is recorder.stream_format
 
 
 def test_record_process_raises_for_missing_process_name(
@@ -384,7 +405,7 @@ def test_record_for_rejects_non_positive_duration() -> None:
 def test_recording_session_requires_output_path_or_callback() -> None:
     with pytest.raises(
         ValueError,
-        match="output_path must be provided unless on_data is set for streaming mode",
+        match="output_path must be provided unless on_buffer is set for streaming mode",
     ):
         session_module.RecordingSession(cast(TapDescription, _FakeTapDescription([42])))
 

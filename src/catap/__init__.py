@@ -23,6 +23,12 @@ if _macos_version_tuple < (14, 2):
         f"catap requires macOS 14.2 or later. Detected macOS {_macos_version}."
     )
 
+from catap.audio_buffer import (
+    AudioBuffer,
+    AudioBufferTiming,
+    AudioStreamFormat,
+    AudioTimestamp,
+)
 from catap.bindings.device import (
     AmbiguousAudioDeviceError,
     AudioDevice,
@@ -62,13 +68,17 @@ except PackageNotFoundError:
 __all__ = [
     "AmbiguousAudioDeviceError",
     "AmbiguousAudioProcessError",
+    "AudioBuffer",
+    "AudioBufferTiming",
     "AudioDevice",
     "AudioDeviceStream",
     "AudioProcess",
     "AudioProcessNotFoundError",
     "AudioRecorder",
+    "AudioStreamFormat",
     "AudioTap",
     "AudioTapNotFoundError",
+    "AudioTimestamp",
     "RecordingSession",
     "TapDescription",
     "TapMuteBehavior",

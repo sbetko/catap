@@ -54,6 +54,10 @@ else:
 
 kAudioTapPropertyUID = int.from_bytes(b"tuid", "big")
 kAudioTapPropertyFormat = int.from_bytes(b"tfmt", "big")
+kAudioTimeStampSampleTimeValid = 1 << 0
+kAudioTimeStampHostTimeValid = 1 << 1
+kAudioTimeStampRateScalarValid = 1 << 2
+kAudioTimeStampWordClockTimeValid = 1 << 3
 
 
 AudioDeviceIOProcType = ctypes.CFUNCTYPE(

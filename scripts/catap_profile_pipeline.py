@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from catap._recording_worker import _AudioWorker, _WorkerConfig
+from catap.audio_buffer import AudioBuffer, AudioStreamFormat
 from catap.bindings._audiotoolbox import PcmAudioConverter, make_linear_pcm_asbd
 
 
@@ -147,7 +148,7 @@ def profile_worker(
     channels: int,
     max_pending_buffers: int,
     output_path: Path | None,
-    on_data: Callable[[bytes, int], None] | None,
+    on_buffer: Callable[[AudioBuffer], None] | None,
     convert_float_output: bool,
     pace_seconds: float | None = None,
 ) -> ProfileResult:
@@ -169,11 +170,15 @@ def profile_worker(
     )
     config = _WorkerConfig(
         output_path=output_path,
-        on_data=on_data,
+        on_buffer=on_buffer,
         max_pending_buffers=max_pending_buffers,
-        sample_rate=sample_rate,
-        num_channels=channels,
-        bits_per_sample=32,
+        stream_format=AudioStreamFormat(
+            sample_rate=sample_rate,
+            num_channels=channels,
+            bits_per_sample=32,
+            sample_type="float",
+            format_id="lpcm",
+        ),
         output_bits_per_sample=16 if convert_float_output else 32,
         convert_float_output=convert_float_output,
     )
@@ -236,9 +241,9 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
 
     callback_bytes = 0
 
-    def on_data(data: bytes, _num_frames: int) -> None:
+    def on_buffer(buffer: AudioBuffer) -> None:
         nonlocal callback_bytes
-        callback_bytes += len(data)
+        callback_bytes += buffer.byte_count
 
     results.append(
         profile_worker(
@@ -250,7 +255,7 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
             channels=args.channels,
             max_pending_buffers=max_pending_buffers,
             output_path=None,
-            on_data=on_data,
+            on_buffer=on_buffer,
             convert_float_output=False,
         )
     )
@@ -266,7 +271,7 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
                 channels=args.channels,
                 max_pending_buffers=max_pending_buffers,
                 output_path=Path(tmpdir) / "profile.wav",
-                on_data=None,
+                on_buffer=None,
                 convert_float_output=True,
             )
         )
@@ -275,8 +280,8 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
         delay_seconds = args.slow_callback_ms / 1000.0
         audio_buffer_seconds = args.buffer_frames / args.sample_rate
 
-        def slow_on_data(data: bytes, _num_frames: int) -> None:
-            del data
+        def slow_on_buffer(buffer: AudioBuffer) -> None:
+            del buffer
             time.sleep(delay_seconds)
 
         results.append(
@@ -289,7 +294,7 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
                 channels=args.channels,
                 max_pending_buffers=args.slow_max_pending_buffers,
                 output_path=None,
-                on_data=slow_on_data,
+                on_buffer=slow_on_buffer,
                 convert_float_output=False,
                 pace_seconds=audio_buffer_seconds,
             )
@@ -306,7 +311,7 @@ def run_profiles(args: argparse.Namespace) -> list[ProfileResult]:
                     channels=args.channels,
                     max_pending_buffers=args.slow_max_pending_buffers,
                     output_path=None,
-                    on_data=slow_on_data,
+                    on_buffer=slow_on_buffer,
                     convert_float_output=False,
                 )
             )

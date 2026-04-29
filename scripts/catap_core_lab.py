@@ -20,6 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import catap
 from catap import (
+    AudioBuffer,
     AudioDevice,
     AudioDeviceStream,
     AudioProcess,
@@ -362,7 +363,7 @@ def _fmt_tap_label(tap: AudioTap) -> str:
 
 
 class Telemetry:
-    """Thread-safe counters for the streaming ``on_data`` callback."""
+    """Thread-safe counters for the streaming ``on_buffer`` callback."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -374,11 +375,11 @@ class Telemetry:
             self.bytes = 0
             self.frames = 0
 
-    def callback(self, data: bytes, num_frames: int) -> None:
+    def callback(self, buffer: AudioBuffer) -> None:
         with self._lock:
             self.buffers += 1
-            self.bytes += len(data)
-            self.frames += num_frames
+            self.bytes += buffer.byte_count
+            self.frames += buffer.frame_count
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
@@ -1583,14 +1584,14 @@ class CoreLabApp:
             max_pending = 256
 
         self.telemetry.reset()
-        on_data = self.telemetry.callback if self.enable_callback.get() else None
+        on_buffer = self.telemetry.callback if self.enable_callback.get() else None
         self.playback_helper.stop(silent=True)
 
         try:
             recorder = AudioRecorder(
                 tap_id=self.active_tap_id,
                 output_path=output_path,
-                on_data=on_data,
+                on_buffer=on_buffer,
                 max_pending_buffers=max_pending,
             )
             recorder.start()

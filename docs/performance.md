@@ -2,8 +2,8 @@
 
 The Core Audio callback runs on a real-time thread and has to return quickly.
 It copies each incoming buffer into a pool-owned ctypes buffer and enqueues it
-for the background worker. It does not call user code, write files, allocate
-in the steady state, or wait for the worker. User callbacks and WAV writes
+for the background worker with decoded scalar timing metadata. It does not call
+user code, write files, or wait for the worker. User callbacks and WAV writes
 run on the `catap-audio-worker` thread.
 
 ## Queueing
@@ -24,8 +24,10 @@ recorder state — frame counters, callback failures — uses explicit locks.
 - If Core Audio delivers a buffer larger than the pool's current buffer size,
   the callback resizes that pool buffer in place. This should be rare after
   startup, but it is an allocation on the callback thread.
-- `on_data` receives a private `bytes` copy, so user code can hold onto it
-  after the pool buffer is reused.
+- The callback creates small Python queue and timing records per accepted
+  buffer; audio payload storage itself is pool-owned in the steady state.
+- `on_buffer` receives an `AudioBuffer` whose `data` is owned immutable
+  `bytes`, so user code can hold onto it after the pool buffer is reused.
 - Default queue depth is 256 buffers. Larger values tolerate slower sinks at
   the cost of more memory and slower failure reporting.
 - Callback exceptions are never raised into Core Audio. The first failure is

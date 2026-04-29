@@ -15,8 +15,14 @@ import pytest
 
 import catap._capture_engine as capture_module
 import catap._recording_worker as worker_module
+from catap.audio_buffer import (
+    AudioBuffer as PublicAudioBuffer,
+    AudioStreamFormat,
+    SampleType,
+    _format_id_to_fourcc,
+)
 from catap.bindings._audiotoolbox import (
-    AudioBuffer,
+    AudioBuffer as CoreAudioBuffer,
     AudioBufferList,
     AudioStreamBasicDescription,
     kAudioFormatFlagIsFloat,
@@ -59,24 +65,31 @@ def _make_worker(
 def _make_worker_config(
     *,
     output_path: Path | None = None,
-    on_data: Callable[[bytes, int], None] | None = None,
+    on_buffer: Callable[[PublicAudioBuffer], None] | None = None,
     max_pending_buffers: int = 256,
     sample_rate: float = 44_100.0,
     num_channels: int = 2,
     bits_per_sample: int = 16,
+    sample_type: SampleType | None = None,
     output_bits_per_sample: int | None = None,
     convert_float_output: bool = False,
 ) -> worker_module._WorkerConfig:
     if output_bits_per_sample is None:
         output_bits_per_sample = bits_per_sample
+    if sample_type is None:
+        sample_type = "float" if convert_float_output else "signed_integer"
 
     return worker_module._WorkerConfig(
         output_path=output_path,
-        on_data=on_data,
+        on_buffer=on_buffer,
         max_pending_buffers=max_pending_buffers,
-        sample_rate=sample_rate,
-        num_channels=num_channels,
-        bits_per_sample=bits_per_sample,
+        stream_format=AudioStreamFormat(
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+            bits_per_sample=bits_per_sample,
+            sample_type=sample_type,
+            format_id="lpcm",
+        ),
         output_bits_per_sample=output_bits_per_sample,
         convert_float_output=convert_float_output,
     )
@@ -88,7 +101,7 @@ def _audio_buffer_list_pointer(
     class _TestAudioBufferList(ctypes.Structure):
         _fields_ = [
             ("mNumberBuffers", ctypes.c_uint32),
-            ("mBuffers", AudioBuffer * len(buffers)),
+            ("mBuffers", CoreAudioBuffer * len(buffers)),
         ]
 
     buffer_list = _TestAudioBufferList()
@@ -108,9 +121,27 @@ def _audio_buffer_list_pointer(
     )
 
 
+def _timestamp_pointer(
+    *,
+    flags: int,
+    sample_time: float = 10.0,
+    host_time: int = 20,
+    rate_scalar: float = 1.0,
+    word_clock_time: int = 30,
+) -> tuple[Any, object]:
+    timestamp = capture_module.AudioTimeStamp()
+    timestamp.mSampleTime = sample_time
+    timestamp.mHostTime = host_time
+    timestamp.mRateScalar = rate_scalar
+    timestamp.mWordClockTime = word_clock_time
+    timestamp.mFlags = flags
+    return ctypes.pointer(timestamp), timestamp
+
+
 class _CapturingWorker:
     def __init__(self) -> None:
         self.enqueued: list[tuple[bytes, int, int]] = []
+        self.timings: list[worker_module._AudioBufferTimingSnapshot] = []
         self.pool_buffers: list[ctypes.Array] = []
 
     def acquire_pool_buffer(self, needed: int) -> ctypes.Array:
@@ -123,17 +154,19 @@ class _CapturingWorker:
         buf: ctypes.Array,
         num_frames: int,
         byte_count: int,
+        timing: worker_module._AudioBufferTimingSnapshot,
     ) -> bool:
         self.enqueued.append(
             (bytes(memoryview(buf)[:byte_count]), num_frames, byte_count)
         )
+        self.timings.append(timing)
         return True
 
 
 def _recording_recorder_with_worker(
     fake_worker: _CapturingWorker,
 ) -> AudioRecorder:
-    recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     recorder._worker = cast(Any, fake_worker)
     recorder._is_recording = True
     recorder._lifecycle_state = "recording"
@@ -210,7 +243,7 @@ def test_start_worker_raises_cleanly_for_missing_output_directory(tmp_path) -> N
 def test_recorder_requires_output_path_or_callback() -> None:
     with pytest.raises(
         ValueError,
-        match="output_path must be provided unless on_data is set for streaming mode",
+        match="output_path must be provided unless on_buffer is set for streaming mode",
     ):
         AudioRecorder(123)
 
@@ -226,18 +259,96 @@ def test_recorder_rejects_non_integer_max_pending_buffers(value: object) -> None
         AudioRecorder(123, "recording.wav", max_pending_buffers=cast(Any, value))
 
 
+def test_format_id_to_fourcc_decodes_core_audio_format_ids() -> None:
+    assert _format_id_to_fourcc(int.from_bytes(b"lpcm", "big")) == "lpcm"
+    assert _format_id_to_fourcc(int.from_bytes(b"alac", "big")) == "alac"
+
+
+def test_recorder_stream_format_is_unknown_until_tap_is_described() -> None:
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+
+    assert recorder.stream_format is None
+    with pytest.raises(RuntimeError, match="Stream format is not known"):
+        recorder._make_worker_config()
+
+    recorder._apply_stream_format(
+        capture_module._TapStreamFormat(
+            sample_rate=48_000.0,
+            num_channels=2,
+            bits_per_sample=32,
+            is_float=True,
+            bytes_per_frame=8,
+            format_id=kAudioFormatLinearPCM,
+            is_signed_integer=False,
+        )
+    )
+
+    stream_format = recorder.stream_format
+    assert stream_format == AudioStreamFormat(
+        sample_rate=48_000.0,
+        num_channels=2,
+        bits_per_sample=32,
+        sample_type="float",
+        format_id="lpcm",
+    )
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        (
+            capture_module.kAudioTimeStampSampleTimeValid,
+            (10.0, None, None, None),
+        ),
+        (
+            capture_module.kAudioTimeStampHostTimeValid,
+            (None, 20, None, None),
+        ),
+        (0, (None, None, None, None)),
+        (
+            capture_module.kAudioTimeStampSampleTimeValid
+            | capture_module.kAudioTimeStampHostTimeValid
+            | capture_module.kAudioTimeStampRateScalarValid
+            | capture_module.kAudioTimeStampWordClockTimeValid,
+            (10.0, 20, 1.0, 30),
+        ),
+    ],
+)
+def test_timestamp_snapshot_decodes_validity_flags(
+    flags: int,
+    expected: tuple[float | None, int | None, float | None, int | None],
+) -> None:
+    timestamp, _keepalive = _timestamp_pointer(flags=flags)
+
+    snapshot = AudioRecorder._timestamp_snapshot(timestamp)
+
+    assert (
+        snapshot.sample_time,
+        snapshot.host_time,
+        snapshot.rate_scalar,
+        snapshot.word_clock_time,
+    ) == expected
+
+
 def test_worker_invokes_callback_off_thread() -> None:
     callback_threads: list[str] = []
     callback_event = threading.Event()
 
-    def on_data(data: bytes, num_frames: int) -> None:
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
         callback_threads.append(threading.current_thread().name)
-        assert data == b"\x01\x02"
-        assert num_frames == 1
+        assert buffer.data == b"\x01\x02"
+        assert buffer.frame_count == 1
+        assert buffer.byte_count == 2
+        assert buffer.duration_seconds == pytest.approx(1 / 44_100)
+        assert buffer.format.format_id == "lpcm"
+        assert buffer.format.bytes_per_frame == 4
+        assert buffer.format.is_signed_integer is True
+        assert buffer.format.is_float is False
+        assert buffer.timing.input_time.sample_time is None
         callback_event.set()
 
     worker = _make_worker()
-    config = _make_worker_config(on_data=on_data)
+    config = _make_worker_config(on_buffer=on_buffer)
     worker.start(config)
 
     buf = (ctypes.c_char * 2).from_buffer_copy(b"\x01\x02")
@@ -249,9 +360,72 @@ def test_worker_invokes_callback_off_thread() -> None:
     assert callback_threads == ["catap-audio-worker"]
 
 
+def test_worker_exposes_buffer_timing_and_reuses_stream_format() -> None:
+    received: list[PublicAudioBuffer] = []
+    callback_event = threading.Event()
+
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
+        received.append(buffer)
+        if len(received) == 2:
+            callback_event.set()
+
+    worker = _make_worker()
+    config = _make_worker_config(
+        on_buffer=on_buffer,
+        sample_rate=48_000,
+        bits_per_sample=32,
+        sample_type="float",
+        max_pending_buffers=4,
+    )
+    worker.start(config)
+
+    timing = worker_module._AudioBufferTimingSnapshot(
+        now=worker_module._AudioTimestampSnapshot(
+            sample_time=None,
+            host_time=100,
+            rate_scalar=None,
+            word_clock_time=None,
+        ),
+        input_time=worker_module._AudioTimestampSnapshot(
+            sample_time=200.5,
+            host_time=300,
+            rate_scalar=1.0,
+            word_clock_time=400,
+        ),
+        output_time=worker_module._AudioTimestampSnapshot(
+            sample_time=None,
+            host_time=None,
+            rate_scalar=None,
+            word_clock_time=None,
+        ),
+    )
+    for payload in (b"\x01\x02\x03\x04", b"\x05\x06\x07\x08"):
+        buf = (ctypes.c_char * len(payload)).from_buffer_copy(payload)
+        assert worker.enqueue_audio_data(buf, 1, len(payload), timing) is True
+
+    assert callback_event.wait(timeout=1)
+    worker.stop()
+
+    assert [buffer.data for buffer in received] == [
+        b"\x01\x02\x03\x04",
+        b"\x05\x06\x07\x08",
+    ]
+    assert all(isinstance(buffer.data, bytes) for buffer in received)
+    assert received[0].format is received[1].format
+    assert received[0].format.format_id == "lpcm"
+    assert received[0].format.is_float is True
+    assert received[0].format.bytes_per_frame == 8
+    assert received[0].timing.now.host_time == 100
+    assert received[0].timing.input_time.sample_time == 200.5
+    assert received[0].timing.input_time.host_time == 300
+    assert received[0].timing.input_time.rate_scalar == 1.0
+    assert received[0].timing.input_time.word_clock_time == 400
+    assert received[0].timing.output_time.host_time is None
+
+
 def test_worker_thread_is_non_daemon() -> None:
     worker = _make_worker()
-    config = _make_worker_config(on_data=lambda data, num_frames: None)
+    config = _make_worker_config(on_buffer=lambda buffer: None)
     worker.start(config)
 
     assert worker.thread is not None
@@ -270,19 +444,19 @@ def test_worker_buffer_pool_handles_concurrent_producers() -> None:
     producer_errors: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
     dropped_frames: list[int] = []
 
-    def on_data(data: bytes, num_frames: int) -> None:
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
         nonlocal received_frames
-        assert data == payload
-        assert num_frames == 1
+        assert buffer.data == payload
+        assert buffer.frame_count == 1
         with received_lock:
-            received_frames += num_frames
+            received_frames += buffer.frame_count
 
     worker = _make_worker(
         record_dropped_frames=dropped_frames.append,
         consume_dropped_stats=lambda: (len(dropped_frames), sum(dropped_frames)),
     )
     config = _make_worker_config(
-        on_data=on_data,
+        on_buffer=on_buffer,
         max_pending_buffers=expected_frames,
     )
     worker.start(config)
@@ -330,8 +504,8 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
     allow_callback_to_finish = threading.Event()
     dropped_frames: list[int] = []
 
-    def on_data(data: bytes, num_frames: int) -> None:
-        del data, num_frames
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
+        del buffer
         callback_started.set()
         assert allow_callback_to_finish.wait(timeout=1)
 
@@ -339,7 +513,7 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
         record_dropped_frames=dropped_frames.append,
         consume_dropped_stats=lambda: (len(dropped_frames), sum(dropped_frames)),
     )
-    config = _make_worker_config(on_data=on_data, max_pending_buffers=1)
+    config = _make_worker_config(on_buffer=on_buffer, max_pending_buffers=1)
     worker.start(config)
 
     buf_type = ctypes.c_char * 2
@@ -386,7 +560,7 @@ def test_stop_reports_core_audio_cleanup_failures(
         capture_module, "_destroy_aggregate_device", destroy_aggregate_device
     )
 
-    recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     recorder._is_recording = True
     recorder._lifecycle_state = "recording"
     recorder._capture_session = capture_module._TapCaptureSession(
@@ -598,13 +772,13 @@ def test_start_worker_failure_closes_resources_without_join(
 def test_stop_preserves_callback_failure_cause() -> None:
     callback_seen = threading.Event()
 
-    def on_data(data: bytes, num_frames: int) -> None:
-        del data, num_frames
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
+        del buffer
         callback_seen.set()
         raise ValueError("boom")
 
     worker = _make_worker()
-    config = _make_worker_config(on_data=on_data)
+    config = _make_worker_config(on_buffer=on_buffer)
     worker.start(config)
 
     buf = (ctypes.c_char * 2).from_buffer_copy(b"\x01\x02")
@@ -613,7 +787,7 @@ def test_stop_preserves_callback_failure_cause() -> None:
 
     with pytest.raises(
         RuntimeError,
-        match="Audio data callback failed: boom",
+        match="Audio buffer callback failed: boom",
     ) as exc_info:
         worker.stop()
 
@@ -695,7 +869,7 @@ def test_stop_preserves_finalize_failure_cause(
 
 
 def test_io_proc_failure_is_reported_on_stop() -> None:
-    recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     recorder._is_recording = True
     recorder._lifecycle_state = "recording"
 
@@ -888,6 +1062,52 @@ def test_io_proc_copies_single_interleaved_buffer_to_worker() -> None:
     assert recorder.frames_recorded == 2
 
 
+def test_io_proc_queues_decoded_timing_metadata() -> None:
+    fake_worker = _CapturingWorker()
+    recorder = _recording_recorder_with_worker(fake_worker)
+    data = struct.pack("<2h", 1, 2)
+    input_data, keepalive = _audio_buffer_list_pointer((data, 2))
+    now, now_keepalive = _timestamp_pointer(
+        flags=capture_module.kAudioTimeStampHostTimeValid,
+        host_time=111,
+    )
+    input_time, input_keepalive = _timestamp_pointer(
+        flags=(
+            capture_module.kAudioTimeStampSampleTimeValid
+            | capture_module.kAudioTimeStampHostTimeValid
+            | capture_module.kAudioTimeStampRateScalarValid
+            | capture_module.kAudioTimeStampWordClockTimeValid
+        ),
+        sample_time=222.5,
+        host_time=333,
+        rate_scalar=1.25,
+        word_clock_time=444,
+    )
+    output_time, output_keepalive = _timestamp_pointer(flags=0)
+    keepalive.extend([now_keepalive, input_keepalive, output_keepalive])
+
+    status = recorder._io_proc(
+        0,
+        now,
+        input_data,
+        input_time,
+        cast(Any, None),
+        output_time,
+        cast(Any, None),
+    )
+
+    assert status == 0
+    timing = fake_worker.timings[0]
+    assert timing.now.host_time == 111
+    assert timing.now.sample_time is None
+    assert timing.input_time.sample_time == 222.5
+    assert timing.input_time.host_time == 333
+    assert timing.input_time.rate_scalar == 1.25
+    assert timing.input_time.word_clock_time == 444
+    assert timing.output_time.sample_time is None
+    assert timing.output_time.host_time is None
+
+
 def test_io_proc_reports_multi_buffer_layout_instead_of_writing_planar_audio() -> None:
     fake_worker = _CapturingWorker()
     recorder = _recording_recorder_with_worker(fake_worker)
@@ -984,7 +1204,7 @@ def test_io_proc_reports_missing_channel_count_instead_of_guessing() -> None:
 
 
 def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:
-    recorder = AudioRecorder(123, on_data=lambda data, num_frames: None)
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     total_updates = 2_000
     started = threading.Event()
 
