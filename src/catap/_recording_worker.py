@@ -12,7 +12,7 @@ import wave
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, TypeAlias
+from typing import BinaryIO, TypeAlias, cast
 
 from catap._recording_support import _combine_errors, _translate_exception
 from catap.audio_buffer import (
@@ -348,7 +348,7 @@ class _AudioWorker:
                         try:
                             on_buffer(
                                 AudioBuffer(
-                                    data=bytes(memoryview(buf)[:byte_count]),
+                                    data=cast(bytes, buf[:byte_count]),
                                     frame_count=num_frames,
                                     format=stream_format,
                                     timing=_public_timing(timing),
