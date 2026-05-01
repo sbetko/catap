@@ -17,9 +17,7 @@ from typing import BinaryIO, TypeAlias, cast
 from catap._recording_support import _combine_errors, _translate_exception
 from catap.audio_buffer import (
     AudioBuffer,
-    AudioBufferTiming,
     AudioStreamFormat,
-    AudioTimestamp,
 )
 from catap.bindings._audiotoolbox import (
     PcmAudioConverter,
@@ -36,37 +34,31 @@ _WorkerFailure: TypeAlias = OSError | RuntimeError
 _DEFAULT_POOL_BUFFER_SIZE = 4096
 
 
-@dataclass(frozen=True, slots=True)
-class _AudioTimestampSnapshot:
-    """Validity-decoded timestamp fields captured on the IOProc thread."""
+@dataclass(slots=True)
+class _AudioWorkItem:
+    """Reusable queue item carrying one callback buffer to the worker."""
 
-    sample_time: float | None
-    host_time: int | None
-    rate_scalar: float | None
-    word_clock_time: int | None
+    buffer: _PoolBuffer
+    num_frames: int = 0
+    byte_count: int = 0
+    input_sample_time: float | None = None
 
+    def ensure_capacity(self, byte_count: int) -> None:
+        if len(self.buffer) < byte_count:
+            self.buffer = (ctypes.c_char * byte_count)()
 
-@dataclass(frozen=True, slots=True)
-class _AudioBufferTimingSnapshot:
-    """Timestamp snapshots for one queued callback buffer."""
+    def prepare(
+        self,
+        *,
+        num_frames: int,
+        byte_count: int,
+        input_sample_time: float | None,
+    ) -> None:
+        self.num_frames = num_frames
+        self.byte_count = byte_count
+        self.input_sample_time = input_sample_time
 
-    now: _AudioTimestampSnapshot
-    input_time: _AudioTimestampSnapshot
-    output_time: _AudioTimestampSnapshot
-
-
-_EMPTY_TIMESTAMP_SNAPSHOT = _AudioTimestampSnapshot(
-    sample_time=None,
-    host_time=None,
-    rate_scalar=None,
-    word_clock_time=None,
-)
-_EMPTY_TIMING_SNAPSHOT = _AudioBufferTimingSnapshot(
-    now=_EMPTY_TIMESTAMP_SNAPSHOT,
-    input_time=_EMPTY_TIMESTAMP_SNAPSHOT,
-    output_time=_EMPTY_TIMESTAMP_SNAPSHOT,
-)
-_WorkerItem: TypeAlias = tuple[_PoolBuffer, int, int, _AudioBufferTimingSnapshot] | None
+_WorkerItem: TypeAlias = _AudioWorkItem | None
 
 
 class _AudioWorkQueue:
@@ -79,7 +71,7 @@ class _AudioWorkQueue:
 
     def put_audio(
         self,
-        item: tuple[_PoolBuffer, int, int, _AudioBufferTimingSnapshot],
+        item: _AudioWorkItem,
     ) -> None:
         self._queue.put(item)
 
@@ -91,23 +83,6 @@ class _AudioWorkQueue:
 
     def qsize(self) -> int:
         return self._queue.qsize()
-
-
-def _public_timestamp(snapshot: _AudioTimestampSnapshot) -> AudioTimestamp:
-    return AudioTimestamp(
-        sample_time=snapshot.sample_time,
-        host_time=snapshot.host_time,
-        rate_scalar=snapshot.rate_scalar,
-        word_clock_time=snapshot.word_clock_time,
-    )
-
-
-def _public_timing(snapshot: _AudioBufferTimingSnapshot) -> AudioBufferTiming:
-    return AudioBufferTiming(
-        now=_public_timestamp(snapshot.now),
-        input_time=_public_timestamp(snapshot.input_time),
-        output_time=_public_timestamp(snapshot.output_time),
-    )
 
 
 @dataclass(slots=True)
@@ -126,8 +101,9 @@ class _WorkerConfig:
 class _WorkerState:
     """Worker state shared by the RT callback and background thread."""
 
-    buffer_pool: queue.SimpleQueue[_PoolBuffer]
+    item_pool: list[_AudioWorkItem]
     work_queue: _AudioWorkQueue
+    acquired_items: dict[int, _AudioWorkItem] = field(default_factory=dict)
     output_file: BinaryIO | None = None
     wav_file: wave.Wave_write | None = None
     pcm_converter: PcmAudioConverter | None = None
@@ -147,9 +123,11 @@ class _AudioWorker:
     def __init__(
         self,
         *,
+        record_accepted_frames: Callable[[int], None],
         record_dropped_frames: Callable[[int], None],
         consume_dropped_stats: Callable[[], tuple[int, int]],
     ) -> None:
+        self._record_accepted_frames = record_accepted_frames
         self._record_dropped_frames = record_dropped_frames
         self._consume_dropped_stats = consume_dropped_stats
         self._state: _WorkerState | None = None
@@ -228,37 +206,50 @@ class _AudioWorker:
         if worker_errors:
             raise _combine_errors("Failed to finalize audio worker", worker_errors)
 
-    def acquire_pool_buffer(self, needed: int) -> _PoolBuffer | None:
-        """Return a ctypes buffer sized for ``needed`` bytes, or None if exhausted."""
+    def acquire_work_item(self, needed: int) -> _AudioWorkItem | None:
+        """Return a reusable work item sized for ``needed`` bytes, or None."""
         state = self._state
         if state is None:
             return None
 
         try:
-            buf = state.buffer_pool.get_nowait()
-        except queue.Empty:
+            item = state.item_pool.pop()
+        except IndexError:
             return None
 
-        if len(buf) < needed:
-            # Resize is rare (only on buffer-size change). Still technically an
-            # allocation on the RT thread, but bounded to a few occurrences.
-            buf = (ctypes.c_char * needed)()
+        item.ensure_capacity(needed)
+        state.acquired_items[id(item.buffer)] = item
+        return item
 
-        return buf
+    def acquire_pool_buffer(self, needed: int) -> _PoolBuffer | None:
+        """Return a ctypes buffer sized for ``needed`` bytes, or None if exhausted."""
+        item = self.acquire_work_item(needed)
+        if item is None:
+            return None
+
+        return item.buffer
 
     def enqueue_audio_data(
         self,
         buf: _PoolBuffer,
         num_frames: int,
         byte_count: int,
-        timing: _AudioBufferTimingSnapshot = _EMPTY_TIMING_SNAPSHOT,
+        input_sample_time: float | None = None,
     ) -> bool:
         """Queue audio work without blocking the Core Audio callback thread."""
         state = self._state
         if state is None:
             return True
 
-        state.work_queue.put_audio((buf, num_frames, byte_count, timing))
+        item = state.acquired_items.pop(id(buf), None)
+        if item is None:
+            item = _AudioWorkItem(buf)
+        item.prepare(
+            num_frames=num_frames,
+            byte_count=byte_count,
+            input_sample_time=input_sample_time,
+        )
+        state.work_queue.put_audio(item)
         return True
 
     def enqueue_copied_audio_data(
@@ -266,7 +257,7 @@ class _AudioWorker:
         source: ctypes.c_void_p,
         num_frames: int,
         byte_count: int,
-        timing: _AudioBufferTimingSnapshot = _EMPTY_TIMING_SNAPSHOT,
+        input_sample_time: float | None = None,
     ) -> bool:
         """Copy audio into a pooled buffer and queue it without blocking."""
         state = self._state
@@ -274,18 +265,20 @@ class _AudioWorker:
             return True
 
         try:
-            buf = state.buffer_pool.get_nowait()
-        except queue.Empty:
+            item = state.item_pool.pop()
+        except IndexError:
             self._record_dropped_frames(num_frames)
             return False
 
-        if len(buf) < byte_count:
-            # Resize is rare (only on buffer-size change). Still technically an
-            # allocation on the RT thread, but bounded to a few occurrences.
-            buf = (ctypes.c_char * byte_count)()
+        item.ensure_capacity(byte_count)
+        item.prepare(
+            num_frames=num_frames,
+            byte_count=byte_count,
+            input_sample_time=input_sample_time,
+        )
 
-        ctypes.memmove(buf, source, byte_count)
-        state.work_queue.put_audio((buf, num_frames, byte_count, timing))
+        ctypes.memmove(item.buffer, source, byte_count)
+        state.work_queue.put_audio(item)
         return True
 
     def _create_state(self, config: _WorkerConfig) -> _WorkerState:
@@ -297,12 +290,12 @@ class _AudioWorker:
             bytes_per_frame * 1024,
         )
         pool_type = ctypes.c_char * pool_buffer_size
-        buffer_pool: queue.SimpleQueue[_PoolBuffer] = queue.SimpleQueue()
-        for _ in range(config.max_pending_buffers):
-            buffer_pool.put(pool_type())
+        item_pool = [
+            _AudioWorkItem(pool_type()) for _ in range(config.max_pending_buffers)
+        ]
 
         state = _WorkerState(
-            buffer_pool=buffer_pool,
+            item_pool=item_pool,
             work_queue=_AudioWorkQueue(),
         )
 
@@ -386,7 +379,10 @@ class _AudioWorker:
                 if item is None:
                     break
 
-                buf, num_frames, byte_count, timing = item
+                buf = item.buffer
+                num_frames = item.num_frames
+                byte_count = item.byte_count
+                self._record_accepted_frames(num_frames)
 
                 try:
                     if on_buffer is not None and not state.callback_failed:
@@ -396,7 +392,7 @@ class _AudioWorker:
                                     data=cast(bytes, buf[:byte_count]),
                                     frame_count=num_frames,
                                     format=stream_format,
-                                    timing=_public_timing(timing),
+                                    input_sample_time=item.input_sample_time,
                                 )
                             )
                         except Exception as exc:
@@ -427,7 +423,10 @@ class _AudioWorker:
                                 )
                             )
                 finally:
-                    state.buffer_pool.put(buf)
+                    item.num_frames = 0
+                    item.byte_count = 0
+                    item.input_sample_time = None
+                    state.item_pool.append(item)
         finally:
             self._close_resources(state)
 

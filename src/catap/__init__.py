@@ -25,9 +25,7 @@ if _macos_version_tuple < (14, 2):
 
 from catap.audio_buffer import (
     AudioBuffer,
-    AudioBufferTiming,
     AudioStreamFormat,
-    AudioTimestamp,
 )
 from catap.bindings.device import (
     AmbiguousAudioDeviceError,
@@ -69,7 +67,6 @@ __all__ = [
     "AmbiguousAudioDeviceError",
     "AmbiguousAudioProcessError",
     "AudioBuffer",
-    "AudioBufferTiming",
     "AudioDevice",
     "AudioDeviceStream",
     "AudioProcess",
@@ -78,7 +75,6 @@ __all__ = [
     "AudioStreamFormat",
     "AudioTap",
     "AudioTapNotFoundError",
-    "AudioTimestamp",
     "RecordingSession",
     "TapDescription",
     "TapMuteBehavior",

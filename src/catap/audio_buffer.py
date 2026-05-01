@@ -40,32 +40,6 @@ class AudioStreamFormat:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class AudioTimestamp:
-    """Decoded Core Audio timestamp fields.
-
-    Each field is ``None`` when Core Audio did not mark that field valid.
-    """
-
-    sample_time: float | None
-    host_time: int | None
-    rate_scalar: float | None
-    word_clock_time: int | None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class AudioBufferTiming:
-    """Core Audio timing metadata for one callback buffer.
-
-    Attributes map to ``AudioDeviceIOProc`` arguments: ``now`` is ``inNow``,
-    ``input_time`` is ``inInputTime``, and ``output_time`` is ``inOutputTime``.
-    """
-
-    now: AudioTimestamp
-    input_time: AudioTimestamp
-    output_time: AudioTimestamp
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class AudioBuffer:
     """One native PCM callback buffer.
 
@@ -76,7 +50,7 @@ class AudioBuffer:
     data: bytes
     frame_count: int
     format: AudioStreamFormat
-    timing: AudioBufferTiming
+    input_sample_time: float | None = None
 
     @property
     def byte_count(self) -> int:

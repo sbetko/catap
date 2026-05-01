@@ -23,9 +23,7 @@ def test_module_has_expected_exports() -> None:
     assert "AudioDevice" in module.__all__
     assert "AudioDeviceStream" in module.__all__
     assert "AudioBuffer" in module.__all__
-    assert "AudioBufferTiming" in module.__all__
     assert "AudioStreamFormat" in module.__all__
-    assert "AudioTimestamp" in module.__all__
     assert "AudioTap" in module.__all__
     assert "AudioTapNotFoundError" in module.__all__
     assert "AudioRecorder" in module.__all__
@@ -57,9 +55,7 @@ def test_public_exports_reference_expected_symbols() -> None:
     assert module.AudioDevice is device_module.AudioDevice
     assert module.AudioDeviceStream is device_module.AudioDeviceStream
     assert module.AudioBuffer is audio_buffer_module.AudioBuffer
-    assert module.AudioBufferTiming is audio_buffer_module.AudioBufferTiming
     assert module.AudioStreamFormat is audio_buffer_module.AudioStreamFormat
-    assert module.AudioTimestamp is audio_buffer_module.AudioTimestamp
     assert module.AudioRecorder is recorder_module.AudioRecorder
     assert module.UnsupportedTapFormatError is recorder_module.UnsupportedTapFormatError
     assert module.TapDescription is tap_module.TapDescription

@@ -165,6 +165,7 @@ def profile_worker(
         return dropped_buffers, dropped_frames
 
     worker = _AudioWorker(
+        record_accepted_frames=lambda num_frames: None,
         record_dropped_frames=record_dropped_frames,
         consume_dropped_stats=consume_dropped_stats,
     )

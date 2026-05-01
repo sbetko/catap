@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ctypes
 import gc
-import queue
 import sys
 import threading
 from collections.abc import Callable
@@ -17,10 +16,7 @@ from catap._capture_engine import (
     _TapCaptureEngine,
     _TapCaptureSession,
     _TapStreamFormat,
-    kAudioTimeStampHostTimeValid,
-    kAudioTimeStampRateScalarValid,
     kAudioTimeStampSampleTimeValid,
-    kAudioTimeStampWordClockTimeValid,
 )
 from catap._recording_support import (
     _DEFAULT_MAX_PENDING_BUFFERS,
@@ -31,8 +27,6 @@ from catap._recording_support import (
     _validate_recording_target,
 )
 from catap._recording_worker import (
-    _AudioBufferTimingSnapshot,
-    _AudioTimestampSnapshot,
     _AudioWorker,
     _WorkerConfig,
 )
@@ -44,7 +38,6 @@ from catap.audio_buffer import (
 from catap.bindings._audiotoolbox import kAudioFormatLinearPCM
 
 _copy_audio_data = ctypes.memmove
-_QueueEmpty = queue.Empty
 _REALTIME_SWITCH_INTERVAL_SECONDS = 0.00025
 _switch_interval_lock = threading.Lock()
 _switch_interval_users = 0
@@ -189,6 +182,7 @@ class AudioRecorder:
         self._is_recording = False
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
         self._worker = _AudioWorker(
+            record_accepted_frames=self._record_accepted_frames,
             record_dropped_frames=self._record_dropped_frames,
             consume_dropped_stats=self._consume_dropped_stats,
         )
@@ -197,7 +191,7 @@ class AudioRecorder:
         self._stats_lock = threading.Lock()
         self._switch_interval_active = False
         self._rt_enqueue_copied_audio_data: Callable[
-            [ctypes.c_void_p, int, int, _AudioBufferTimingSnapshot],
+            [ctypes.c_void_p, int, int, float | None],
             bool,
         ] | None = None
 
@@ -404,7 +398,7 @@ class AudioRecorder:
         if state is None:
             raise RuntimeError("Audio worker is not started")
 
-        buffer_pool_get = state.buffer_pool.get_nowait
+        item_pool_pop = state.item_pool.pop
         work_queue_put = state.work_queue.put_audio
         record_dropped_frames = self._record_dropped_frames
 
@@ -412,19 +406,23 @@ class AudioRecorder:
             source: ctypes.c_void_p,
             num_frames: int,
             byte_count: int,
-            timing: _AudioBufferTimingSnapshot,
+            input_sample_time: float | None,
         ) -> bool:
             try:
-                buf = buffer_pool_get()
-            except _QueueEmpty:
+                item = item_pool_pop()
+            except IndexError:
                 record_dropped_frames(num_frames)
                 return False
 
-            if len(buf) < byte_count:
-                buf = (ctypes.c_char * byte_count)()
+            item.ensure_capacity(byte_count)
+            item.prepare(
+                num_frames=num_frames,
+                byte_count=byte_count,
+                input_sample_time=input_sample_time,
+            )
 
-            _copy_audio_data(buf, source, byte_count)
-            work_queue_put((buf, num_frames, byte_count, timing))
+            _copy_audio_data(item.buffer, source, byte_count)
+            work_queue_put(item)
             return True
 
         self._rt_enqueue_copied_audio_data = enqueue_copied_audio_data
@@ -433,18 +431,16 @@ class AudioRecorder:
         self._rt_enqueue_copied_audio_data = None
 
     @staticmethod
-    def _timestamp_snapshot(timestamp: AudioTimeStampPtr) -> _AudioTimestampSnapshot:
-        """Copy validity-decoded timestamp fields off the Core Audio pointer."""
+    def _input_sample_time(timestamp: AudioTimeStampPtr) -> float | None:
+        """Copy only the continuity-relevant sample time off the Core Audio pointer."""
         if not timestamp:
-            return _AudioTimestampSnapshot(None, None, None, None)
+            return None
 
         value = timestamp.contents
-        flags = value.mFlags
-        return _AudioTimestampSnapshot(
-            value.mSampleTime if flags & kAudioTimeStampSampleTimeValid else None,
-            value.mHostTime if flags & kAudioTimeStampHostTimeValid else None,
-            value.mRateScalar if flags & kAudioTimeStampRateScalarValid else None,
-            value.mWordClockTime if flags & kAudioTimeStampWordClockTimeValid else None,
+        return (
+            value.mSampleTime
+            if value.mFlags & kAudioTimeStampSampleTimeValid
+            else None
         )
 
     def _io_proc(
@@ -475,13 +471,6 @@ class AudioRecorder:
                     "Unsupported AudioBufferList layout: expected one "
                     f"interleaved buffer, got {num_buffers}"
                 )
-            timestamp_snapshot = self._timestamp_snapshot
-            timing = _AudioBufferTimingSnapshot(
-                timestamp_snapshot(now),
-                timestamp_snapshot(input_time),
-                timestamp_snapshot(output_time),
-            )
-
             buffer = buffer_list.mBuffers[0]
             byte_count = buffer.mDataByteSize
             if byte_count > 0:
@@ -508,13 +497,12 @@ class AudioRecorder:
                 enqueue_audio_data = self._rt_enqueue_copied_audio_data
                 if enqueue_audio_data is None:
                     enqueue_audio_data = self._worker.enqueue_copied_audio_data
-                if enqueue_audio_data(
+                enqueue_audio_data(
                     buffer.mData,
                     num_frames,
                     byte_count,
-                    timing,
-                ):
-                    self._total_frames += num_frames
+                    self._input_sample_time(input_time),
+                )
 
         except Exception as exc:
             # Must not raise from a Core Audio callback.
@@ -652,7 +640,7 @@ class AudioRecorder:
 
     @property
     def frames_recorded(self) -> int:
-        """Number of audio frames accepted for processing so far."""
+        """Number of queued audio frames drained by the worker so far."""
         return self._total_frames
 
     @property

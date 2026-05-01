@@ -50,10 +50,16 @@ def _stub_tap_format(tap_id: int) -> AudioStreamBasicDescription:
 
 def _make_worker(
     *,
+    record_accepted_frames: Callable[[int], None] | None = None,
     record_dropped_frames: Callable[[int], None] | None = None,
     consume_dropped_stats: Callable[[], tuple[int, int]] | None = None,
 ) -> worker_module._AudioWorker:
     return worker_module._AudioWorker(
+        record_accepted_frames=(
+            (lambda num_frames: None)
+            if record_accepted_frames is None
+            else record_accepted_frames
+        ),
         record_dropped_frames=(
             (lambda num_frames: None)
             if record_dropped_frames is None
@@ -144,7 +150,7 @@ def _timestamp_pointer(
 class _CapturingWorker:
     def __init__(self) -> None:
         self.enqueued: list[tuple[bytes, int, int]] = []
-        self.timings: list[worker_module._AudioBufferTimingSnapshot] = []
+        self.input_sample_times: list[float | None] = []
         self.pool_buffers: list[ctypes.Array] = []
 
     def acquire_pool_buffer(self, needed: int) -> ctypes.Array:
@@ -157,12 +163,12 @@ class _CapturingWorker:
         buf: ctypes.Array,
         num_frames: int,
         byte_count: int,
-        timing: worker_module._AudioBufferTimingSnapshot,
+        input_sample_time: float | None,
     ) -> bool:
         self.enqueued.append(
             (bytes(memoryview(buf)[:byte_count]), num_frames, byte_count)
         )
-        self.timings.append(timing)
+        self.input_sample_times.append(input_sample_time)
         return True
 
     def enqueue_copied_audio_data(
@@ -170,12 +176,12 @@ class _CapturingWorker:
         source: ctypes.c_void_p,
         num_frames: int,
         byte_count: int,
-        timing: worker_module._AudioBufferTimingSnapshot,
+        input_sample_time: float | None,
     ) -> bool:
         self.enqueued.append(
             (ctypes.string_at(source, byte_count), num_frames, byte_count)
         )
-        self.timings.append(timing)
+        self.input_sample_times.append(input_sample_time)
         return True
 
 
@@ -313,37 +319,21 @@ def test_recorder_stream_format_is_unknown_until_tap_is_described() -> None:
     ("flags", "expected"),
     [
         (
-            capture_module.kAudioTimeStampSampleTimeValid,
-            (10.0, None, None, None),
-        ),
-        (
-            capture_module.kAudioTimeStampHostTimeValid,
-            (None, 20, None, None),
-        ),
-        (0, (None, None, None, None)),
-        (
             capture_module.kAudioTimeStampSampleTimeValid
-            | capture_module.kAudioTimeStampHostTimeValid
-            | capture_module.kAudioTimeStampRateScalarValid
-            | capture_module.kAudioTimeStampWordClockTimeValid,
-            (10.0, 20, 1.0, 30),
+            | capture_module.kAudioTimeStampHostTimeValid,
+            10.0,
         ),
+        (capture_module.kAudioTimeStampHostTimeValid, None),
+        (0, None),
     ],
 )
-def test_timestamp_snapshot_decodes_validity_flags(
+def test_input_sample_time_decodes_validity_flag(
     flags: int,
-    expected: tuple[float | None, int | None, float | None, int | None],
+    expected: float | None,
 ) -> None:
     timestamp, _keepalive = _timestamp_pointer(flags=flags)
 
-    snapshot = AudioRecorder._timestamp_snapshot(timestamp)
-
-    assert (
-        snapshot.sample_time,
-        snapshot.host_time,
-        snapshot.rate_scalar,
-        snapshot.word_clock_time,
-    ) == expected
+    assert AudioRecorder._input_sample_time(timestamp) == expected
 
 
 def test_worker_invokes_callback_off_thread() -> None:
@@ -360,7 +350,7 @@ def test_worker_invokes_callback_off_thread() -> None:
         assert buffer.format.bytes_per_frame == 4
         assert buffer.format.is_signed_integer is True
         assert buffer.format.is_float is False
-        assert buffer.timing.input_time.sample_time is None
+        assert buffer.input_sample_time is None
         callback_event.set()
 
     worker = _make_worker()
@@ -376,7 +366,7 @@ def test_worker_invokes_callback_off_thread() -> None:
     assert callback_threads == ["catap-audio-worker"]
 
 
-def test_worker_exposes_buffer_timing_and_reuses_stream_format() -> None:
+def test_worker_exposes_input_sample_time_and_reuses_stream_format() -> None:
     received: list[PublicAudioBuffer] = []
     callback_event = threading.Event()
 
@@ -395,29 +385,14 @@ def test_worker_exposes_buffer_timing_and_reuses_stream_format() -> None:
     )
     worker.start(config)
 
-    timing = worker_module._AudioBufferTimingSnapshot(
-        now=worker_module._AudioTimestampSnapshot(
-            sample_time=None,
-            host_time=100,
-            rate_scalar=None,
-            word_clock_time=None,
-        ),
-        input_time=worker_module._AudioTimestampSnapshot(
-            sample_time=200.5,
-            host_time=300,
-            rate_scalar=1.0,
-            word_clock_time=400,
-        ),
-        output_time=worker_module._AudioTimestampSnapshot(
-            sample_time=None,
-            host_time=None,
-            rate_scalar=None,
-            word_clock_time=None,
-        ),
-    )
     for payload in (b"\x01\x02\x03\x04", b"\x05\x06\x07\x08"):
         buf = (ctypes.c_char * len(payload)).from_buffer_copy(payload)
-        assert worker.enqueue_audio_data(buf, 1, len(payload), timing) is True
+        assert worker.enqueue_audio_data(
+            buf,
+            1,
+            len(payload),
+            input_sample_time=200.5,
+        ) is True
 
     assert callback_event.wait(timeout=1)
     worker.stop()
@@ -431,12 +406,7 @@ def test_worker_exposes_buffer_timing_and_reuses_stream_format() -> None:
     assert received[0].format.format_id == "lpcm"
     assert received[0].format.is_float is True
     assert received[0].format.bytes_per_frame == 8
-    assert received[0].timing.now.host_time == 100
-    assert received[0].timing.input_time.sample_time == 200.5
-    assert received[0].timing.input_time.host_time == 300
-    assert received[0].timing.input_time.rate_scalar == 1.0
-    assert received[0].timing.input_time.word_clock_time == 400
-    assert received[0].timing.output_time.host_time is None
+    assert received[0].input_sample_time == 200.5
 
 
 def test_worker_thread_is_non_daemon() -> None:
@@ -1073,10 +1043,10 @@ def test_io_proc_copies_single_interleaved_buffer_to_worker() -> None:
 
     assert status == 0
     assert fake_worker.enqueued == [(data, 2, len(data))]
-    assert recorder.frames_recorded == 2
+    assert recorder.frames_recorded == 0
 
 
-def test_io_proc_queues_decoded_timing_metadata() -> None:
+def test_io_proc_queues_input_sample_time() -> None:
     fake_worker = _CapturingWorker()
     recorder = _recording_recorder_with_worker(fake_worker)
     data = struct.pack("<2h", 1, 2)
@@ -1111,15 +1081,7 @@ def test_io_proc_queues_decoded_timing_metadata() -> None:
     )
 
     assert status == 0
-    timing = fake_worker.timings[0]
-    assert timing.now.host_time == 111
-    assert timing.now.sample_time is None
-    assert timing.input_time.sample_time == 222.5
-    assert timing.input_time.host_time == 333
-    assert timing.input_time.rate_scalar == 1.25
-    assert timing.input_time.word_clock_time == 444
-    assert timing.output_time.sample_time is None
-    assert timing.output_time.host_time is None
+    assert fake_worker.input_sample_times == [222.5]
 
 
 def test_io_proc_reports_multi_buffer_layout_instead_of_writing_planar_audio() -> None:
