@@ -3,25 +3,18 @@
 from __future__ import annotations
 
 import ctypes
-import gc
-import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
 
 from catap._capture_engine import (
-    AudioBufferListPtr,
-    AudioDeviceIOProcType,
-    AudioTimeStampPtr,
     _TapCaptureEngine,
     _TapCaptureSession,
     _TapStreamFormat,
-    kAudioTimeStampSampleTimeValid,
 )
 from catap._native_coreaudio import (
     NativeCoreAudioRecorder,
     NativeCoreAudioRecorderStats,
-    NativeCoreAudioUnavailable,
 )
 from catap._recording_support import (
     _DEFAULT_MAX_PENDING_BUFFERS,
@@ -42,89 +35,8 @@ from catap.audio_buffer import (
 )
 from catap.bindings._audiotoolbox import kAudioFormatLinearPCM
 
-_copy_audio_data = ctypes.memmove
-_REALTIME_SWITCH_INTERVAL_SECONDS = 0.00025
 _NATIVE_DRAIN_IDLE_INTERVAL_SECONDS = 0.001
 _NATIVE_SLOT_FRAME_CAPACITY = 16_384
-_switch_interval_lock = threading.Lock()
-_switch_interval_users = 0
-_previous_switch_interval: float | None = None
-_changed_switch_interval = False
-_gc_lock = threading.Lock()
-_gc_pause_users = 0
-_gc_was_enabled = False
-
-
-def _enter_realtime_switch_interval() -> None:
-    """Temporarily lower Python's GIL switch interval during recording."""
-    global _changed_switch_interval
-    global _previous_switch_interval
-    global _switch_interval_users
-
-    with _switch_interval_lock:
-        if _switch_interval_users == 0:
-            current = sys.getswitchinterval()
-            _previous_switch_interval = current
-            _changed_switch_interval = current > _REALTIME_SWITCH_INTERVAL_SECONDS
-            if _changed_switch_interval:
-                sys.setswitchinterval(_REALTIME_SWITCH_INTERVAL_SECONDS)
-        _switch_interval_users += 1
-
-
-def _exit_realtime_switch_interval() -> None:
-    """Restore Python's GIL switch interval when recording quiesces."""
-    global _changed_switch_interval
-    global _previous_switch_interval
-    global _switch_interval_users
-
-    with _switch_interval_lock:
-        if _switch_interval_users <= 0:
-            return
-
-        _switch_interval_users -= 1
-        if _switch_interval_users != 0:
-            return
-
-        previous = _previous_switch_interval
-        if (
-            _changed_switch_interval
-            and previous is not None
-            and sys.getswitchinterval() == _REALTIME_SWITCH_INTERVAL_SECONDS
-        ):
-            sys.setswitchinterval(previous)
-        _previous_switch_interval = None
-        _changed_switch_interval = False
-
-
-def _enter_realtime_gc_pause() -> None:
-    """Pause cyclic GC while real-time audio callbacks are active."""
-    global _gc_pause_users
-    global _gc_was_enabled
-
-    with _gc_lock:
-        if _gc_pause_users == 0:
-            _gc_was_enabled = gc.isenabled()
-            if _gc_was_enabled:
-                gc.disable()
-        _gc_pause_users += 1
-
-
-def _exit_realtime_gc_pause() -> None:
-    """Restore cyclic GC state after real-time audio callbacks stop."""
-    global _gc_pause_users
-    global _gc_was_enabled
-
-    with _gc_lock:
-        if _gc_pause_users <= 0:
-            return
-
-        _gc_pause_users -= 1
-        if _gc_pause_users != 0:
-            return
-
-        if _gc_was_enabled:
-            gc.enable()
-        _gc_was_enabled = False
 
 
 class UnsupportedTapFormatError(ValueError):
@@ -196,11 +108,6 @@ class AudioRecorder:
         self._lifecycle_lock = threading.Lock()
         self._lifecycle_state = "idle"
         self._stats_lock = threading.Lock()
-        self._switch_interval_active = False
-        self._rt_enqueue_copied_audio_data: Callable[
-            [ctypes.c_void_p, int, int, float | None],
-            bool,
-        ] | None = None
         self._native_recorder: NativeCoreAudioRecorder | None = None
         self._native_drain_thread: threading.Thread | None = None
         self._native_drain_stop_event: threading.Event | None = None
@@ -209,8 +116,6 @@ class AudioRecorder:
         self._total_frames = 0
         self._dropped_buffers = 0
         self._dropped_frames = 0
-        self._io_proc_failure: RuntimeError | None = None
-        self._io_proc_failure_count = 0
 
         # Stream format (populated on start).
         self._sample_rate = 44100.0
@@ -221,9 +126,6 @@ class AudioRecorder:
         self._convert_float_output = True
         self._is_float = True
         self._stream_format: AudioStreamFormat | None = None
-
-        # Keep reference to callback to prevent garbage collection.
-        self._callback = AudioDeviceIOProcType(self._io_proc)
 
     def _apply_stream_format(self, stream_format: _TapStreamFormat) -> None:
         """Apply tap stream metadata to recorder state."""
@@ -343,8 +245,6 @@ class AudioRecorder:
             self._total_frames = 0
             self._dropped_buffers = 0
             self._dropped_frames = 0
-            self._io_proc_failure = None
-            self._io_proc_failure_count = 0
 
     def _record_accepted_frames(self, num_frames: int) -> None:
         self._total_frames += num_frames
@@ -362,96 +262,14 @@ class AudioRecorder:
             self._dropped_frames = 0
         return dropped_buffers, dropped_frames
 
-    def _record_io_proc_failure(self, exc: Exception) -> None:
-        """Remember callback failures without raising into Core Audio."""
-        with self._stats_lock:
-            self._io_proc_failure_count += 1
-            if self._io_proc_failure is None:
-                failure = _translate_exception(
-                    RuntimeError,
-                    f"Audio callback failed: {exc}",
-                    exc,
-                )
-                assert isinstance(failure, RuntimeError)
-                self._io_proc_failure = failure
-
-    def _consume_io_proc_failure(self) -> RuntimeError | None:
-        """Return and clear the first callback failure captured this run."""
-        with self._stats_lock:
-            failure = self._io_proc_failure
-            failure_count = self._io_proc_failure_count
-            self._io_proc_failure = None
-            self._io_proc_failure_count = 0
-
-        if failure is not None and failure_count > 1:
-            failure.add_note(
-                f"Audio callback failed {failure_count} times; first failure shown."
-            )
-        return failure
-
-    def _enter_runtime_tuning(self) -> None:
-        _enter_realtime_switch_interval()
-        try:
-            _enter_realtime_gc_pause()
-        except Exception:
-            _exit_realtime_switch_interval()
-            raise
-        self._switch_interval_active = True
-
-    def _exit_runtime_tuning(self) -> None:
-        if self._switch_interval_active:
-            self._switch_interval_active = False
-            _exit_realtime_gc_pause()
-            _exit_realtime_switch_interval()
-
-    def _bind_realtime_worker(self) -> None:
-        state = self._worker._state
-        if state is None:
-            raise RuntimeError("Audio worker is not started")
-
-        item_pool_pop = state.item_pool.pop
-        work_queue_put = state.work_queue.put_audio
-        record_dropped_frames = self._record_dropped_frames
-
-        def enqueue_copied_audio_data(
-            source: ctypes.c_void_p,
-            num_frames: int,
-            byte_count: int,
-            input_sample_time: float | None,
-        ) -> bool:
-            try:
-                item = item_pool_pop()
-            except IndexError:
-                record_dropped_frames(num_frames)
-                return False
-
-            item.ensure_capacity(byte_count)
-            item.prepare(
-                num_frames=num_frames,
-                byte_count=byte_count,
-                input_sample_time=input_sample_time,
-            )
-
-            _copy_audio_data(item.buffer, source, byte_count)
-            work_queue_put(item)
-            return True
-
-        self._rt_enqueue_copied_audio_data = enqueue_copied_audio_data
-
-    def _clear_realtime_worker(self) -> None:
-        self._rt_enqueue_copied_audio_data = None
-
-    def _try_create_native_recorder(self) -> NativeCoreAudioRecorder | None:
-        """Create the native IOProc recorder when the dylib is available."""
-        try:
-            return NativeCoreAudioRecorder(
-                slot_count=self._max_pending_buffers,
-                slot_capacity=self._native_slot_capacity(),
-                expected_channel_count=self._num_channels,
-                bytes_per_frame=self._bytes_per_frame,
-            )
-        except NativeCoreAudioUnavailable:
-            return None
+    def _create_native_recorder(self) -> NativeCoreAudioRecorder:
+        """Create the native IOProc recorder."""
+        return NativeCoreAudioRecorder(
+            slot_count=self._max_pending_buffers,
+            slot_capacity=self._native_slot_capacity(),
+            expected_channel_count=self._num_channels,
+            bytes_per_frame=self._bytes_per_frame,
+        )
 
     def _native_slot_capacity(self) -> int:
         return self._bytes_per_frame * _NATIVE_SLOT_FRAME_CAPACITY
@@ -557,86 +375,6 @@ class AudioRecorder:
 
         return errors
 
-    @staticmethod
-    def _input_sample_time(timestamp: AudioTimeStampPtr) -> float | None:
-        """Copy only the continuity-relevant sample time off the Core Audio pointer."""
-        if not timestamp:
-            return None
-
-        value = timestamp.contents
-        return (
-            value.mSampleTime
-            if value.mFlags & kAudioTimeStampSampleTimeValid
-            else None
-        )
-
-    def _io_proc(
-        self,
-        device: int,
-        now: AudioTimeStampPtr,
-        input_data: AudioBufferListPtr,
-        input_time: AudioTimeStampPtr,
-        output_data: AudioBufferListPtr,
-        output_time: AudioTimeStampPtr,
-        client_data: ctypes.c_void_p,
-    ) -> int:
-        """Audio I/O callback - called on the Core Audio real-time thread."""
-        if not self._is_recording:
-            return 0
-
-        try:
-            if not input_data:
-                return 0
-
-            buffer_list = input_data.contents
-            num_buffers = buffer_list.mNumberBuffers
-
-            if num_buffers == 0:
-                return 0
-            if num_buffers != 1:
-                raise UnsupportedTapFormatError(
-                    "Unsupported AudioBufferList layout: expected one "
-                    f"interleaved buffer, got {num_buffers}"
-                )
-            buffer = buffer_list.mBuffers[0]
-            byte_count = buffer.mDataByteSize
-            if byte_count > 0:
-                if not buffer.mData:
-                    raise UnsupportedTapFormatError(
-                        "Audio buffer reported bytes without a data pointer"
-                    )
-                num_channels = self._num_channels
-                if buffer.mNumberChannels != num_channels:
-                    raise UnsupportedTapFormatError(
-                        "Unsupported audio buffer channel count: expected "
-                        f"{num_channels}, got {buffer.mNumberChannels}"
-                )
-
-                bytes_per_frame = self._bytes_per_frame
-                num_frames, extra_bytes = divmod(byte_count, bytes_per_frame)
-                if num_frames == 0 or extra_bytes:
-                    raise UnsupportedTapFormatError(
-                        "Audio buffer byte count is not a whole number of "
-                        f"frames: {byte_count} bytes for "
-                        f"{bytes_per_frame}-byte frames"
-                    )
-
-                enqueue_audio_data = self._rt_enqueue_copied_audio_data
-                if enqueue_audio_data is None:
-                    enqueue_audio_data = self._worker.enqueue_copied_audio_data
-                enqueue_audio_data(
-                    buffer.mData,
-                    num_frames,
-                    byte_count,
-                    self._input_sample_time(input_time),
-                )
-
-        except Exception as exc:
-            # Must not raise from a Core Audio callback.
-            self._record_io_proc_failure(exc)
-
-        return 0  # noErr
-
     def start(self) -> None:
         """Start recording audio.
 
@@ -668,35 +406,21 @@ class AudioRecorder:
             capture_session: _TapCaptureSession | None = None
             native_recorder: NativeCoreAudioRecorder | None = None
             try:
-                native_recorder = self._try_create_native_recorder()
-                if native_recorder is not None:
-                    self._native_recorder = native_recorder
-                    cleanup.append(native_recorder.close)
-                    capture_session = self._capture_engine.open_tap_capture(
-                        self.tap_id,
-                        native_recorder.io_proc_pointer,
-                        native_recorder.handle,
-                    )
-                else:
-                    capture_session = self._capture_engine.open_tap_capture(
-                        self.tap_id,
-                        self._callback,
-                    )
+                native_recorder = self._create_native_recorder()
+                self._native_recorder = native_recorder
+                cleanup.append(native_recorder.close)
+                capture_session = self._capture_engine.open_tap_capture(
+                    self.tap_id,
+                    native_recorder.io_proc_pointer,
+                    native_recorder.handle,
+                )
                 self._capture_session = capture_session
                 cleanup.append(lambda: self._capture_engine.close(capture_session))
 
-                if native_recorder is None:
-                    self._enter_runtime_tuning()
-                    cleanup.append(self._exit_runtime_tuning)
-
                 self._worker.start(self._make_worker_config())
                 cleanup.append(lambda: self._worker.stop(publish=False))
-                if native_recorder is None:
-                    self._bind_realtime_worker()
-                    cleanup.append(self._clear_realtime_worker)
-                else:
-                    self._start_native_drain(native_recorder)
-                    cleanup.append(self._stop_native_drain)
+                self._start_native_drain(native_recorder)
+                cleanup.append(self._stop_native_drain)
 
                 with self._lifecycle_lock:
                     self._is_recording = True
@@ -780,14 +504,6 @@ class AudioRecorder:
             self._worker.stop(publish=publish_worker_output)
         except (OSError, RuntimeError) as exc:
             cleanup_errors.append(exc)
-        finally:
-            self._clear_realtime_worker()
-
-        self._exit_runtime_tuning()
-
-        callback_failure = self._consume_io_proc_failure()
-        if callback_failure is not None:
-            cleanup_errors.append(callback_failure)
 
         self._capture_session = None
         if native_recorder is not None:

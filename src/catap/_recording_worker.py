@@ -62,7 +62,7 @@ _WorkerItem: TypeAlias = _AudioWorkItem | None
 
 
 class _AudioWorkQueue:
-    """Simple audio queue optimized for the IOProc producer."""
+    """Simple audio queue for native-drain work."""
 
     __slots__ = ("_queue",)
 
@@ -99,11 +99,10 @@ class _WorkerConfig:
 
 @dataclass(slots=True)
 class _WorkerState:
-    """Worker state shared by the RT callback and background thread."""
+    """Worker state owned by the native drain and background thread."""
 
     item_pool: list[_AudioWorkItem]
     work_queue: _AudioWorkQueue
-    acquired_items: dict[int, _AudioWorkItem] = field(default_factory=dict)
     output_file: BinaryIO | None = None
     wav_file: wave.Wave_write | None = None
     pcm_converter: PcmAudioConverter | None = None
@@ -205,81 +204,6 @@ class _AudioWorker:
 
         if worker_errors:
             raise _combine_errors("Failed to finalize audio worker", worker_errors)
-
-    def acquire_work_item(self, needed: int) -> _AudioWorkItem | None:
-        """Return a reusable work item sized for ``needed`` bytes, or None."""
-        state = self._state
-        if state is None:
-            return None
-
-        try:
-            item = state.item_pool.pop()
-        except IndexError:
-            return None
-
-        item.ensure_capacity(needed)
-        state.acquired_items[id(item.buffer)] = item
-        return item
-
-    def acquire_pool_buffer(self, needed: int) -> _PoolBuffer | None:
-        """Return a ctypes buffer sized for ``needed`` bytes, or None if exhausted."""
-        item = self.acquire_work_item(needed)
-        if item is None:
-            return None
-
-        return item.buffer
-
-    def enqueue_audio_data(
-        self,
-        buf: _PoolBuffer,
-        num_frames: int,
-        byte_count: int,
-        input_sample_time: float | None = None,
-    ) -> bool:
-        """Queue audio work without blocking the Core Audio callback thread."""
-        state = self._state
-        if state is None:
-            return True
-
-        item = state.acquired_items.pop(id(buf), None)
-        if item is None:
-            item = _AudioWorkItem(buf)
-        item.prepare(
-            num_frames=num_frames,
-            byte_count=byte_count,
-            input_sample_time=input_sample_time,
-        )
-        state.work_queue.put_audio(item)
-        return True
-
-    def enqueue_copied_audio_data(
-        self,
-        source: ctypes.c_void_p,
-        num_frames: int,
-        byte_count: int,
-        input_sample_time: float | None = None,
-    ) -> bool:
-        """Copy audio into a pooled buffer and queue it without blocking."""
-        state = self._state
-        if state is None:
-            return True
-
-        try:
-            item = state.item_pool.pop()
-        except IndexError:
-            self._record_dropped_frames(num_frames)
-            return False
-
-        item.ensure_capacity(byte_count)
-        item.prepare(
-            num_frames=num_frames,
-            byte_count=byte_count,
-            input_sample_time=input_sample_time,
-        )
-
-        ctypes.memmove(item.buffer, source, byte_count)
-        state.work_queue.put_audio(item)
-        return True
 
     def enqueue_audio_bytes(
         self,

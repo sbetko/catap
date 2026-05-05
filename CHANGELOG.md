@@ -12,6 +12,9 @@ All notable changes to this project will be documented in this file.
 - Added `stream_format` accessors on `AudioRecorder` and `RecordingSession`;
   use fields such as `stream_format.sample_rate` instead of scalar format
   convenience properties.
+- Added a native macOS Core Audio helper dylib for the recorder IOProc and
+  made it required for recording. The old pure-Python IOProc fallback has been
+  removed.
 
   ```python
   # Before

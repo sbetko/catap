@@ -6,7 +6,7 @@ on:
 jobs:
   publish-test:
     name: Publish to TestPyPI
-    runs-on: ubuntu-latest
+    runs-on: macos-26
     permissions:
       id-token: write
       contents: read

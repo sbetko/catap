@@ -17,6 +17,9 @@ wheels/
 _CodeSignature/
 .DS_Store
 
+# Local native build artifacts
+*.dylib
+
 # Log files
 *.log
 

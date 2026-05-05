@@ -20,6 +20,9 @@ It targets macOS 14.2 and newer. CI covers CPython 3.11 through 3.14 plus
 free-threaded CPython 3.13t and 3.14t on macOS. Current development is on
 Apple Silicon and macOS 26.2.
 
+Recording requires the bundled native Core Audio helper dylib. Wheels include
+it; source builds require the macOS command-line developer tools.
+
 ## Quick start
 
 CLI:
@@ -232,10 +235,11 @@ system-audio-capture entitlement.
 3. Aggregate device: creates a private Core Audio aggregate device containing
    the tap, matching Apple's documented tap-capture path. `catap` destroys the
    aggregate when recording stops.
-4. Audio capture: registers an `AudioDeviceIOProc` callback to receive
-   audio buffers.
-5. WAV output: uses Core Audio `AudioConverter` to convert float32 audio to
-   16-bit PCM for the WAV file.
+4. Audio capture: registers the bundled native dylib's `AudioDeviceIOProc`
+   and copies tap audio into a preallocated native ring.
+5. Worker output: a Python drain thread feeds the background worker, which
+   writes WAV data and invokes optional `on_buffer` callbacks outside the
+   Core Audio real-time path.
 
 The supported Core Audio surface is enumerated in
 [`docs/core-audio-support-matrix.md`](docs/core-audio-support-matrix.md).

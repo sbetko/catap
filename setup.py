@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 if sys.platform == "darwin":
-    os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", "14.0")
+    os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", "14.2")
 
 from setuptools import setup
 from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel

@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import ctypes
-import gc
-import queue
 import struct
-import sys
 import threading
 import wave
 from collections.abc import Callable
@@ -25,8 +22,6 @@ from catap.audio_buffer import (
     _format_id_to_fourcc,
 )
 from catap.bindings._audiotoolbox import (
-    AudioBuffer as CoreAudioBuffer,
-    AudioBufferList,
     AudioStreamBasicDescription,
     kAudioFormatFlagIsFloat,
     kAudioFormatFlagIsPacked,
@@ -104,87 +99,6 @@ def _make_worker_config(
     )
 
 
-def _audio_buffer_list_pointer(
-    *buffers: tuple[bytes, int],
-) -> tuple[Any, list[object]]:
-    class _TestAudioBufferList(ctypes.Structure):
-        _fields_ = [
-            ("mNumberBuffers", ctypes.c_uint32),
-            ("mBuffers", CoreAudioBuffer * len(buffers)),
-        ]
-
-    buffer_list = _TestAudioBufferList()
-    buffer_list.mNumberBuffers = len(buffers)
-    keepalive: list[object] = [buffer_list]
-
-    for index, (data, channels) in enumerate(buffers):
-        data_buffer = (ctypes.c_char * len(data)).from_buffer_copy(data)
-        keepalive.append(data_buffer)
-        buffer_list.mBuffers[index].mNumberChannels = channels
-        buffer_list.mBuffers[index].mDataByteSize = len(data)
-        buffer_list.mBuffers[index].mData = ctypes.cast(data_buffer, ctypes.c_void_p)
-
-    return (
-        ctypes.cast(ctypes.pointer(buffer_list), ctypes.POINTER(AudioBufferList)),
-        keepalive,
-    )
-
-
-def _timestamp_pointer(
-    *,
-    flags: int,
-    sample_time: float = 10.0,
-    host_time: int = 20,
-    rate_scalar: float = 1.0,
-    word_clock_time: int = 30,
-) -> tuple[Any, object]:
-    timestamp = capture_module.AudioTimeStamp()
-    timestamp.mSampleTime = sample_time
-    timestamp.mHostTime = host_time
-    timestamp.mRateScalar = rate_scalar
-    timestamp.mWordClockTime = word_clock_time
-    timestamp.mFlags = flags
-    return ctypes.pointer(timestamp), timestamp
-
-
-class _CapturingWorker:
-    def __init__(self) -> None:
-        self.enqueued: list[tuple[bytes, int, int]] = []
-        self.input_sample_times: list[float | None] = []
-        self.pool_buffers: list[ctypes.Array] = []
-
-    def acquire_pool_buffer(self, needed: int) -> ctypes.Array:
-        buf = (ctypes.c_char * needed)()
-        self.pool_buffers.append(buf)
-        return buf
-
-    def enqueue_audio_data(
-        self,
-        buf: ctypes.Array,
-        num_frames: int,
-        byte_count: int,
-        input_sample_time: float | None,
-    ) -> bool:
-        self.enqueued.append(
-            (bytes(memoryview(buf)[:byte_count]), num_frames, byte_count)
-        )
-        self.input_sample_times.append(input_sample_time)
-        return True
-
-    def enqueue_copied_audio_data(
-        self,
-        source: ctypes.c_void_p,
-        num_frames: int,
-        byte_count: int,
-        input_sample_time: float | None,
-    ) -> bool:
-        self.enqueued.append(
-            (ctypes.string_at(source, byte_count), num_frames, byte_count)
-        )
-        self.input_sample_times.append(input_sample_time)
-        return True
-
-
 class _FakeNativeRingStats:
     def __init__(
         self,
@@ -225,17 +139,32 @@ class _FakeNativeChunk:
         self.input_sample_time = input_sample_time
 
 
-def _recording_recorder_with_worker(
-    fake_worker: _CapturingWorker,
-) -> AudioRecorder:
-    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
-    recorder._worker = cast(Any, fake_worker)
-    recorder._is_recording = True
-    recorder._lifecycle_state = "recording"
-    recorder._num_channels = 2
-    recorder._bits_per_sample = 16
-    recorder._bytes_per_frame = 4
-    return recorder
+@pytest.fixture(autouse=True)
+def _fake_native_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeNativeRecorder:
+        def __init__(
+            self,
+            *,
+            slot_count: int,
+            slot_capacity: int,
+            expected_channel_count: int,
+            bytes_per_frame: int,
+        ) -> None:
+            del slot_count, slot_capacity, expected_channel_count, bytes_per_frame
+            self.io_proc_pointer = ctypes.c_void_p(456)
+            self.handle = ctypes.c_void_p(789)
+            self.closed = False
+
+        def read(self) -> object | None:
+            return None
+
+        def stats(self) -> _FakeNativeRecorderStats:
+            return _FakeNativeRecorderStats()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(recorder_module, "NativeCoreAudioRecorder", _FakeNativeRecorder)
 
 
 def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
@@ -252,8 +181,7 @@ def test_writer_streams_float_audio_to_wav(tmp_path) -> None:
 
     worker.start(config)
     data = struct.pack("<4f", 0.5, -0.5, 1.0, -1.0)
-    buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-    assert worker.enqueue_audio_data(buf, 2, len(data)) is True
+    assert worker.enqueue_audio_bytes(data, 2) is True
     worker.stop()
 
     with wave.open(str(output_path), "rb") as wav_file:
@@ -277,8 +205,7 @@ def test_writer_preserves_int16_audio(tmp_path) -> None:
 
     worker.start(config)
     data = struct.pack("<3h", 100, -200, 300)
-    buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-    assert worker.enqueue_audio_data(buf, 3, len(data)) is True
+    assert worker.enqueue_audio_bytes(data, 3) is True
     worker.stop()
 
     with wave.open(str(output_path), "rb") as wav_file:
@@ -371,27 +298,6 @@ def test_recorder_stream_format_is_unknown_until_tap_is_described() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("flags", "expected"),
-    [
-        (
-            capture_module.kAudioTimeStampSampleTimeValid
-            | capture_module.kAudioTimeStampHostTimeValid,
-            10.0,
-        ),
-        (capture_module.kAudioTimeStampHostTimeValid, None),
-        (0, None),
-    ],
-)
-def test_input_sample_time_decodes_validity_flag(
-    flags: int,
-    expected: float | None,
-) -> None:
-    timestamp, _keepalive = _timestamp_pointer(flags=flags)
-
-    assert AudioRecorder._input_sample_time(timestamp) == expected
-
-
 def test_worker_invokes_callback_off_thread() -> None:
     callback_threads: list[str] = []
     callback_event = threading.Event()
@@ -413,8 +319,7 @@ def test_worker_invokes_callback_off_thread() -> None:
     config = _make_worker_config(on_buffer=on_buffer)
     worker.start(config)
 
-    buf = (ctypes.c_char * 2).from_buffer_copy(b"\x01\x02")
-    assert worker.enqueue_audio_data(buf, 1, 2) is True
+    assert worker.enqueue_audio_bytes(b"\x01\x02", 1) is True
     assert callback_event.wait(timeout=1)
 
     worker.stop()
@@ -442,13 +347,7 @@ def test_worker_exposes_input_sample_time_and_reuses_stream_format() -> None:
     worker.start(config)
 
     for payload in (b"\x01\x02\x03\x04", b"\x05\x06\x07\x08"):
-        buf = (ctypes.c_char * len(payload)).from_buffer_copy(payload)
-        assert worker.enqueue_audio_data(
-            buf,
-            1,
-            len(payload),
-            input_sample_time=200.5,
-        ) is True
+        assert worker.enqueue_audio_bytes(payload, 1, 200.5) is True
 
     assert callback_event.wait(timeout=1)
     worker.stop()
@@ -474,60 +373,6 @@ def test_worker_thread_is_non_daemon() -> None:
     assert worker.thread.daemon is False
 
     worker.stop()
-
-
-def test_worker_buffer_pool_handles_concurrent_producers() -> None:
-    producer_count = 8
-    items_per_producer = 128
-    expected_frames = producer_count * items_per_producer
-    payload = b"\x01\x02\x03\x04"
-    received_frames = 0
-    received_lock = threading.Lock()
-    producer_errors: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
-    dropped_frames: list[int] = []
-
-    def on_buffer(buffer: PublicAudioBuffer) -> None:
-        nonlocal received_frames
-        assert buffer.data == payload
-        assert buffer.frame_count == 1
-        with received_lock:
-            received_frames += buffer.frame_count
-
-    worker = _make_worker(
-        record_dropped_frames=dropped_frames.append,
-        consume_dropped_stats=lambda: (len(dropped_frames), sum(dropped_frames)),
-    )
-    config = _make_worker_config(
-        on_buffer=on_buffer,
-        max_pending_buffers=expected_frames,
-    )
-    worker.start(config)
-    barrier = threading.Barrier(producer_count)
-
-    def produce() -> None:
-        try:
-            barrier.wait(timeout=1)
-            for _ in range(items_per_producer):
-                buf = worker.acquire_pool_buffer(len(payload))
-                assert buf is not None
-                ctypes.memmove(buf, payload, len(payload))
-                assert worker.enqueue_audio_data(buf, 1, len(payload)) is True
-        except BaseException as exc:
-            producer_errors.put(exc)
-
-    producers = [threading.Thread(target=produce) for _ in range(producer_count)]
-    for producer in producers:
-        producer.start()
-    for producer in producers:
-        producer.join()
-
-    worker.stop()
-
-    if not producer_errors.empty():
-        raise producer_errors.get()
-
-    assert received_frames == expected_frames
-    assert dropped_frames == []
 
 
 def test_worker_rejects_double_start(tmp_path) -> None:
@@ -558,15 +403,9 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
     config = _make_worker_config(on_buffer=on_buffer, max_pending_buffers=1)
     worker.start(config)
 
-    first = (ctypes.c_char * 2).from_buffer_copy(b"\x00\x01")
-    assert worker.enqueue_copied_audio_data(ctypes.cast(first, ctypes.c_void_p), 1, 2)
+    assert worker.enqueue_audio_bytes(b"\x00\x01", 1)
     assert callback_started.wait(timeout=1)
-    second = (ctypes.c_char * 2).from_buffer_copy(b"\x02\x03")
-    assert not worker.enqueue_copied_audio_data(
-        ctypes.cast(second, ctypes.c_void_p),
-        2,
-        2,
-    )
+    assert not worker.enqueue_audio_bytes(b"\x02\x03", 2)
 
     allow_callback_to_finish.set()
 
@@ -706,7 +545,6 @@ def test_start_uses_native_io_proc_when_dylib_is_available(
 ) -> None:
     created_recorders: list[Any] = []
     capture_calls: list[tuple[object, object | None]] = []
-    tuning_calls: list[str] = []
 
     class _FakeNativeRecorder:
         def __init__(
@@ -770,16 +608,6 @@ def test_start_uses_native_io_proc_when_dylib_is_available(
             del session
 
     monkeypatch.setattr(recorder_module, "NativeCoreAudioRecorder", _FakeNativeRecorder)
-    monkeypatch.setattr(
-        recorder_module,
-        "_enter_realtime_switch_interval",
-        lambda: tuning_calls.append("switch"),
-    )
-    monkeypatch.setattr(
-        recorder_module,
-        "_enter_realtime_gc_pause",
-        lambda: tuning_calls.append("gc"),
-    )
 
     recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     recorder._capture_engine = cast(Any, _NativeCaptureEngine())
@@ -796,9 +624,55 @@ def test_start_uses_native_io_proc_when_dylib_is_available(
     assert native_recorder.expected_channel_count == 2
     assert native_recorder.bytes_per_frame == 8
     assert capture_calls == [(native_recorder.io_proc_pointer, native_recorder.handle)]
-    assert tuning_calls == []
     assert native_recorder.closed is True
     assert recorder._native_recorder is None
+
+
+def test_start_fails_when_native_recorder_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _MissingNativeRecorder:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            raise RuntimeError("native dylib missing")
+
+    class _CaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                32,
+                True,
+                bytes_per_frame=8,
+                is_signed_integer=False,
+            )
+
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> object:
+            del tap_id, callback, client_data
+            raise AssertionError("capture should not open without native recorder")
+
+    monkeypatch.setattr(
+        recorder_module,
+        "NativeCoreAudioRecorder",
+        _MissingNativeRecorder,
+    )
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, _CaptureEngine())
+
+    with pytest.raises(RuntimeError, match="native dylib missing"):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
 
 
 def test_failed_start_unwinds_cleanup_for_non_oserror_exceptions(
@@ -922,8 +796,7 @@ def test_stop_preserves_callback_failure_cause() -> None:
     config = _make_worker_config(on_buffer=on_buffer)
     worker.start(config)
 
-    buf = (ctypes.c_char * 2).from_buffer_copy(b"\x01\x02")
-    assert worker.enqueue_audio_data(buf, 1, 2) is True
+    assert worker.enqueue_audio_bytes(b"\x01\x02", 1) is True
     assert callback_seen.wait(timeout=1)
 
     with pytest.raises(
@@ -962,8 +835,7 @@ def test_stop_preserves_write_failure_cause(
     monkeypatch.setattr(worker.wav_file, "writeframesraw", _fail_write)
 
     data = struct.pack("<4f", 0.5, -0.5, 1.0, -1.0)
-    buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-    assert worker.enqueue_audio_data(buf, 2, len(data)) is True
+    assert worker.enqueue_audio_bytes(data, 2) is True
 
     with pytest.raises(
         OSError,
@@ -1007,33 +879,6 @@ def test_stop_preserves_finalize_failure_cause(
     assert any(
         "Failed to finalize audio worker" in note for note in exc_info.value.__notes__
     )
-
-
-def test_io_proc_failure_is_reported_on_stop() -> None:
-    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
-    recorder._is_recording = True
-    recorder._lifecycle_state = "recording"
-
-    status = recorder._io_proc(
-        0,
-        cast(Any, None),
-        cast(Any, object()),
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-    )
-
-    assert status == 0
-
-    with pytest.raises(RuntimeError, match="Audio callback failed") as exc_info:
-        recorder.stop()
-
-    assert isinstance(exc_info.value.__cause__, AttributeError)
-    assert any(
-        "Failed to stop recording cleanly" in note for note in exc_info.value.__notes__
-    )
-    assert recorder._lifecycle_state == "idle"
 
 
 def test_start_rejects_non_interleaved_tap_format() -> None:
@@ -1212,160 +1057,6 @@ def test_start_rejects_padded_tap_frames() -> None:
     assert recorder._lifecycle_state == "idle"
 
 
-def test_io_proc_copies_single_interleaved_buffer_to_worker() -> None:
-    fake_worker = _CapturingWorker()
-    recorder = _recording_recorder_with_worker(fake_worker)
-    data = struct.pack("<4h", 1, 2, 3, 4)
-    input_data, _keepalive = _audio_buffer_list_pointer((data, 2))
-
-    status = recorder._io_proc(
-        0,
-        cast(Any, None),
-        input_data,
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-    )
-
-    assert status == 0
-    assert fake_worker.enqueued == [(data, 2, len(data))]
-    assert recorder.frames_recorded == 0
-
-
-def test_io_proc_queues_input_sample_time() -> None:
-    fake_worker = _CapturingWorker()
-    recorder = _recording_recorder_with_worker(fake_worker)
-    data = struct.pack("<2h", 1, 2)
-    input_data, keepalive = _audio_buffer_list_pointer((data, 2))
-    now, now_keepalive = _timestamp_pointer(
-        flags=capture_module.kAudioTimeStampHostTimeValid,
-        host_time=111,
-    )
-    input_time, input_keepalive = _timestamp_pointer(
-        flags=(
-            capture_module.kAudioTimeStampSampleTimeValid
-            | capture_module.kAudioTimeStampHostTimeValid
-            | capture_module.kAudioTimeStampRateScalarValid
-            | capture_module.kAudioTimeStampWordClockTimeValid
-        ),
-        sample_time=222.5,
-        host_time=333,
-        rate_scalar=1.25,
-        word_clock_time=444,
-    )
-    output_time, output_keepalive = _timestamp_pointer(flags=0)
-    keepalive.extend([now_keepalive, input_keepalive, output_keepalive])
-
-    status = recorder._io_proc(
-        0,
-        now,
-        input_data,
-        input_time,
-        cast(Any, None),
-        output_time,
-        cast(Any, None),
-    )
-
-    assert status == 0
-    assert fake_worker.input_sample_times == [222.5]
-
-
-def test_io_proc_reports_multi_buffer_layout_instead_of_writing_planar_audio() -> None:
-    fake_worker = _CapturingWorker()
-    recorder = _recording_recorder_with_worker(fake_worker)
-    left = struct.pack("<2h", 1, 3)
-    right = struct.pack("<2h", 2, 4)
-    input_data, _keepalive = _audio_buffer_list_pointer((left, 1), (right, 1))
-
-    status = recorder._io_proc(
-        0,
-        cast(Any, None),
-        input_data,
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-    )
-
-    assert status == 0
-    assert fake_worker.enqueued == []
-    failure = recorder._consume_io_proc_failure()
-    assert failure is not None
-    assert isinstance(failure.__cause__, UnsupportedTapFormatError)
-    assert "expected one interleaved buffer, got 2" in str(failure)
-
-
-def test_io_proc_reports_partial_frame_instead_of_writing_truncated_audio() -> None:
-    fake_worker = _CapturingWorker()
-    recorder = _recording_recorder_with_worker(fake_worker)
-    input_data, _keepalive = _audio_buffer_list_pointer((b"\x01\x02\x03", 2))
-
-    status = recorder._io_proc(
-        0,
-        cast(Any, None),
-        input_data,
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-    )
-
-    assert status == 0
-    assert fake_worker.enqueued == []
-    failure = recorder._consume_io_proc_failure()
-    assert failure is not None
-    assert isinstance(failure.__cause__, UnsupportedTapFormatError)
-    assert "not a whole number of frames" in str(failure)
-
-
-def test_io_proc_reports_missing_data_pointer_instead_of_ignoring_bytes() -> None:
-    fake_worker = _CapturingWorker()
-    recorder = _recording_recorder_with_worker(fake_worker)
-    input_data, _keepalive = _audio_buffer_list_pointer((b"\x00\x01\x02\x03", 2))
-    input_data.contents.mBuffers[0].mData = None
-
-    status = recorder._io_proc(
-        0,
-        cast(Any, None),
-        input_data,
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-    )
-
-    assert status == 0
-    assert fake_worker.enqueued == []
-    failure = recorder._consume_io_proc_failure()
-    assert failure is not None
-    assert isinstance(failure.__cause__, UnsupportedTapFormatError)
-    assert "without a data pointer" in str(failure)
-
-
-def test_io_proc_reports_missing_channel_count_instead_of_guessing() -> None:
-    fake_worker = _CapturingWorker()
-    recorder = _recording_recorder_with_worker(fake_worker)
-    input_data, _keepalive = _audio_buffer_list_pointer((b"\x00\x01\x02\x03", 0))
-
-    status = recorder._io_proc(
-        0,
-        cast(Any, None),
-        input_data,
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-        cast(Any, None),
-    )
-
-    assert status == 0
-    assert fake_worker.enqueued == []
-    failure = recorder._consume_io_proc_failure()
-    assert failure is not None
-    assert isinstance(failure.__cause__, UnsupportedTapFormatError)
-    assert "expected 2, got 0" in str(failure)
-
-
 def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:
     recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     total_updates = 2_000
@@ -1388,50 +1079,3 @@ def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:
 
     assert observed == sorted(observed)
     assert observed[-1] == total_updates
-
-
-def test_realtime_switch_interval_is_reference_counted() -> None:
-    original = sys.getswitchinterval()
-    try:
-        sys.setswitchinterval(0.005)
-
-        recorder_module._enter_realtime_switch_interval()
-        assert sys.getswitchinterval() == pytest.approx(
-            recorder_module._REALTIME_SWITCH_INTERVAL_SECONDS
-        )
-
-        recorder_module._enter_realtime_switch_interval()
-        recorder_module._exit_realtime_switch_interval()
-        assert sys.getswitchinterval() == pytest.approx(
-            recorder_module._REALTIME_SWITCH_INTERVAL_SECONDS
-        )
-
-        recorder_module._exit_realtime_switch_interval()
-        assert sys.getswitchinterval() == pytest.approx(0.005)
-    finally:
-        while recorder_module._switch_interval_users:
-            recorder_module._exit_realtime_switch_interval()
-        sys.setswitchinterval(original)
-
-
-def test_realtime_gc_pause_is_reference_counted() -> None:
-    was_enabled = gc.isenabled()
-    try:
-        gc.enable()
-
-        recorder_module._enter_realtime_gc_pause()
-        assert gc.isenabled() is False
-
-        recorder_module._enter_realtime_gc_pause()
-        recorder_module._exit_realtime_gc_pause()
-        assert gc.isenabled() is False
-
-        recorder_module._exit_realtime_gc_pause()
-        assert gc.isenabled() is True
-    finally:
-        while recorder_module._gc_pause_users:
-            recorder_module._exit_realtime_gc_pause()
-        if was_enabled:
-            gc.enable()
-        else:
-            gc.disable()

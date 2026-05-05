@@ -1,81 +1,22 @@
-# Performance and Real-Time Notes
+# Performance Notes
 
-The Core Audio callback runs on a real-time thread and has to return quickly.
-It copies each incoming buffer into a pool-owned ctypes buffer and enqueues it
-for the background worker with decoded scalar timing metadata. It does not call
-user code, write files, or wait for the worker. User callbacks and WAV writes
-run on the `catap-audio-worker` thread.
+`catap` records through a native Core Audio helper dylib. The Core Audio IOProc
+is a C function, not a Python callback.
 
-## Queueing
+On the real-time thread, the native IOProc validates the one-buffer interleaved
+layout, copies the incoming audio bytes into a preallocated single-producer /
+single-consumer ring, records simple counters, and returns. It does not run
+Python code, allocate per callback in the steady state, write files, call user
+callbacks, or wait on the background worker.
 
-The recorder uses a bounded queue. If the worker falls behind, new buffers
-are dropped rather than letting memory grow without bound. The dropped count
-is reported when recording stops.
+A Python drain thread reads the native ring and hands owned `bytes` to the
+normal worker. WAV writing and `on_buffer` callbacks still run on
+`catap-audio-worker`, outside the Core Audio real-time path.
 
-The buffer pool is a `queue.SimpleQueue`: the callback takes a buffer with
-`get_nowait()` and the worker returns it with `put()`. This avoids a separate
-Python-level lock around pool mutation while still using a thread-safe
-primitive on free-threaded builds. The work queue is a bounded `queue.Queue`,
-so overload turns into dropped audio rather than runaway memory. Multi-step
-recorder state — frame counters, callback failures — uses explicit locks.
+If the native ring fills, `catap` drops incoming buffers and reports that on
+stop instead of growing memory without bound. `max_pending_buffers` controls
+the ring depth and worker queue depth.
 
-## Tradeoffs
-
-- If Core Audio delivers a buffer larger than the pool's current buffer size,
-  the callback resizes that pool buffer in place. This should be rare after
-  startup, but it is an allocation on the callback thread.
-- The callback creates small Python queue and timing records per accepted
-  buffer; audio payload storage itself is pool-owned in the steady state.
-- `on_buffer` receives an `AudioBuffer` whose `data` is owned immutable
-  `bytes`, so user code can hold onto it after the pool buffer is reused.
-- Default queue depth is 256 buffers. Larger values tolerate slower sinks at
-  the cost of more memory and slower failure reporting.
-- Callback exceptions are never raised into Core Audio. The first failure is
-  captured and reported on `AudioRecorder.stop()`.
-
-## Profiling
-
-For real Core Audio runs, use Apple's `Audio System Trace` Instruments
-template. The `Audio Client`, `Audio Statistics`, and `Audio Server` tracks
-show IOProc timing, engine jitter, I/O cycle load, and overloads:
-
-```bash
-xcrun xctrace record \
-  --template "Audio System Trace" \
-  --all-processes \
-  --time-limit 20s \
-  --output /tmp/catap-audio.trace
-```
-
-Open the trace in Instruments. Check that callback work stays short, that
-file and user-callback work runs on the `catap-audio-worker` thread, and
-that the Audio Client/Server tracks show no overloads during normal
-recording.
-
-For a synthetic profile that does not require audio-capture permission:
-
-```bash
-uv run python scripts/catap_profile_pipeline.py
-```
-
-To simulate a slow callback with Core Audio-like pacing:
-
-```bash
-uv run python scripts/catap_profile_pipeline.py --slow-callback-ms 2
-```
-
-The default converter and worker profiles are unpaced throughput tests. The
-slow-callback profile is paced at the synthetic buffer interval. Add
-`--slow-burst` to also run the older burst pressure test.
-
-For a live probe that creates a real tap and measures callback timing through
-the public recording API:
-
-```bash
-uv run python scripts/catap_live_probe.py --seconds 2
-```
-
-The probe reports callback intervals, observed frames and bytes, drop errors
-on stop, and (best-effort) queue depth when the private recorder state
-exposes it. It needs the same macOS audio-capture permission as a normal
-recording.
+The native dylib is required for recording. If it is missing or has an
+unsupported ABI version, recording fails at startup instead of falling back to
+the old Python IOProc path.

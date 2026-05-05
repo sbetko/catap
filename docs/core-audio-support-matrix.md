@@ -23,8 +23,9 @@ Evidence labels:
 | IOProc lifecycle | Registers an `AudioDeviceIOProc`, starts and stops it with `AudioDeviceStart` / `AudioDeviceStop`, then destroys the IOProc. | Apple sample/docs; SDK header; runtime audit; unit tests. | Supported for normal start/stop. | Start/stop races and abnormal device-stop notifications need more probing. |
 | IOProc callback shape | Expects a single interleaved input buffer for the one-tap aggregate path. | Runtime audit; unit tests around unsupported layouts. | Supported for the verified path. | Multi-buffer and non-interleaved layouts are rejected. |
 | IOProc stream usage | Does not set `kAudioDevicePropertyIOProcStreamUsage` for the one-stream aggregate path. | SDK header; runtime audit. | Supported for the current one-stream aggregate. | Revisit before supporting multi-stream aggregates. |
-| Worker boundary | Copies callback data into pool-owned buffers, then hands work to a background thread for WAV output or user callbacks. | Unit tests; synthetic profile; live probe. | Supported. | Callback hot-path allocations under changing buffer sizes should be watched in longer traces. |
-| Bounded backpressure | Drops buffers and reports the failure on stop when the worker falls behind. | Unit tests; synthetic profile; live slow-callback probe. | Supported. | Defaults need tuning against longer real captures and slower disks. |
+| Native IOProc | Uses the bundled native dylib as the Core Audio IOProc and writes callback audio into a preallocated SPSC ring. | Unit tests; runtime audit. | Supported for the verified one-buffer interleaved path. | Multi-buffer and non-interleaved layouts are rejected. |
+| Worker boundary | Drains native-ring chunks on a Python thread, then runs WAV output or user callbacks on `catap-audio-worker`. | Unit tests; integration smoke test. | Supported. | Defaults need tuning against longer real captures and slower disks. |
+| Bounded backpressure | Drops buffers and reports the failure on stop when the native ring or worker falls behind. | Unit tests; integration smoke test. | Supported. | None known for the current one-tap path. |
 
 ## Explicit Non-Claims
 
@@ -50,8 +51,4 @@ uv run pytest
 CATAP_RUN_INTEGRATION=1 uv run pytest -m integration
 CATAP_RUN_TONE_INTEGRATION=1 \
   uv run pytest tests/test_integration.py::test_cli_records_headless_tone_by_audio_object_id
-uv run python scripts/catap_live_probe.py --seconds 2
 ```
-
-When changing recorder internals, also profile manually with Instruments'
-`Audio System Trace` template.
