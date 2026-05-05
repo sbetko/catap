@@ -18,6 +18,11 @@ from catap._capture_engine import (
     _TapStreamFormat,
     kAudioTimeStampSampleTimeValid,
 )
+from catap._native_coreaudio import (
+    NativeCoreAudioRecorder,
+    NativeCoreAudioRecorderStats,
+    NativeCoreAudioUnavailable,
+)
 from catap._recording_support import (
     _DEFAULT_MAX_PENDING_BUFFERS,
     _add_secondary_failure,
@@ -39,6 +44,8 @@ from catap.bindings._audiotoolbox import kAudioFormatLinearPCM
 
 _copy_audio_data = ctypes.memmove
 _REALTIME_SWITCH_INTERVAL_SECONDS = 0.00025
+_NATIVE_DRAIN_IDLE_INTERVAL_SECONDS = 0.001
+_NATIVE_SLOT_FRAME_CAPACITY = 16_384
 _switch_interval_lock = threading.Lock()
 _switch_interval_users = 0
 _previous_switch_interval: float | None = None
@@ -194,6 +201,10 @@ class AudioRecorder:
             [ctypes.c_void_p, int, int, float | None],
             bool,
         ] | None = None
+        self._native_recorder: NativeCoreAudioRecorder | None = None
+        self._native_drain_thread: threading.Thread | None = None
+        self._native_drain_stop_event: threading.Event | None = None
+        self._native_drain_failures: list[RuntimeError] = []
 
         self._total_frames = 0
         self._dropped_buffers = 0
@@ -430,6 +441,122 @@ class AudioRecorder:
     def _clear_realtime_worker(self) -> None:
         self._rt_enqueue_copied_audio_data = None
 
+    def _try_create_native_recorder(self) -> NativeCoreAudioRecorder | None:
+        """Create the native IOProc recorder when the dylib is available."""
+        try:
+            return NativeCoreAudioRecorder(
+                slot_count=self._max_pending_buffers,
+                slot_capacity=self._native_slot_capacity(),
+                expected_channel_count=self._num_channels,
+                bytes_per_frame=self._bytes_per_frame,
+            )
+        except NativeCoreAudioUnavailable:
+            return None
+
+    def _native_slot_capacity(self) -> int:
+        return self._bytes_per_frame * _NATIVE_SLOT_FRAME_CAPACITY
+
+    def _start_native_drain(self, native_recorder: NativeCoreAudioRecorder) -> None:
+        if self._native_drain_thread is not None:
+            raise RuntimeError("Native recorder drain already started")
+
+        stop_event = threading.Event()
+        self._native_drain_stop_event = stop_event
+        self._native_drain_failures = []
+        thread = threading.Thread(
+            target=self._native_drain_loop,
+            args=(native_recorder, stop_event),
+            name="catap-native-audio-drain",
+            daemon=False,
+        )
+        thread.start()
+        self._native_drain_thread = thread
+
+    def _stop_native_drain(self) -> None:
+        stop_event = self._native_drain_stop_event
+        if stop_event is not None:
+            stop_event.set()
+
+        thread = self._native_drain_thread
+        if thread is not None:
+            thread.join()
+
+        self._native_drain_thread = None
+        self._native_drain_stop_event = None
+
+        failures = self._native_drain_failures
+        self._native_drain_failures = []
+        if failures:
+            raise _combine_errors("Failed to drain native recorder", failures)
+
+    def _native_drain_loop(
+        self,
+        native_recorder: NativeCoreAudioRecorder,
+        stop_event: threading.Event,
+    ) -> None:
+        try:
+            while True:
+                drained = self._drain_native_recorder(native_recorder)
+                if stop_event.is_set():
+                    return
+                if not drained:
+                    stop_event.wait(_NATIVE_DRAIN_IDLE_INTERVAL_SECONDS)
+        except Exception as exc:
+            failure = _translate_exception(
+                RuntimeError,
+                f"Native recorder drain failed: {exc}",
+                exc,
+            )
+            assert isinstance(failure, RuntimeError)
+            self._native_drain_failures.append(failure)
+
+    def _drain_native_recorder(
+        self,
+        native_recorder: NativeCoreAudioRecorder,
+    ) -> bool:
+        drained = False
+        while True:
+            chunk = native_recorder.read()
+            if chunk is None:
+                return drained
+            drained = True
+            self._worker.enqueue_audio_bytes(
+                chunk.data,
+                chunk.frame_count,
+                chunk.input_sample_time,
+            )
+
+    def _native_recorder_errors(
+        self,
+        stats: NativeCoreAudioRecorderStats,
+    ) -> list[RuntimeError]:
+        errors: list[RuntimeError] = []
+        if stats.callback_failures:
+            errors.append(
+                RuntimeError(
+                    "Native CoreAudio callback rejected "
+                    f"{stats.callback_failures} audio buffer(s); last error "
+                    f"{stats.last_error_name} ({stats.last_error_status})."
+                )
+            )
+
+        if stats.ring.dropped_chunks:
+            message = (
+                "Dropped "
+                f"{stats.ring.dropped_chunks} native audio buffer(s) "
+                f"({stats.ring.dropped_frames} frame(s)) before they reached "
+                "the background worker."
+            )
+            if stats.ring.oversized_chunks:
+                message += (
+                    " "
+                    f"{stats.ring.oversized_chunks} buffer(s) exceeded the "
+                    "native ring slot capacity."
+                )
+            errors.append(RuntimeError(message))
+
+        return errors
+
     @staticmethod
     def _input_sample_time(timestamp: AudioTimeStampPtr) -> float | None:
         """Copy only the continuity-relevant sample time off the Core Audio pointer."""
@@ -539,21 +666,37 @@ class AudioRecorder:
 
             cleanup: list[Callable[[], None]] = []
             capture_session: _TapCaptureSession | None = None
+            native_recorder: NativeCoreAudioRecorder | None = None
             try:
-                capture_session = self._capture_engine.open_tap_capture(
-                    self.tap_id,
-                    self._callback,
-                )
+                native_recorder = self._try_create_native_recorder()
+                if native_recorder is not None:
+                    self._native_recorder = native_recorder
+                    cleanup.append(native_recorder.close)
+                    capture_session = self._capture_engine.open_tap_capture(
+                        self.tap_id,
+                        native_recorder.io_proc_pointer,
+                        native_recorder.handle,
+                    )
+                else:
+                    capture_session = self._capture_engine.open_tap_capture(
+                        self.tap_id,
+                        self._callback,
+                    )
                 self._capture_session = capture_session
                 cleanup.append(lambda: self._capture_engine.close(capture_session))
 
-                self._enter_runtime_tuning()
-                cleanup.append(self._exit_runtime_tuning)
+                if native_recorder is None:
+                    self._enter_runtime_tuning()
+                    cleanup.append(self._exit_runtime_tuning)
 
                 self._worker.start(self._make_worker_config())
                 cleanup.append(lambda: self._worker.stop(publish=False))
-                self._bind_realtime_worker()
-                cleanup.append(self._clear_realtime_worker)
+                if native_recorder is None:
+                    self._bind_realtime_worker()
+                    cleanup.append(self._clear_realtime_worker)
+                else:
+                    self._start_native_drain(native_recorder)
+                    cleanup.append(self._stop_native_drain)
 
                 with self._lifecycle_lock:
                     self._is_recording = True
@@ -573,6 +716,7 @@ class AudioRecorder:
                             cleanup_exc,
                         )
                 self._capture_session = None
+                self._native_recorder = None
                 raise
         except Exception:
             with self._lifecycle_lock:
@@ -598,8 +742,10 @@ class AudioRecorder:
             self._lifecycle_state = "stopping"
             self._is_recording = False
             capture_session = self._capture_session
+            native_recorder = self._native_recorder
 
         cleanup_errors: list[OSError | RuntimeError] = []
+        publish_worker_output = True
 
         if capture_session is not None:
             try:
@@ -607,13 +753,31 @@ class AudioRecorder:
             except OSError as exc:
                 cleanup_errors.append(exc)
 
+        if native_recorder is not None:
+            try:
+                self._stop_native_drain()
+            except RuntimeError as exc:
+                cleanup_errors.append(exc)
+                publish_worker_output = False
+
+            try:
+                native_errors = self._native_recorder_errors(native_recorder.stats())
+            except RuntimeError as exc:
+                cleanup_errors.append(exc)
+                publish_worker_output = False
+            else:
+                if native_errors:
+                    cleanup_errors.extend(native_errors)
+                    publish_worker_output = False
+
+        if capture_session is not None:
             try:
                 self._capture_engine.close(capture_session)
             except OSError as exc:
                 cleanup_errors.append(exc)
 
         try:
-            self._worker.stop()
+            self._worker.stop(publish=publish_worker_output)
         except (OSError, RuntimeError) as exc:
             cleanup_errors.append(exc)
         finally:
@@ -626,6 +790,9 @@ class AudioRecorder:
             cleanup_errors.append(callback_failure)
 
         self._capture_session = None
+        if native_recorder is not None:
+            native_recorder.close()
+            self._native_recorder = None
 
         with self._lifecycle_lock:
             self._lifecycle_state = "idle"

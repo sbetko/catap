@@ -185,6 +185,46 @@ class _CapturingWorker:
         return True
 
 
+class _FakeNativeRingStats:
+    def __init__(
+        self,
+        *,
+        dropped_chunks: int = 0,
+        dropped_frames: int = 0,
+        oversized_chunks: int = 0,
+    ) -> None:
+        self.dropped_chunks = dropped_chunks
+        self.dropped_frames = dropped_frames
+        self.oversized_chunks = oversized_chunks
+
+
+class _FakeNativeRecorderStats:
+    def __init__(
+        self,
+        *,
+        callback_failures: int = 0,
+        last_error_status: int = 0,
+        last_error_name: str = "OK",
+        ring: _FakeNativeRingStats | None = None,
+    ) -> None:
+        self.callback_failures = callback_failures
+        self.last_error_status = last_error_status
+        self.last_error_name = last_error_name
+        self.ring = _FakeNativeRingStats() if ring is None else ring
+
+
+class _FakeNativeChunk:
+    def __init__(
+        self,
+        data: bytes,
+        frame_count: int,
+        input_sample_time: float | None = None,
+    ) -> None:
+        self.data = data
+        self.frame_count = frame_count
+        self.input_sample_time = input_sample_time
+
+
 def _recording_recorder_with_worker(
     fake_worker: _CapturingWorker,
 ) -> AudioRecorder:
@@ -248,6 +288,22 @@ def test_writer_preserves_int16_audio(tmp_path) -> None:
         samples = struct.unpack("<3h", wav_file.readframes(3))
 
     assert samples == (100, -200, 300)
+
+
+def test_worker_queues_owned_audio_bytes_for_non_realtime_producers() -> None:
+    seen: list[PublicAudioBuffer] = []
+    worker = _make_worker()
+    config = _make_worker_config(on_buffer=lambda buffer: seen.append(buffer))
+    worker.start(config)
+
+    assert worker.enqueue_audio_bytes(b"\x01\x02\x03\x04", 2, 123.5) is True
+
+    worker.stop()
+
+    assert len(seen) == 1
+    assert seen[0].data == b"\x01\x02\x03\x04"
+    assert seen[0].frame_count == 2
+    assert seen[0].input_sample_time == 123.5
 
 
 def test_start_worker_raises_cleanly_for_missing_output_directory(tmp_path) -> None:
@@ -622,8 +678,9 @@ def test_failed_device_start_does_not_clobber_existing_output_file(tmp_path) -> 
             self,
             tap_id: int,
             callback: object,
+            client_data: object | None = None,
         ) -> capture_module._TapCaptureSession:
-            del tap_id, callback
+            del tap_id, callback, client_data
             return capture_module._TapCaptureSession(55, ctypes.c_void_p(77))
 
         def start(self, session: capture_module._TapCaptureSession) -> None:
@@ -642,6 +699,106 @@ def test_failed_device_start_does_not_clobber_existing_output_file(tmp_path) -> 
     assert output_path.read_bytes() == original_bytes
     assert list(tmp_path.glob(".existing.wav.*.tmp")) == []
     assert recorder._lifecycle_state == "idle"
+
+
+def test_start_uses_native_io_proc_when_dylib_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_recorders: list[Any] = []
+    capture_calls: list[tuple[object, object | None]] = []
+    tuning_calls: list[str] = []
+
+    class _FakeNativeRecorder:
+        def __init__(
+            self,
+            *,
+            slot_count: int,
+            slot_capacity: int,
+            expected_channel_count: int,
+            bytes_per_frame: int,
+        ) -> None:
+            self.slot_count = slot_count
+            self.slot_capacity = slot_capacity
+            self.expected_channel_count = expected_channel_count
+            self.bytes_per_frame = bytes_per_frame
+            self.io_proc_pointer = ctypes.c_void_p(456)
+            self.handle = ctypes.c_void_p(789)
+            self.closed = False
+            created_recorders.append(self)
+
+        def read(self) -> object | None:
+            return None
+
+        def stats(self) -> _FakeNativeRecorderStats:
+            return _FakeNativeRecorderStats()
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _NativeCaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                32,
+                True,
+                bytes_per_frame=8,
+                is_signed_integer=False,
+            )
+
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> capture_module._TapCaptureSession:
+            del tap_id
+            capture_calls.append((callback, client_data))
+            return capture_module._TapCaptureSession(55, ctypes.c_void_p(77))
+
+        def start(self, session: capture_module._TapCaptureSession) -> None:
+            session.started = True
+
+        def stop(self, session: capture_module._TapCaptureSession) -> None:
+            session.started = False
+
+        def close(self, session: capture_module._TapCaptureSession) -> None:
+            del session
+
+    monkeypatch.setattr(recorder_module, "NativeCoreAudioRecorder", _FakeNativeRecorder)
+    monkeypatch.setattr(
+        recorder_module,
+        "_enter_realtime_switch_interval",
+        lambda: tuning_calls.append("switch"),
+    )
+    monkeypatch.setattr(
+        recorder_module,
+        "_enter_realtime_gc_pause",
+        lambda: tuning_calls.append("gc"),
+    )
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, _NativeCaptureEngine())
+
+    recorder.start()
+    recorder.stop()
+
+    native_recorder = created_recorders[0]
+    assert native_recorder.slot_count == recorder.max_pending_buffers
+    assert (
+        native_recorder.slot_capacity
+        == 8 * recorder_module._NATIVE_SLOT_FRAME_CAPACITY
+    )
+    assert native_recorder.expected_channel_count == 2
+    assert native_recorder.bytes_per_frame == 8
+    assert capture_calls == [(native_recorder.io_proc_pointer, native_recorder.handle)]
+    assert tuning_calls == []
+    assert native_recorder.closed is True
+    assert recorder._native_recorder is None
 
 
 def test_failed_start_unwinds_cleanup_for_non_oserror_exceptions(
@@ -896,7 +1053,13 @@ def test_start_rejects_non_interleaved_tap_format() -> None:
                 is_signed_integer=False,
             )
 
-        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> object:
+            del tap_id, callback, client_data
             raise AssertionError("capture should not open for unsupported formats")
 
     recorder = AudioRecorder(123, "recording.wav")
@@ -925,7 +1088,13 @@ def test_start_rejects_non_linear_pcm_tap_format() -> None:
                 is_signed_integer=False,
             )
 
-        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> object:
+            del tap_id, callback, client_data
             raise AssertionError("capture should not open for unsupported formats")
 
     recorder = AudioRecorder(123, "recording.wav")
@@ -954,7 +1123,13 @@ def test_start_rejects_big_endian_tap_format() -> None:
                 is_signed_integer=True,
             )
 
-        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> object:
+            del tap_id, callback, client_data
             raise AssertionError("capture should not open for unsupported formats")
 
     recorder = AudioRecorder(123, "recording.wav")
@@ -982,7 +1157,13 @@ def test_start_rejects_unsigned_integer_tap_format() -> None:
                 is_signed_integer=False,
             )
 
-        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> object:
+            del tap_id, callback, client_data
             raise AssertionError("capture should not open for unsupported formats")
 
     recorder = AudioRecorder(123, "recording.wav")
@@ -1010,7 +1191,13 @@ def test_start_rejects_padded_tap_frames() -> None:
                 is_interleaved=True,
             )
 
-        def open_tap_capture(self, tap_id: int, callback: object) -> object:
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> object:
+            del tap_id, callback, client_data
             raise AssertionError("capture should not open for unsupported formats")
 
     recorder = AudioRecorder(123, "recording.wav")

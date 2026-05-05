@@ -134,6 +134,43 @@ def test_open_tap_capture_creates_aggregate_device_and_io_proc(
     assert session.started is False
 
 
+def test_open_tap_capture_passes_client_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback = ctypes.c_void_p(123)
+    client_data = ctypes.c_void_p(456)
+    calls: list[tuple[int, object, object]] = []
+
+    monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(
+        capture_module,
+        "_create_aggregate_device_for_tap",
+        lambda tap_uid, name: 55,
+    )
+
+    def create_io_proc(
+        device_id: int,
+        callback_arg: object,
+        client_data_arg: object,
+        io_proc_id: object,
+    ) -> int:
+        calls.append((device_id, callback_arg, client_data_arg))
+        _set_void_p(io_proc_id, 77)
+        return 0
+
+    monkeypatch.setattr(capture_module, "_AudioDeviceCreateIOProcID", create_io_proc)
+
+    session = capture_module._TapCaptureEngine().open_tap_capture(
+        123,
+        callback,
+        client_data,
+    )
+
+    assert calls == [(55, callback, client_data)]
+    assert session.io_proc_callback is callback
+    assert session.client_data is client_data
+
+
 def test_open_tap_capture_destroys_aggregate_when_io_proc_creation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

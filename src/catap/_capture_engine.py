@@ -86,7 +86,7 @@ _AudioHardwareDestroyAggregateDevice.restype = ctypes.c_int32
 _AudioDeviceCreateIOProcID = _CoreAudio.AudioDeviceCreateIOProcID
 _AudioDeviceCreateIOProcID.argtypes = [
     ctypes.c_uint32,
-    AudioDeviceIOProcType,
+    ctypes.c_void_p,
     ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_void_p),
 ]
@@ -205,6 +205,8 @@ class _TapCaptureSession:
 
     aggregate_device_id: int
     io_proc_id: ctypes.c_void_p
+    io_proc_callback: object | None = None
+    client_data: object | None = None
     started: bool = False
 
 
@@ -243,6 +245,7 @@ class _TapCaptureEngine:
         self,
         tap_id: int,
         callback: object,
+        client_data: object | None = None,
     ) -> _TapCaptureSession:
         """Create the aggregate device and IOProc for a recorder session."""
         try:
@@ -262,7 +265,7 @@ class _TapCaptureEngine:
             status = _AudioDeviceCreateIOProcID(
                 aggregate_device_id,
                 callback,
-                None,
+                client_data,
                 ctypes.byref(io_proc_id),
             )
             if status != 0:
@@ -271,6 +274,8 @@ class _TapCaptureEngine:
             return _TapCaptureSession(
                 aggregate_device_id=aggregate_device_id,
                 io_proc_id=io_proc_id,
+                io_proc_callback=callback,
+                client_data=client_data,
             )
         except Exception as exc:
             if aggregate_device_id is not None:

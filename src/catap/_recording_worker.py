@@ -281,6 +281,36 @@ class _AudioWorker:
         state.work_queue.put_audio(item)
         return True
 
+    def enqueue_audio_bytes(
+        self,
+        data: bytes,
+        num_frames: int,
+        input_sample_time: float | None = None,
+    ) -> bool:
+        """Queue owned audio bytes from a non-real-time producer."""
+        state = self._state
+        if state is None:
+            return True
+
+        try:
+            item = state.item_pool.pop()
+        except IndexError:
+            self._record_dropped_frames(num_frames)
+            return False
+
+        byte_count = len(data)
+        item.ensure_capacity(byte_count)
+        item.prepare(
+            num_frames=num_frames,
+            byte_count=byte_count,
+            input_sample_time=input_sample_time,
+        )
+        if byte_count:
+            item.buffer[:byte_count] = data
+
+        state.work_queue.put_audio(item)
+        return True
+
     def _create_state(self, config: _WorkerConfig) -> _WorkerState:
         """Create worker-owned queueing state and start the worker thread."""
         stream_format = config.stream_format
