@@ -4,9 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-05
+
 - BREAKING: Replaced streaming callbacks from `on_data(data, num_frames)` with
-  `on_buffer(buffer: AudioBuffer)`. The next release should be `0.5.0`, not
-  `0.4.4`.
+  `on_buffer(buffer: AudioBuffer)`.
 - Added callback metadata types: `AudioBuffer` and `AudioStreamFormat`.
 - Added `stream_format` accessors on `AudioRecorder` and `RecordingSession`;
   use fields such as `stream_format.sample_rate` instead of scalar format
