@@ -82,7 +82,7 @@ class AudioRecorder:
             tap_id: AudioObjectID of the tap to record from
             output_path: Path to write the WAV file, or None for streaming mode
             on_buffer: Optional callback invoked with an ``AudioBuffer`` for
-                each captured buffer. The bytes are owned and safe to retain.
+                each captured buffer. The bytes are safe to retain.
                 The callback runs on catap's background worker thread, so
                 Core Audio's real-time callback stays lightweight.
             max_pending_buffers: Maximum number of audio buffers to queue for
@@ -386,7 +386,7 @@ class AudioRecorder:
             if self._lifecycle_state == "recording":
                 raise RuntimeError("Already recording")
             if self._lifecycle_state != "idle":
-                raise RuntimeError("Recorder lifecycle transition already in progress")
+                raise RuntimeError("Recorder is already starting or stopping")
             self._lifecycle_state = "starting"
 
         try:
@@ -461,7 +461,7 @@ class AudioRecorder:
             if self._lifecycle_state == "idle":
                 raise RuntimeError("Not recording")
             if self._lifecycle_state != "recording":
-                raise RuntimeError("Recorder lifecycle transition already in progress")
+                raise RuntimeError("Recorder is already starting or stopping")
 
             self._lifecycle_state = "stopping"
             self._is_recording = False

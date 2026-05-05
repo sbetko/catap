@@ -62,7 +62,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-exclude = ["catap._devtools", "catap._devtools.*"]
 
 [tool.setuptools]
 include-package-data = false
@@ -95,7 +94,6 @@ markers = [
 [tool.coverage.report]
 omit = [
     "src/catap/__main__.py",
-    "src/catap/_devtools/*",
 ]
 
 [tool.vulture]

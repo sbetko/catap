@@ -74,7 +74,7 @@ def build_system_tap_description(
 
 class RecordingSession:
     """
-    Managed recording session that owns tap and recorder lifecycle.
+    Recording session that owns tap and recorder cleanup.
 
     This is the higher-level API for common capture flows. It wraps the
     lower-level tap creation and AudioRecorder startup/shutdown steps so users
@@ -92,15 +92,15 @@ class RecordingSession:
         _backend: _SessionBackend | None = None,
     ) -> None:
         """
-        Create a managed recording session.
+        Create a recording session.
 
         Args:
             tap_description: Tap description to create when recording starts
             output_path: Path to write a WAV file, or None for streaming mode
             on_buffer: Optional callback invoked with an ``AudioBuffer`` for
-                each captured buffer. The buffer's data is owned and safe to
-                retain. Runs on catap's background worker thread, not on Core
-                Audio's real-time callback thread.
+                each captured buffer. The buffer's data is safe to retain.
+                Runs on catap's background worker thread, not on Core Audio's
+                real-time callback thread.
             max_pending_buffers: Maximum number of audio buffers to queue for
                 the background worker before new buffers are dropped and the
                 capture fails on stop. Higher values trade memory for tolerance
@@ -134,7 +134,7 @@ class RecordingSession:
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """
-        Create a managed session for recording one application's audio.
+        Create a session for recording one application's audio.
 
         Args:
             process: Application name or AudioProcess to record
@@ -175,7 +175,7 @@ class RecordingSession:
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
         """
-        Create a managed session for recording a global process-output mix.
+        Create a session for recording a global process-output mix.
 
         Args:
             output_path: Path to write a WAV file, or None for streaming mode
@@ -211,7 +211,7 @@ class RecordingSession:
         on_buffer: Callable[[AudioBuffer], None] | None = None,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
     ) -> Self:
-        """Create a managed session that records from an existing tap."""
+        """Create a session that records from an existing tap."""
         backend = _DEFAULT_SESSION_BACKEND
         source_tap = tap if isinstance(tap, AudioTap) else None
         tap_id = tap.audio_object_id if isinstance(tap, AudioTap) else tap
@@ -427,7 +427,7 @@ def record_process(
     max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
-    Create a managed session for recording one application's audio.
+    Create a session for recording one application's audio.
 
     The session owns tap creation, recorder startup, shutdown, and tap cleanup.
     Pass ``max_pending_buffers`` to tune how much audio can be queued while the
@@ -450,7 +450,7 @@ def record_system_audio(
     max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
-    Create a managed session for recording a global process-output mix.
+    Create a session for recording a global process-output mix.
 
     The session owns tap creation, recorder startup, shutdown, and tap cleanup.
     Pass ``max_pending_buffers`` to tune how much audio can be queued while the
@@ -472,10 +472,10 @@ def record_tap(
     max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
 ) -> RecordingSession:
     """
-    Create a managed session for recording from an existing visible tap.
+    Create a session for recording from an existing visible tap.
 
-    The tap itself is treated as externally owned and will not be destroyed
-    when the session stops or closes.
+    The tap was created elsewhere, so the session will not destroy it when
+    recording stops.
     """
     return RecordingSession.from_tap(
         tap,

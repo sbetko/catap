@@ -48,6 +48,8 @@ class bdist_wheel(_bdist_wheel):
 
     def get_tag(self) -> tuple[str, str, str]:
         _python, _abi, platform_tag = super().get_tag()
+        if sys.platform == "darwin":
+            platform_tag = "macosx_14_0_universal2"
         return "py3", "none", platform_tag
 
 

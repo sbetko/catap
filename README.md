@@ -20,8 +20,8 @@ It targets macOS 14.2 and newer. CI covers CPython 3.11 through 3.14 plus
 free-threaded CPython 3.13t and 3.14t on macOS. Current development is on
 Apple Silicon and macOS 26.2.
 
-Recording requires the bundled native Core Audio helper dylib. Wheels include
-it; source builds require the macOS command-line developer tools.
+Recording requires the bundled native Core Audio dylib. Wheels include a
+universal2 build; source builds require the macOS command-line developer tools.
 
 ## Quick start
 
@@ -54,22 +54,21 @@ print(f"Recorded {session.duration_seconds:.2f} seconds")
 - Use a bounded audio queue: if the worker falls behind, buffers are dropped
   and the count is reported on stop, instead of growing memory without bound.
 
-## Support boundary
+## Scope
 
 `catap` is a process-output capture library. It is not a microphone/input-device
 recorder, an AudioServerPlugIn implementation, or a virtual audio driver.
 
 The current recorder path reads one tap through one private HAL aggregate
-device. It accepts packed, interleaved linear PCM tap formats and fails closed
-for non-interleaved, multi-buffer, compressed, padded, or otherwise unusual
-formats.
+device. It accepts packed, interleaved linear PCM tap formats and rejects
+non-interleaved, multi-buffer, compressed, padded, or otherwise unusual formats.
 
 The `--system` and `record_system_audio()` paths build a global Core Audio tap:
 they capture process output that Core Audio exposes to taps. Long-running
 captures across sleep/wake, route changes, source-process restarts, and default
-output-device changes are intentionally not claimed yet. See
-[`docs/core-audio-support-matrix.md`](docs/core-audio-support-matrix.md) for the
-full support matrix.
+output-device changes are not covered yet. See
+[`docs/core-audio-notes.md`](docs/core-audio-notes.md) for the short Core Audio
+notes.
 
 ## Usage
 
@@ -101,14 +100,14 @@ print(f"Recorded {session.duration_seconds:.2f} seconds")
 
 If you pass `on_buffer=...`, the callback runs on `catap`'s background worker
 thread so the Core Audio callback stays lightweight. The callback receives an
-`AudioBuffer` with owned `bytes`, frame count, stream format metadata, and
-Core Audio timing metadata:
+`AudioBuffer` with bytes that are safe to keep, frame count, stream format
+metadata, and Core Audio timing metadata:
 
 ```python
 from catap import AudioBuffer, record_process
 
 def on_buffer(buffer: AudioBuffer) -> None:
-    print(buffer.frame_count, buffer.format.sample_rate, buffer.timing.input_time.host_time)
+    print(buffer.frame_count, buffer.format.sample_rate, buffer.input_sample_time)
 
 session = record_process("Safari", on_buffer=on_buffer)
 session.record_for(5)
@@ -143,10 +142,8 @@ the error rather than picking one arbitrarily.
 ### Mute Behavior
 
 With `record_process(..., mute=True)`, the app stays muted for the lifetime
-of the recording session. The two underlying modes (`MUTED` and
-`MUTED_WHEN_TAPPED`) have different lifecycle semantics; see
-[`docs/mute-behavior.md`](docs/mute-behavior.md) for probe results and the
-points at which each mode transitions between audible and silent.
+of the recording session. The lower-level mute modes behave differently if the
+tap outlives the recorder; see [`docs/mute-behavior.md`](docs/mute-behavior.md).
 
 ### Low-level API
 
@@ -241,21 +238,9 @@ system-audio-capture entitlement.
    writes WAV data and invokes optional `on_buffer` callbacks outside the
    Core Audio real-time path.
 
-The supported Core Audio surface is enumerated in
-[`docs/core-audio-support-matrix.md`](docs/core-audio-support-matrix.md).
+The Core Audio notes live in [`docs/core-audio-notes.md`](docs/core-audio-notes.md).
 Recorder callback and queueing design is in
 [`docs/performance.md`](docs/performance.md).
-
-## Interactive lab
-
-A Tkinter app that exercises process browsing, mute modes, callback
-streaming, shared-tap attachment, device-stream-targeted taps, and a
-helper-tone launcher:
-
-```bash
-uv sync --group dev
-uv run python scripts/catap_core_lab.py
-```
 
 ## Development
 
@@ -293,9 +278,6 @@ CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
 
 Opt-in. Exercises the real macOS Core Audio bridge: process enumeration and
 a short recording that covers tap startup, shutdown, and WAV finalization.
-
-Signal-oracle testing with the internal tone fixtures is documented in
-[`docs/headless-signal-fixtures.md`](docs/headless-signal-fixtures.md).
 
 See [`RELEASE.md`](RELEASE.md) for the release checklist.
 

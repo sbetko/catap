@@ -43,8 +43,7 @@ class AudioStreamFormat:
 class AudioBuffer:
     """One native PCM callback buffer.
 
-    ``data`` is owned immutable bytes and is safe to retain after the callback
-    returns.
+    ``data`` is immutable bytes and is safe to retain after the callback returns.
     """
 
     data: bytes

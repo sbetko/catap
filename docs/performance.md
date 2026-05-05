@@ -1,7 +1,7 @@
 # Performance Notes
 
-`catap` records through a native Core Audio helper dylib. The Core Audio IOProc
-is a C function, not a Python callback.
+`catap` records through a native Core Audio dylib. The Core Audio IOProc is a C
+function, not a Python callback.
 
 On the real-time thread, the native IOProc validates the one-buffer interleaved
 layout, copies the incoming audio bytes into a preallocated single-producer /
@@ -9,7 +9,7 @@ single-consumer ring, records simple counters, and returns. It does not run
 Python code, allocate per callback in the steady state, write files, call user
 callbacks, or wait on the background worker.
 
-A Python drain thread reads the native ring and hands owned `bytes` to the
+A Python drain thread reads the native ring and hands audio bytes to the
 normal worker. WAV writing and `on_buffer` callbacks still run on
 `catap-audio-worker`, outside the Core Audio real-time path.
 

@@ -1,12 +1,11 @@
 # Mute Behavior
 
-`record_process(..., mute=True)` uses `TapMuteBehavior.MUTED`, which keeps
-the app muted for the lifetime of the tap. In the managed `RecordingSession`
-APIs that is effectively "muted while recording", since the tap is created
-on `start()` and destroyed on `stop()`.
+`record_process(..., mute=True)` uses `TapMuteBehavior.MUTED`. The app is
+muted while the recording session is active because the session creates the tap
+on `start()` and destroys it on `stop()`.
 
-The lower-level tap API decouples tap lifetime from recorder lifetime, and
-the two mute modes behave differently across that gap:
+If you use the lower-level tap API directly, the tap can outlive the recorder.
+The two mute modes behave differently in that case:
 
 - `MUTED` keeps playback muted as long as the tap exists, even if nothing is
   currently reading it.
@@ -14,9 +13,9 @@ the two mute modes behave differently across that gap:
   the tap. In `catap` that's usually a running `AudioRecorder`, but any
   other client reading the same tap has the same effect.
 
-## Probe results
+## Timing
 
-Running `scripts/catap_mute_timing_probe.py` shows:
+Local listening tests showed:
 
 - `MUTED_WHEN_TAPPED` stays audible through `create_process_tap()`,
   aggregate-device creation, and IOProc registration. It goes silent when
@@ -29,11 +28,4 @@ Running `scripts/catap_mute_timing_probe.py` shows:
 
 Neither `kAudioHardwarePropertyProcessIsAudible` nor
 `kAudioDevicePropertyProcessMute` tracked these transitions during the
-probe, so the audible result is the more trustworthy signal of the two.
-
-To run the probe:
-
-```bash
-uv run python scripts/catap_mute_timing_probe.py --interactive --mute-behavior MUTED_WHEN_TAPPED
-uv run python scripts/catap_mute_timing_probe.py --interactive --mute-behavior MUTED
-```
+tests, so the audible behavior is the useful signal.

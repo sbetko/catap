@@ -15,7 +15,7 @@ from catap.recorder import AudioRecorder
 
 
 class _RecorderLike(Protocol):
-    """Recorder surface the session layer relies on."""
+    """Recorder methods used by the session layer."""
 
     is_recording: bool
     frames_recorded: int

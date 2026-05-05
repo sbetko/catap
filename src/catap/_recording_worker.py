@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import os
 import queue
 import tempfile
@@ -12,7 +11,7 @@ import wave
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, TypeAlias, cast
+from typing import BinaryIO, TypeAlias
 
 from catap._recording_support import _combine_errors, _translate_exception
 from catap.audio_buffer import (
@@ -24,65 +23,19 @@ from catap.bindings._audiotoolbox import (
     make_linear_pcm_asbd,
 )
 
-# Pool buffers are ctypes char arrays rather than bytearrays because
-# ``ctypes.memmove`` rejects bytearray/memoryview as source or destination,
-# and the worker's AudioConverter path can consume the ctypes buffers directly
-# without an extra copy.
-_PoolBuffer: TypeAlias = ctypes.Array  # ctypes.c_char * N instance
 _WorkerFailure: TypeAlias = OSError | RuntimeError
-
-_DEFAULT_POOL_BUFFER_SIZE = 4096
 
 
 @dataclass(slots=True)
 class _AudioWorkItem:
-    """Reusable queue item carrying one callback buffer to the worker."""
+    """Owned audio bytes queued for the background worker."""
 
-    buffer: _PoolBuffer
-    num_frames: int = 0
-    byte_count: int = 0
-    input_sample_time: float | None = None
+    data: bytes
+    num_frames: int
+    input_sample_time: float | None
 
-    def ensure_capacity(self, byte_count: int) -> None:
-        if len(self.buffer) < byte_count:
-            self.buffer = (ctypes.c_char * byte_count)()
-
-    def prepare(
-        self,
-        *,
-        num_frames: int,
-        byte_count: int,
-        input_sample_time: float | None,
-    ) -> None:
-        self.num_frames = num_frames
-        self.byte_count = byte_count
-        self.input_sample_time = input_sample_time
 
 _WorkerItem: TypeAlias = _AudioWorkItem | None
-
-
-class _AudioWorkQueue:
-    """Simple audio queue for native-drain work."""
-
-    __slots__ = ("_queue",)
-
-    def __init__(self) -> None:
-        self._queue: queue.SimpleQueue[_WorkerItem] = queue.SimpleQueue()
-
-    def put_audio(
-        self,
-        item: _AudioWorkItem,
-    ) -> None:
-        self._queue.put(item)
-
-    def put_stop(self) -> None:
-        self._queue.put(None)
-
-    def get(self) -> _WorkerItem:
-        return self._queue.get()
-
-    def qsize(self) -> int:
-        return self._queue.qsize()
 
 
 @dataclass(slots=True)
@@ -101,8 +54,8 @@ class _WorkerConfig:
 class _WorkerState:
     """Worker state owned by the native drain and background thread."""
 
-    item_pool: list[_AudioWorkItem]
-    work_queue: _AudioWorkQueue
+    work_queue: queue.SimpleQueue[_WorkerItem]
+    pending_slots: threading.BoundedSemaphore
     output_file: BinaryIO | None = None
     wav_file: wave.Wave_write | None = None
     pcm_converter: PcmAudioConverter | None = None
@@ -166,7 +119,7 @@ class _AudioWorker:
             return
 
         if state.thread is not None and state.thread.is_alive():
-            state.work_queue.put_stop()
+            state.work_queue.put(None)
 
         if state.thread is not None:
             state.thread.join()
@@ -216,41 +169,24 @@ class _AudioWorker:
         if state is None:
             return True
 
-        try:
-            item = state.item_pool.pop()
-        except IndexError:
+        if not state.pending_slots.acquire(blocking=False):
             self._record_dropped_frames(num_frames)
             return False
 
-        byte_count = len(data)
-        item.ensure_capacity(byte_count)
-        item.prepare(
+        item = _AudioWorkItem(
+            data=data,
             num_frames=num_frames,
-            byte_count=byte_count,
             input_sample_time=input_sample_time,
         )
-        if byte_count:
-            item.buffer[:byte_count] = data
-
-        state.work_queue.put_audio(item)
+        state.work_queue.put(item)
         return True
 
     def _create_state(self, config: _WorkerConfig) -> _WorkerState:
         """Create worker-owned queueing state and start the worker thread."""
         stream_format = config.stream_format
-        bytes_per_frame = max(1, stream_format.bytes_per_frame)
-        pool_buffer_size = max(
-            _DEFAULT_POOL_BUFFER_SIZE,
-            bytes_per_frame * 1024,
-        )
-        pool_type = ctypes.c_char * pool_buffer_size
-        item_pool = [
-            _AudioWorkItem(pool_type()) for _ in range(config.max_pending_buffers)
-        ]
-
         state = _WorkerState(
-            item_pool=item_pool,
-            work_queue=_AudioWorkQueue(),
+            work_queue=queue.SimpleQueue(),
+            pending_slots=threading.BoundedSemaphore(config.max_pending_buffers),
         )
 
         with contextlib.ExitStack() as stack:
@@ -333,9 +269,8 @@ class _AudioWorker:
                 if item is None:
                     break
 
-                buf = item.buffer
+                data = item.data
                 num_frames = item.num_frames
-                byte_count = item.byte_count
                 self._record_accepted_frames(num_frames)
 
                 try:
@@ -343,7 +278,7 @@ class _AudioWorker:
                         try:
                             on_buffer(
                                 AudioBuffer(
-                                    data=cast(bytes, buf[:byte_count]),
+                                    data=data,
                                     frame_count=num_frames,
                                     format=stream_format,
                                     input_sample_time=item.input_sample_time,
@@ -362,10 +297,10 @@ class _AudioWorker:
                     if state.wav_file is not None and not state.writer_failed:
                         try:
                             if state.pcm_converter is not None:
-                                state.pcm_converter.convert(buf, byte_count)
+                                state.pcm_converter.convert(data)
                                 output_data = state.pcm_converter.output_view()
                             else:
-                                output_data = memoryview(buf)[:byte_count]
+                                output_data = data
                             state.wav_file.writeframesraw(output_data)
                         except Exception as exc:
                             state.writer_failed = True
@@ -377,10 +312,7 @@ class _AudioWorker:
                                 )
                             )
                 finally:
-                    item.num_frames = 0
-                    item.byte_count = 0
-                    item.input_sample_time = None
-                    state.item_pool.append(item)
+                    state.pending_slots.release()
         finally:
             self._close_resources(state)
 

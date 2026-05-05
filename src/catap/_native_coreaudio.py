@@ -1,4 +1,4 @@
-"""ctypes loader for catap's native CoreAudio helper library."""
+"""ctypes loader for catap's native CoreAudio library."""
 
 from __future__ import annotations
 
@@ -468,7 +468,7 @@ def find_native_coreaudio_path(path: str | Path | None = None) -> Path:
 
 
 def load_native_coreaudio(path: str | Path | None = None) -> NativeCoreAudioLibrary:
-    """Load catap's native CoreAudio helper dylib."""
+    """Load catap's native CoreAudio dylib."""
     library_path = find_native_coreaudio_path(path)
     if not library_path.exists():
         raise NativeCoreAudioUnavailable(

@@ -7,14 +7,12 @@ All notable changes to this project will be documented in this file.
 - BREAKING: Replaced streaming callbacks from `on_data(data, num_frames)` with
   `on_buffer(buffer: AudioBuffer)`. The next release should be `0.5.0`, not
   `0.4.4`.
-- Added callback metadata types: `AudioBuffer`, `AudioStreamFormat`,
-  `AudioTimestamp`, and `AudioBufferTiming`.
+- Added callback metadata types: `AudioBuffer` and `AudioStreamFormat`.
 - Added `stream_format` accessors on `AudioRecorder` and `RecordingSession`;
   use fields such as `stream_format.sample_rate` instead of scalar format
   convenience properties.
-- Added a native macOS Core Audio helper dylib for the recorder IOProc and
-  made it required for recording. The old pure-Python IOProc fallback has been
-  removed.
+- Added a native macOS Core Audio dylib for the recorder IOProc and made it
+  required for recording. The old pure-Python IOProc fallback has been removed.
 
   ```python
   # Before
@@ -29,8 +27,8 @@ All notable changes to this project will be documented in this file.
 
 ## [0.4.3] - 2026-04-28
 
-- Tightened README, CLI help, and package metadata around the process-tap support
-  boundary and unsupported capture scenarios.
+- Tightened README, CLI help, and package metadata around supported process-tap
+  scenarios and known gaps.
 
 ## [0.4.2] - 2026-04-27
 
@@ -114,7 +112,7 @@ All notable changes to this project will be documented in this file.
 - Recorder output-file lifecycle is hardened: failed WAV setup closes the underlying file, and the output file is closed in the worker's teardown.
 - Recorder startup no longer touches the destination WAV path until Core Audio startup succeeds, preventing failed starts from clobbering existing files.
 - Session and recorder setup now reject target-less "streaming" configurations unless an `on_data` callback is supplied.
-- Recorder now uses Core Audio `AudioConverter` for the float32 -> int16 WAV path, improving worker throughput while changing the exact int16 rounding/clipping semantics to match Core Audio.
+- Recorder now uses Core Audio `AudioConverter` for the float32 -> int16 WAV path, improving worker throughput while changing the exact int16 rounding/clipping behavior to match Core Audio.
 - CLI distinguishes output-file errors (bad path, unwritable directory) from permission errors when a recording fails to start.
 - Added an opt-in integration smoke test that performs a short real recording and validates the resulting WAV file.
 - Consolidated internal Core Audio bindings into a single `_coreaudio` module for easier maintenance.

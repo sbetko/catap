@@ -13,13 +13,19 @@ _ROOT = Path(__file__).resolve().parents[1]
 _SOURCE = _ROOT / "native" / "catap_coreaudio" / "src" / "catap_coreaudio.c"
 _INCLUDE = _ROOT / "native" / "catap_coreaudio" / "include"
 _DEFAULT_OUTPUT = _ROOT / "src" / "catap" / "native" / "libcatap_coreaudio.dylib"
+_DEFAULT_ARCHS = ("arm64", "x86_64")
 
 
-def _build_command(output: Path, *, debug: bool) -> list[str]:
+def _arch_flags(archs: tuple[str, ...]) -> list[str]:
+    return [flag for arch in archs for flag in ("-arch", arch)]
+
+
+def _build_command(output: Path, *, debug: bool, archs: tuple[str, ...]) -> list[str]:
     optimization_flags = ["-O0", "-g"] if debug else ["-O3", "-DNDEBUG"]
     return [
         "cc",
         "-std=c11",
+        *_arch_flags(archs),
         "-Wall",
         "-Wextra",
         "-Werror",
@@ -39,14 +45,25 @@ def _build_command(output: Path, *, debug: bool) -> list[str]:
     ]
 
 
-def build(output: Path, *, debug: bool = False) -> None:
+def build(
+    output: Path,
+    *,
+    debug: bool = False,
+    archs: tuple[str, ...] = _DEFAULT_ARCHS,
+) -> None:
     if platform.system() != "Darwin":
         raise SystemExit("catap native CoreAudio builds require macOS")
+    if not archs:
+        raise SystemExit("at least one architecture must be provided")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.setdefault("MACOSX_DEPLOYMENT_TARGET", "14.2")
-    subprocess.run(_build_command(output, debug=debug), env=env, check=True)
+    subprocess.run(
+        _build_command(output, debug=debug, archs=archs),
+        env=env,
+        check=True,
+    )
 
 
 def main() -> None:
@@ -62,9 +79,20 @@ def main() -> None:
         action="store_true",
         help="Build with debug symbols and no optimization",
     )
+    parser.add_argument(
+        "--arch",
+        action="append",
+        choices=_DEFAULT_ARCHS,
+        help="Architecture to include. Repeat to build multiple slices "
+        "(default: arm64 and x86_64).",
+    )
     args = parser.parse_args()
 
-    build(args.output, debug=args.debug)
+    build(
+        args.output,
+        debug=args.debug,
+        archs=tuple(args.arch) if args.arch else _DEFAULT_ARCHS,
+    )
 
 
 if __name__ == "__main__":
