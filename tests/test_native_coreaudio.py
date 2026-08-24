@@ -6,6 +6,7 @@ import ctypes
 import shutil
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,59 @@ def test_editable_build_generates_bundled_native_library(tmp_path: Path) -> None
     assert build.returncode == 0, build.stdout + build.stderr
     assert bundled_library.is_file()
     assert load_native_coreaudio(bundled_library).abi_version() == 1
+
+
+def test_sdist_excludes_editable_native_build_output(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    source_project = tmp_path / "source-project"
+    source_project.mkdir()
+
+    for filename in (
+        "CHANGELOG.md",
+        "LICENSE",
+        "MANIFEST.in",
+        "README.md",
+        "pyproject.toml",
+        "setup.py",
+    ):
+        shutil.copy2(project_root / filename, source_project / filename)
+    for directory in ("native", "scripts", "src"):
+        shutil.copytree(
+            project_root / directory,
+            source_project / directory,
+            ignore=shutil.ignore_patterns("*.egg-info", "__pycache__"),
+        )
+
+    generated_library = (
+        source_project
+        / "src"
+        / "catap"
+        / "native"
+        / "libcatap_coreaudio.dylib"
+    )
+    generated_library.parent.mkdir(parents=True, exist_ok=True)
+    generated_library.write_bytes(b"editable build output")
+
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from setuptools.build_meta import build_sdist; "
+            "build_sdist('dist')",
+        ],
+        cwd=source_project,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert build.returncode == 0, build.stdout + build.stderr
+    sdist = next((source_project / "dist").glob("catap-*.tar.gz"))
+    with tarfile.open(sdist, "r:gz") as archive:
+        members = archive.getnames()
+    assert not any(member.endswith(".dylib") for member in members)
+    assert any(member.endswith("catap_coreaudio.c") for member in members)
+    assert any(member.endswith("catap_coreaudio.h") for member in members)
 
 
 def test_abandoned_recorder_handle_is_not_destroyed() -> None:
