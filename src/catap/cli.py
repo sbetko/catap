@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import signal
 import sys
 import threading
@@ -47,10 +48,18 @@ def _positive_float(value: str) -> float:
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"{value!r} is not a valid number") from exc
 
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
 
     return parsed
+
+
+def _output_path(value: str) -> str:
+    if not value:
+        raise argparse.ArgumentTypeError("output path must not be empty")
+    return value
 
 
 def _positive_int(value: str) -> int:
@@ -110,6 +119,7 @@ def _build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument(
         "--output",
         "-o",
+        type=_output_path,
         default="output.wav",
         help="Output file path (default: output.wav)",
     )
@@ -429,13 +439,14 @@ def _build_system_tap(
     return build_system_tap_description(excluded_processes)
 
 
-def _print_recording_start_error(exc: OSError) -> None:
+def _print_recording_start_error(exc: OSError | RuntimeError) -> None:
     print(f"Error starting recording: {exc}", file=sys.stderr)
-    print("", file=sys.stderr)
 
-    hint_lines = _OUTPUT_HINT if exc.errno is not None else _PERMISSION_HINT
-    for line in hint_lines:
-        print(line, file=sys.stderr)
+    if isinstance(exc, OSError):
+        print("", file=sys.stderr)
+        hint_lines = _OUTPUT_HINT if exc.errno is not None else _PERMISSION_HINT
+        for line in hint_lines:
+            print(line, file=sys.stderr)
 
 
 def _run_recording_session(
@@ -457,8 +468,8 @@ def _run_recording_session(
     try:
         try:
             session.start()
-        except OSError as exc:
-            with contextlib.suppress(OSError):
+        except (OSError, RuntimeError) as exc:
+            with contextlib.suppress(OSError, RuntimeError):
                 session.close()
             _print_recording_start_error(exc)
             return 1
@@ -481,11 +492,11 @@ def _run_recording_session(
             print(f"Recorded {session.duration_seconds:.2f} seconds", flush=True)
             print(f"Saved to: {output}", flush=True)
             return 0
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             print(f"Recording error: {exc}", file=sys.stderr)
             return 1
         finally:
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(OSError, RuntimeError):
                 session.close()
     finally:
         signal.signal(signal.SIGINT, original_handler)
