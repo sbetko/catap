@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Required setuptools 83+ for sdist builds and the locked development
+  environment, picking up the fix for CVE-2026-59890 (MANIFEST.in exclusions
+  bypassed by Unicode normalization on macOS filesystems). catap's ASCII-only
+  tree was not exposed.
 - CI now installs the built wheel into a clean environment and verifies the
   package version, native dylib load and ABI, and the `catap` entry point
   before uploading artifacts, in the CI and both publish workflows.
