@@ -1176,10 +1176,13 @@ def test_failed_start_does_not_clobber_existing_output_file(
 
     monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
     monkeypatch.setattr(capture_module, "_get_tap_format", _stub_tap_format)
+    def _fail_create_aggregate(tap_uid: str, name: str, out: object = None) -> int:
+        raise OSError("aggregate failed")
+
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: (_ for _ in ()).throw(OSError("aggregate failed")),
+        _fail_create_aggregate,
     )
 
     recorder = AudioRecorder(123, output_path)
@@ -1420,7 +1423,7 @@ def test_start_cleans_capture_after_return_handoff_interrupt(
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: 55,
+        lambda tap_uid, name, out=None: 55,
     )
     monkeypatch.setattr(
         capture_module,
@@ -1612,7 +1615,7 @@ def test_failed_start_unwinds_cleanup_for_non_oserror_exceptions(
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: 42,
+        lambda tap_uid, name, out=None: 42,
     )
     monkeypatch.setattr(
         capture_module,

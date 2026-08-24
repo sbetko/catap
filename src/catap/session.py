@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import math
 import time
 from collections.abc import Callable, Sequence
@@ -290,14 +291,19 @@ class RecordingSession:
                 "Session has pending tap cleanup; call close() before restarting"
             )
 
-        tap_id = (
-            self._existing_tap_id
-            if self._existing_tap_id is not None
-            else self._backend.create_process_tap(self.tap_description)
-        )
-        self._tap_id = tap_id
-
+        # Core Audio writes the new tap's ID into this caller-owned box, so an
+        # interruption between tap creation and storing self._tap_id cannot
+        # lose the only reference to the tap.
+        created_tap_id = ctypes.c_uint32(0)
         try:
+            if self._existing_tap_id is not None:
+                tap_id = self._existing_tap_id
+            else:
+                tap_id = self._backend.create_process_tap(
+                    self.tap_description,
+                    out=created_tap_id,
+                )
+            self._tap_id = tap_id
             recorder = self._backend.create_recorder(
                 tap_id,
                 self.output_path,
@@ -307,6 +313,8 @@ class RecordingSession:
             self._recorder = recorder
             recorder.start()
         except BaseException as exc:
+            if self._tap_id is None and created_tap_id.value:
+                self._tap_id = created_tap_id.value
             if not _recorder_requires_cleanup(self._recorder):
                 try:
                     cleanup_error = self._destroy_tap()

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Closed the interruption windows during tap and aggregate-device creation:
+  Core Audio now writes new object IDs into caller-owned storage, so a
+  `KeyboardInterrupt` between creation and Python storing the ID no longer
+  leaks the object. `create_process_tap` accepts an optional ``out``
+  parameter for low-level callers who want the same recovery guarantee.
 - Rejected non-finite tap sample rates and integer tap bit depths other than
   16, 24, and 32 bits up front with `UnsupportedTapFormatError`, instead of
   failing later in WAV setup or silently passing in streaming-only mode.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -198,10 +199,17 @@ class _FakeSessionBackend:
         self.taps_described.append(tap_id)
         return _FakeTapDescription([tap_id])
 
-    def create_process_tap(self, description: _FakeTapDescription) -> int:
+    def create_process_tap(
+        self,
+        description: _FakeTapDescription,
+        *,
+        out: ctypes.c_uint32 | None = None,
+    ) -> int:
         self.created_tap_ids.append(
             description.processes[0] if description.processes else 99
         )
+        if out is not None:
+            out.value = 77
         return 77
 
     def destroy_process_tap(self, tap_id: int) -> None:
@@ -465,6 +473,60 @@ def test_start_failure_retains_pending_recorder_cleanup_for_close(
     assert recorder.needs_cleanup is False
     assert session.tap_id is None
     assert backend.destroyed_tap_ids == [77]
+
+
+class _InterruptedCreateBackend(_FakeSessionBackend):
+    """Backend whose tap creation is interrupted after the tap exists."""
+
+    def create_process_tap(
+        self,
+        description: _FakeTapDescription,
+        *,
+        out: ctypes.c_uint32 | None = None,
+    ) -> int:
+        super().create_process_tap(description, out=out)
+        raise KeyboardInterrupt
+
+
+def test_interrupted_tap_creation_destroys_recovered_tap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _InterruptedCreateBackend()
+    _install_backend(monkeypatch, backend)
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        session.start()
+
+    assert backend.created_recorders == []
+    assert backend.destroyed_tap_ids == [77]
+    assert session.tap_id is None
+    assert session.is_recording is False
+
+
+def test_interrupted_tap_creation_retains_tap_when_destroy_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _InterruptedCreateBackend(destroy_error=OSError("destroy deferred"))
+    _install_backend(monkeypatch, backend)
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        session.start()
+
+    assert backend.destroyed_tap_ids == [77]
+    assert session.tap_id == 77
+
+    backend.destroy_error = None
+    session.close()
+    assert backend.destroyed_tap_ids == [77, 77]
+    assert session.tap_id is None
 
 
 def test_record_system_audio_tracks_excluded_processes(

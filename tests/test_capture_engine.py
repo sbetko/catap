@@ -103,7 +103,11 @@ def test_open_tap_capture_creates_aggregate_device_and_io_proc(
     callback = object()
     calls: list[tuple[str, object]] = []
 
-    def create_aggregate_device(tap_uid: str, name: str) -> int:
+    def create_aggregate_device(
+        tap_uid: str,
+        name: str,
+        out: object = None,
+    ) -> int:
         calls.append(("aggregate", (tap_uid, name)))
         return 55
 
@@ -145,7 +149,7 @@ def test_open_tap_capture_passes_client_data(
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: 55,
+        lambda tap_uid, name, out=None: 55,
     )
 
     def create_io_proc(
@@ -179,7 +183,7 @@ def test_open_tap_capture_destroys_aggregate_when_io_proc_creation_fails(
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: 55,
+        lambda tap_uid, name, out=None: 55,
     )
     monkeypatch.setattr(
         capture_module,
@@ -198,6 +202,41 @@ def test_open_tap_capture_destroys_aggregate_when_io_proc_creation_fails(
     assert destroyed == [55]
 
 
+def test_open_tap_capture_destroys_aggregate_recovered_after_interruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed: list[int] = []
+
+    def create_aggregate_device_then_interrupt(
+        tap_uid: str,
+        name: str,
+        *,
+        out: ctypes.c_uint32,
+    ) -> int:
+        del tap_uid, name
+        out.value = 55
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(
+        capture_module,
+        "_create_aggregate_device_for_tap",
+        create_aggregate_device_then_interrupt,
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_aggregate_device",
+        lambda device_id: destroyed.append(device_id),
+    )
+
+    engine = capture_module._TapCaptureEngine()
+    with pytest.raises(KeyboardInterrupt):
+        engine.open_tap_capture(123, object())
+
+    assert destroyed == [55]
+    assert engine.failed_capture_session is None
+
+
 def test_open_tap_capture_notes_cleanup_failure_when_unwind_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -208,7 +247,7 @@ def test_open_tap_capture_notes_cleanup_failure_when_unwind_fails(
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: 55,
+        lambda tap_uid, name, out=None: 55,
     )
     monkeypatch.setattr(
         capture_module,
@@ -249,7 +288,7 @@ def test_open_tap_capture_unwinds_registered_io_proc_when_interrupted(
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: 55,
+        lambda tap_uid, name, out=None: 55,
     )
     monkeypatch.setattr(capture_module, "_AudioDeviceCreateIOProcID", create_io_proc)
     monkeypatch.setattr(
@@ -288,7 +327,7 @@ def test_open_tap_capture_preserves_session_when_io_proc_unwind_fails(
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: 55,
+        lambda tap_uid, name, out=None: 55,
     )
     monkeypatch.setattr(capture_module, "_AudioDeviceCreateIOProcID", create_io_proc)
     monkeypatch.setattr(
@@ -332,7 +371,7 @@ def test_open_tap_capture_publishes_ownership_until_caller_acknowledges(
     monkeypatch.setattr(
         capture_module,
         "_create_aggregate_device_for_tap",
-        lambda tap_uid, name: 55,
+        lambda tap_uid, name, out=None: 55,
     )
     monkeypatch.setattr(capture_module, "_AudioDeviceCreateIOProcID", create_io_proc)
     engine = capture_module._TapCaptureEngine()

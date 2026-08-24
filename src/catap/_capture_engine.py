@@ -131,8 +131,18 @@ def _get_tap_format(tap_id: int) -> AudioStreamBasicDescription:
     return result
 
 
-def _create_aggregate_device_for_tap(tap_uid: str, name: str) -> int:
-    """Create an aggregate device that includes the specified tap."""
+def _create_aggregate_device_for_tap(
+    tap_uid: str,
+    name: str,
+    *,
+    out: ctypes.c_uint32 | None = None,
+) -> int:
+    """Create an aggregate device that includes the specified tap.
+
+    Core Audio writes the new device's ID into ``out`` when provided, so a
+    caller interrupted between creation and storing the returned ID can still
+    recover and destroy the device.
+    """
     agg_uid = f"io.github.catap.aggregate.{uuid.uuid4()}"
 
     tap_entry = NSDictionary.dictionaryWithDictionary_(
@@ -154,9 +164,11 @@ def _create_aggregate_device_for_tap(tap_uid: str, name: str) -> int:
     )
 
     cf_dict_ptr = description.__c_void_p__()
-    device_id = ctypes.c_uint32(0)
+    device_id = ctypes.c_uint32(0) if out is None else out
+    device_id.value = 0
     status = _AudioHardwareCreateAggregateDevice(cf_dict_ptr, ctypes.byref(device_id))
     if status != 0:
+        device_id.value = 0
         raise OSError(f"Failed to create aggregate device: status {status}")
 
     return device_id.value
@@ -262,11 +274,14 @@ class _TapCaptureEngine:
 
         cleanup_errors: list[BaseException] = []
         aggregate_device_id: int | None = None
+        aggregate_device_box = ctypes.c_uint32(0)
         session: _TapCaptureSession | None = None
 
         try:
             aggregate_device_id = _create_aggregate_device_for_tap(
-                tap_uid, "catap Recording Device"
+                tap_uid,
+                "catap Recording Device",
+                out=aggregate_device_box,
             )
             # Allocate every Python owner before handing Core Audio the client-data
             # pointer. After successful registration, returning this already-built
@@ -292,6 +307,10 @@ class _TapCaptureEngine:
 
             return session
         except BaseException as exc:
+            if aggregate_device_id is None and aggregate_device_box.value:
+                # The device exists but its ID was lost to an interruption
+                # before it could be stored; recover it for cleanup below.
+                aggregate_device_id = aggregate_device_box.value
             if session is not None:
                 if session.io_proc_id.value is None:
                     session.io_proc_destroyed = True

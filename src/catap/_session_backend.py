@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
@@ -47,7 +48,12 @@ class _SessionBackend(Protocol):
 
     def get_tap_description(self, tap_id: int) -> TapDescription: ...
 
-    def create_process_tap(self, description: TapDescription) -> int: ...
+    def create_process_tap(
+        self,
+        description: TapDescription,
+        *,
+        out: ctypes.c_uint32 | None = None,
+    ) -> int: ...
 
     def destroy_process_tap(self, tap_id: int) -> None: ...
 
@@ -98,8 +104,13 @@ class _CoreAudioSessionBackend:
     def get_tap_description(self, tap_id: int) -> TapDescription:
         return get_tap_description(tap_id)
 
-    def create_process_tap(self, description: TapDescription) -> int:
-        return create_process_tap(description)
+    def create_process_tap(
+        self,
+        description: TapDescription,
+        *,
+        out: ctypes.c_uint32 | None = None,
+    ) -> int:
+        return create_process_tap(description, out=out)
 
     def destroy_process_tap(self, tap_id: int) -> None:
         destroy_process_tap(tap_id)
