@@ -38,6 +38,15 @@ from catap.bindings._audiotoolbox import kAudioFormatLinearPCM
 _NATIVE_DRAIN_IDLE_INTERVAL_SECONDS = 0.001
 _NATIVE_SLOT_FRAME_CAPACITY = 16_384
 
+# Core Audio retains the IOProc and its client-data pointer until a matching
+# AudioDeviceDestroyIOProcID succeeds. If teardown cannot confirm that boundary,
+# retain both owners for process lifetime rather than letting ctypes free memory
+# that Core Audio may still access.
+_ABANDONED_NATIVE_CAPTURES: list[
+    tuple[_TapCaptureSession, NativeCoreAudioRecorder]
+] = []
+_ABANDONED_NATIVE_CAPTURES_LOCK = threading.Lock()
+
 
 class UnsupportedTapFormatError(ValueError):
     """Raised when a tap exposes an audio layout catap cannot safely record."""
@@ -111,6 +120,8 @@ class AudioRecorder:
         self._native_recorder: NativeCoreAudioRecorder | None = None
         self._native_drain_thread: threading.Thread | None = None
         self._native_drain_stop_event: threading.Event | None = None
+        self._native_drain_abort_event: threading.Event | None = None
+        self._native_drain_done_event: threading.Event | None = None
         self._native_drain_failures: list[RuntimeError] = []
 
         self._total_frames = 0
@@ -275,51 +286,141 @@ class AudioRecorder:
         return self._bytes_per_frame * _NATIVE_SLOT_FRAME_CAPACITY
 
     def _start_native_drain(self, native_recorder: NativeCoreAudioRecorder) -> None:
-        if self._native_drain_thread is not None:
-            raise RuntimeError("Native recorder drain already started")
+        existing_thread = self._native_drain_thread
+        if existing_thread is not None:
+            if not self._native_drain_is_quiesced():
+                raise RuntimeError("Native recorder drain already started")
+            self._native_drain_thread = None
+            self._native_drain_stop_event = None
+            self._native_drain_abort_event = None
+            self._native_drain_done_event = None
+            self._native_drain_failures = []
 
         stop_event = threading.Event()
+        abort_event = threading.Event()
+        done_event = threading.Event()
         self._native_drain_stop_event = stop_event
+        self._native_drain_abort_event = abort_event
+        self._native_drain_done_event = done_event
         self._native_drain_failures = []
         thread = threading.Thread(
             target=self._native_drain_loop,
-            args=(native_recorder, stop_event),
+            args=(native_recorder, stop_event, abort_event, done_event),
             name="catap-native-audio-drain",
             daemon=False,
         )
-        thread.start()
         self._native_drain_thread = thread
+        thread.start()
 
-    def _stop_native_drain(self) -> None:
+    def _stop_native_drain(self, *, drain_remaining: bool = True) -> None:
+        cleanup_errors: list[BaseException] = []
         stop_event = self._native_drain_stop_event
         if stop_event is not None:
-            stop_event.set()
+            self._set_cleanup_event_with_retry(stop_event, cleanup_errors)
+        if not drain_remaining:
+            abort_event = self._native_drain_abort_event
+            if abort_event is not None:
+                self._set_cleanup_event_with_retry(abort_event, cleanup_errors)
 
         thread = self._native_drain_thread
         if thread is not None:
-            thread.join()
+            try:
+                if thread.is_alive():
+                    thread.join()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                try:
+                    done_event = self._native_drain_done_event
+                    if done_event is not None and not done_event.is_set():
+                        done_event.wait()
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+
+            try:
+                thread_is_alive = thread.is_alive()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                thread_is_alive = True
+            done_event = self._native_drain_done_event
+            thread_never_started = (
+                not thread_is_alive and getattr(thread, "ident", None) is None
+            )
+            drain_is_done = (
+                thread_never_started
+                or (done_event is not None and done_event.is_set())
+            )
+            if not drain_is_done:
+                if not cleanup_errors:
+                    cleanup_errors.append(
+                        RuntimeError("Native recorder drain did not stop")
+                    )
+                raise _combine_errors(
+                    "Failed to stop native recorder drain",
+                    cleanup_errors,
+                )
 
         self._native_drain_thread = None
         self._native_drain_stop_event = None
+        self._native_drain_abort_event = None
+        self._native_drain_done_event = None
 
         failures = self._native_drain_failures
         self._native_drain_failures = []
-        if failures:
-            raise _combine_errors("Failed to drain native recorder", failures)
+        cleanup_errors.extend(failures)
+        if cleanup_errors:
+            raise _combine_errors(
+                "Failed to drain native recorder",
+                cleanup_errors,
+            )
+
+    @staticmethod
+    def _set_cleanup_event_with_retry(
+        event: threading.Event,
+        cleanup_errors: list[BaseException],
+    ) -> None:
+        """Set a cleanup event, retrying once after an interruption."""
+        try:
+            event.set()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+            try:
+                event.set()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+
+    def _native_drain_is_quiesced(self) -> bool:
+        """Return whether no native reader can still access recorder memory."""
+        thread = self._native_drain_thread
+        if thread is None:
+            return True
+        done_event = self._native_drain_done_event
+        if done_event is not None and done_event.is_set():
+            return True
+        try:
+            return not thread.is_alive() and getattr(thread, "ident", None) is None
+        except BaseException:
+            return False
 
     def _native_drain_loop(
         self,
         native_recorder: NativeCoreAudioRecorder,
         stop_event: threading.Event,
+        abort_event: threading.Event,
+        done_event: threading.Event,
     ) -> None:
         try:
             while True:
-                drained = self._drain_native_recorder(native_recorder)
+                drained = self._drain_native_recorder(
+                    native_recorder,
+                    abort_event,
+                )
+                if abort_event.is_set():
+                    return
                 if stop_event.is_set():
                     return
                 if not drained:
                     stop_event.wait(_NATIVE_DRAIN_IDLE_INTERVAL_SECONDS)
-        except Exception as exc:
+        except BaseException as exc:
             failure = _translate_exception(
                 RuntimeError,
                 f"Native recorder drain failed: {exc}",
@@ -327,13 +428,18 @@ class AudioRecorder:
             )
             assert isinstance(failure, RuntimeError)
             self._native_drain_failures.append(failure)
+        finally:
+            done_event.set()
 
     def _drain_native_recorder(
         self,
         native_recorder: NativeCoreAudioRecorder,
+        abort_event: threading.Event,
     ) -> bool:
         drained = False
         while True:
+            if abort_event.is_set():
+                return drained
             chunk = native_recorder.read()
             if chunk is None:
                 return drained
@@ -375,6 +481,93 @@ class AudioRecorder:
 
         return errors
 
+    @staticmethod
+    def _release_native_recorder(
+        native_recorder: NativeCoreAudioRecorder,
+        capture_session: _TapCaptureSession | None,
+        *,
+        drain_quiesced: bool,
+    ) -> bool:
+        """Release native state only after every raw-pointer reader has stopped."""
+        io_proc_destroyed = (
+            capture_session is None or capture_session.io_proc_destroyed
+        )
+        if io_proc_destroyed and drain_quiesced:
+            native_recorder.close()
+            return True
+
+        if capture_session is not None:
+            with _ABANDONED_NATIVE_CAPTURES_LOCK:
+                _ABANDONED_NATIVE_CAPTURES.append((capture_session, native_recorder))
+        native_recorder.abandon()
+        return False
+
+    def _release_native_recorder_with_retry(
+        self,
+        native_recorder: NativeCoreAudioRecorder,
+        capture_session: _TapCaptureSession | None,
+        *,
+        drain_quiesced: bool,
+    ) -> tuple[bool, bool, list[BaseException]]:
+        """Complete the native lifetime boundary after one interruption."""
+        errors: list[BaseException] = []
+        handled = False
+        released = False
+
+        try:
+            try:
+                released = self._release_native_recorder(
+                    native_recorder,
+                    capture_session,
+                    drain_quiesced=drain_quiesced,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                handled = True
+        finally:
+            if not handled:
+                try:
+                    released = self._release_native_recorder(
+                        native_recorder,
+                        capture_session,
+                        drain_quiesced=drain_quiesced,
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                else:
+                    handled = True
+
+        return handled, released, errors
+
+    def _publish_lifecycle_state_with_retry(
+        self,
+        state: str,
+    ) -> tuple[bool, list[BaseException]]:
+        """Publish terminal lifecycle state after one interruption."""
+        errors: list[BaseException] = []
+        published = False
+
+        try:
+            try:
+                with self._lifecycle_lock:
+                    self._lifecycle_state = state
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                published = True
+        finally:
+            if not published:
+                try:
+                    with self._lifecycle_lock:
+                        self._lifecycle_state = state
+                except BaseException as exc:
+                    errors.append(exc)
+                else:
+                    published = True
+
+        return published, errors
+
     def start(self) -> None:
         """Start recording audio.
 
@@ -382,14 +575,22 @@ class AudioRecorder:
             OSError: If recording cannot be started
             RuntimeError: If already recording
         """
-        with self._lifecycle_lock:
-            if self._lifecycle_state == "recording":
-                raise RuntimeError("Already recording")
-            if self._lifecycle_state != "idle":
-                raise RuntimeError("Recorder is already starting or stopping")
-            self._lifecycle_state = "starting"
-
+        start_succeeded = False
+        start_error: BaseException | None = None
+        lifecycle_claimed = False
         try:
+            with self._lifecycle_lock:
+                if self._lifecycle_state == "recording":
+                    raise RuntimeError("Already recording")
+                if self.needs_cleanup:
+                    raise RuntimeError(
+                        "Recorder has pending cleanup; call stop() before restarting"
+                    )
+                if self._lifecycle_state != "idle":
+                    raise RuntimeError("Recorder is already starting or stopping")
+                lifecycle_claimed = True
+                self._lifecycle_state = "starting"
+
             stream_format = self._capture_engine.describe_tap_stream(self.tap_id)
             self._apply_stream_format(stream_format)
 
@@ -404,51 +605,187 @@ class AudioRecorder:
 
             cleanup: list[Callable[[], None]] = []
             capture_session: _TapCaptureSession | None = None
+            capture_cleanup_registered = False
             native_recorder: NativeCoreAudioRecorder | None = None
             try:
                 native_recorder = self._create_native_recorder()
                 self._native_recorder = native_recorder
-                cleanup.append(native_recorder.close)
                 capture_session = self._capture_engine.open_tap_capture(
                     self.tap_id,
                     native_recorder.io_proc_pointer,
                     native_recorder.handle,
                 )
                 self._capture_session = capture_session
+                acknowledge_capture_session = getattr(
+                    self._capture_engine,
+                    "acknowledge_capture_session",
+                    None,
+                )
+                if acknowledge_capture_session is not None:
+                    acknowledge_capture_session(capture_session)
                 cleanup.append(lambda: self._capture_engine.close(capture_session))
+                capture_cleanup_registered = True
 
                 self._worker.start(self._make_worker_config())
                 cleanup.append(lambda: self._worker.stop(publish=False))
+                cleanup.append(
+                    lambda: self._stop_native_drain(drain_remaining=False)
+                )
                 self._start_native_drain(native_recorder)
-                cleanup.append(self._stop_native_drain)
 
                 with self._lifecycle_lock:
                     self._is_recording = True
 
                 self._capture_engine.start(capture_session)
                 cleanup.append(lambda: self._capture_engine.stop(capture_session))
-            except Exception as exc:
-                with self._lifecycle_lock:
-                    self._is_recording = False
-                for step in reversed(cleanup):
+            except BaseException as exc:
+                native_handled = native_recorder is None
+                try:
                     try:
-                        step()
-                    except Exception as cleanup_exc:
+                        failed_capture_session = getattr(
+                            self._capture_engine,
+                            "failed_capture_session",
+                            None,
+                        )
+                        if capture_session is None and isinstance(
+                            failed_capture_session,
+                            _TapCaptureSession,
+                        ):
+                            capture_session = failed_capture_session
+                            self._capture_session = capture_session
+                        if (
+                            capture_session is not None
+                            and not capture_cleanup_registered
+                        ):
+                            cleanup.append(
+                                lambda: self._capture_engine.close(capture_session)
+                            )
+                            capture_cleanup_registered = True
+                        self._is_recording = False
+                        for step in reversed(cleanup):
+                            try:
+                                step()
+                            except BaseException as cleanup_exc:
+                                _add_secondary_failure(
+                                    exc,
+                                    "Cleanup failure during recorder startup",
+                                    cleanup_exc,
+                                )
+                    except BaseException as cleanup_exc:
                         _add_secondary_failure(
                             exc,
-                            "Cleanup failure during recorder startup",
+                            "Cleanup interruption during recorder startup",
                             cleanup_exc,
                         )
-                self._capture_session = None
-                self._native_recorder = None
+                finally:
+                    try:
+                        if native_recorder is not None:
+                            try:
+                                drain_quiesced = self._native_drain_is_quiesced()
+                            except BaseException as cleanup_exc:
+                                drain_quiesced = False
+                                _add_secondary_failure(
+                                    exc,
+                                    "Cleanup failure while checking the native "
+                                    "drain",
+                                    cleanup_exc,
+                                )
+                            if (
+                                not drain_quiesced
+                                and self._native_drain_abort_event is not None
+                            ):
+                                abort_errors: list[BaseException] = []
+                                self._set_cleanup_event_with_retry(
+                                    self._native_drain_abort_event,
+                                    abort_errors,
+                                )
+                                for cleanup_exc in abort_errors:
+                                    _add_secondary_failure(
+                                        exc,
+                                        "Cleanup failure while aborting the native "
+                                        "drain",
+                                        cleanup_exc,
+                                    )
+                            (
+                                native_handled,
+                                native_was_released,
+                                release_errors,
+                            ) = self._release_native_recorder_with_retry(
+                                native_recorder,
+                                capture_session,
+                                drain_quiesced=drain_quiesced,
+                            )
+                            for cleanup_exc in release_errors:
+                                _add_secondary_failure(
+                                    exc,
+                                    "Cleanup failure while releasing native "
+                                    "recorder state",
+                                    cleanup_exc,
+                                )
+                            if native_handled and not native_was_released:
+                                exc.add_note(
+                                    "Retained native recorder state because startup "
+                                    "cleanup did not confirm both IOProc destruction "
+                                    "and drain quiescence."
+                                )
+                            if not native_handled:
+                                exc.add_note(
+                                    "Native recorder ownership remains attached to "
+                                    "this recorder; call stop() to retry cleanup."
+                                )
+                    except BaseException as cleanup_exc:
+                        _add_secondary_failure(
+                            exc,
+                            "Cleanup failure at native recorder lifetime boundary",
+                            cleanup_exc,
+                        )
+                    finally:
+                        if native_handled:
+                            self._native_recorder = None
+                        capture_cleanup_finished = capture_session is None or (
+                            not capture_session.started
+                            and capture_session.io_proc_destroyed
+                            and capture_session.aggregate_device_destroyed
+                        )
+                        if capture_cleanup_finished:
+                            self._capture_session = None
                 raise
-        except Exception:
-            with self._lifecycle_lock:
-                self._lifecycle_state = "idle"
+            start_succeeded = True
+        except BaseException as exc:
+            start_error = exc
             raise
-        else:
-            with self._lifecycle_lock:
-                self._lifecycle_state = "recording"
+        finally:
+            if lifecycle_claimed:
+                if not start_succeeded:
+                    self._is_recording = False
+                if start_succeeded:
+                    terminal_state = "recording"
+                elif self.needs_cleanup:
+                    terminal_state = "cleanup_failed"
+                else:
+                    terminal_state = "idle"
+                lifecycle_published, lifecycle_errors = (
+                    self._publish_lifecycle_state_with_retry(terminal_state)
+                )
+                if not lifecycle_published:
+                    lifecycle_errors.append(
+                        RuntimeError(
+                            "Failed to publish recorder lifecycle state "
+                            f"{terminal_state!r}"
+                        )
+                    )
+                if lifecycle_errors:
+                    if start_error is None:
+                        raise _combine_errors(
+                            "Failed to finalize recorder lifecycle",
+                            lifecycle_errors,
+                        )
+                    for lifecycle_error in lifecycle_errors:
+                        _add_secondary_failure(
+                            start_error,
+                            "Cleanup failure while publishing recorder lifecycle",
+                            lifecycle_error,
+                        )
 
     def stop(self) -> None:
         """Stop recording and finalize any WAV output.
@@ -457,69 +794,268 @@ class AudioRecorder:
             OSError: If Core Audio cleanup fails
             RuntimeError: If not recording
         """
-        with self._lifecycle_lock:
-            if self._lifecycle_state == "idle":
-                raise RuntimeError("Not recording")
-            if self._lifecycle_state != "recording":
-                raise RuntimeError("Recorder is already starting or stopping")
+        if self._worker.is_worker_thread:
+            raise RuntimeError(
+                "Cannot call AudioRecorder.stop() from an on_buffer callback; "
+                "signal the owning thread with threading.Event and call stop() "
+                "there instead"
+            )
 
-            self._lifecycle_state = "stopping"
-            self._is_recording = False
-            capture_session = self._capture_session
-            native_recorder = self._native_recorder
+        lifecycle_claimed = False
+        stop_error: BaseException | None = None
+        try:
+            with self._lifecycle_lock:
+                if self._lifecycle_state == "idle" and not self.needs_cleanup:
+                    raise RuntimeError("Not recording")
+                if self._lifecycle_state not in {
+                    "idle",
+                    "recording",
+                    "cleanup_failed",
+                }:
+                    raise RuntimeError("Recorder is already starting or stopping")
 
-        cleanup_errors: list[OSError | RuntimeError] = []
+                lifecycle_claimed = True
+                self._lifecycle_state = "stopping"
+                self._is_recording = False
+
+            self._finish_stop()
+        except BaseException as exc:
+            stop_error = exc
+            raise
+        finally:
+            if lifecycle_claimed:
+                self._is_recording = False
+                terminal_state = "cleanup_failed" if self.needs_cleanup else "idle"
+                if self._lifecycle_state != terminal_state:
+                    lifecycle_published, lifecycle_errors = (
+                        self._publish_lifecycle_state_with_retry(terminal_state)
+                    )
+                    if not lifecycle_published:
+                        lifecycle_errors.append(
+                            RuntimeError(
+                                "Failed to publish recorder lifecycle state "
+                                f"{terminal_state!r}"
+                            )
+                        )
+                    if lifecycle_errors:
+                        if stop_error is None:
+                            raise _combine_errors(
+                                "Failed to finalize recorder lifecycle",
+                                lifecycle_errors,
+                            )
+                        for lifecycle_error in lifecycle_errors:
+                            _add_secondary_failure(
+                                stop_error,
+                                "Cleanup failure while publishing recorder "
+                                "lifecycle",
+                                lifecycle_error,
+                            )
+
+    def _finish_stop(self) -> None:
+        """Finish teardown after the public lifecycle claim is recoverable."""
+        capture_session = self._capture_session
+        native_recorder = self._native_recorder
+
+        cleanup_errors: list[BaseException] = []
         publish_worker_output = True
+        drain_quiesced = self._native_drain_thread is None
+        native_handled = native_recorder is None
 
-        if capture_session is not None:
-            try:
-                self._capture_engine.stop(capture_session)
-            except OSError as exc:
-                cleanup_errors.append(exc)
-
-        if native_recorder is not None:
-            try:
-                self._stop_native_drain()
-            except RuntimeError as exc:
-                cleanup_errors.append(exc)
-                publish_worker_output = False
-
-            try:
-                native_errors = self._native_recorder_errors(native_recorder.stats())
-            except RuntimeError as exc:
-                cleanup_errors.append(exc)
-                publish_worker_output = False
-            else:
-                if native_errors:
-                    cleanup_errors.extend(native_errors)
-                    publish_worker_output = False
-
-        if capture_session is not None:
-            try:
-                self._capture_engine.close(capture_session)
-            except OSError as exc:
-                cleanup_errors.append(exc)
+        def record_cleanup_error(error: BaseException) -> None:
+            if all(error is not existing for existing in cleanup_errors):
+                cleanup_errors.append(error)
 
         try:
-            self._worker.stop(publish=publish_worker_output)
-        except (OSError, RuntimeError) as exc:
-            cleanup_errors.append(exc)
+            try:
+                if capture_session is not None:
+                    try:
+                        self._capture_engine.close(capture_session)
+                    except BaseException as exc:
+                        record_cleanup_error(exc)
+                        if capture_session.started:
+                            publish_worker_output = False
 
-        self._capture_session = None
-        if native_recorder is not None:
-            native_recorder.close()
-            self._native_recorder = None
+                if self._native_drain_thread is not None:
+                    try:
+                        self._stop_native_drain(
+                            drain_remaining=(
+                                native_recorder is not None
+                                and (
+                                    capture_session is None
+                                    or not capture_session.started
+                                )
+                            )
+                        )
+                    except BaseException as exc:
+                        record_cleanup_error(exc)
+                        publish_worker_output = False
+                    finally:
+                        try:
+                            drain_quiesced = self._native_drain_is_quiesced()
+                        except BaseException as exc:
+                            record_cleanup_error(exc)
+                            drain_quiesced = False
+                        if not drain_quiesced:
+                            publish_worker_output = False
 
-        with self._lifecycle_lock:
-            self._lifecycle_state = "idle"
+                if native_recorder is not None:
+                    try:
+                        native_errors = self._native_recorder_errors(
+                            native_recorder.stats()
+                        )
+                    except BaseException as exc:
+                        record_cleanup_error(exc)
+                        publish_worker_output = False
+                    else:
+                        if native_errors:
+                            cleanup_errors.extend(native_errors)
+                            publish_worker_output = False
+
+                try:
+                    self._worker.stop(publish=publish_worker_output)
+                except BaseException as exc:
+                    record_cleanup_error(exc)
+                    try:
+                        self._worker.stop(publish=False)
+                    except BaseException as cleanup_exc:
+                        record_cleanup_error(cleanup_exc)
+            except BaseException as exc:
+                # Defer asynchronous exceptions until the native ownership
+                # boundary has completed.
+                record_cleanup_error(exc)
+            finally:
+                try:
+                    if capture_session is not None and (
+                        capture_session.started
+                        or not capture_session.io_proc_destroyed
+                        or not capture_session.aggregate_device_destroyed
+                    ):
+                        try:
+                            self._capture_engine.close(capture_session)
+                        except BaseException as exc:
+                            record_cleanup_error(exc)
+                finally:
+                    try:
+                        if (
+                            self._native_drain_thread is not None
+                            and not drain_quiesced
+                        ):
+                            try:
+                                self._stop_native_drain(
+                                    drain_remaining=(
+                                        native_recorder is not None
+                                        and (
+                                            capture_session is None
+                                            or not capture_session.started
+                                        )
+                                    )
+                                )
+                            except BaseException as exc:
+                                record_cleanup_error(exc)
+                            finally:
+                                try:
+                                    drain_quiesced = (
+                                        self._native_drain_is_quiesced()
+                                    )
+                                except BaseException as exc:
+                                    record_cleanup_error(exc)
+                                    drain_quiesced = False
+                    finally:
+                        try:
+                            self._worker.stop(publish=False)
+                        except BaseException as exc:
+                            record_cleanup_error(exc)
+        finally:
+            try:
+                if native_recorder is not None:
+                    if (
+                        not drain_quiesced
+                        and self._native_drain_abort_event is not None
+                    ):
+                        abort_errors: list[BaseException] = []
+                        self._set_cleanup_event_with_retry(
+                            self._native_drain_abort_event,
+                            abort_errors,
+                        )
+                        for abort_error in abort_errors:
+                            record_cleanup_error(abort_error)
+                    (
+                        native_handled,
+                        native_was_released,
+                        release_errors,
+                    ) = self._release_native_recorder_with_retry(
+                        native_recorder,
+                        capture_session,
+                        drain_quiesced=drain_quiesced,
+                    )
+                    for release_error in release_errors:
+                        record_cleanup_error(release_error)
+                    if native_handled and not native_was_released:
+                        record_cleanup_error(
+                            RuntimeError(
+                                "Retained native recorder state because cleanup did "
+                                "not confirm both IOProc destruction and drain "
+                                "quiescence."
+                            )
+                        )
+                    if not native_handled:
+                        record_cleanup_error(
+                            RuntimeError(
+                                "Native recorder ownership remains attached; call "
+                                "stop() to retry cleanup."
+                            )
+                        )
+            except BaseException as exc:
+                record_cleanup_error(exc)
+            finally:
+                if native_handled:
+                    self._native_recorder = None
+                capture_cleanup_finished = capture_session is None or (
+                    not capture_session.started
+                    and capture_session.io_proc_destroyed
+                    and capture_session.aggregate_device_destroyed
+                )
+                if capture_cleanup_finished:
+                    self._capture_session = None
+                else:
+                    record_cleanup_error(
+                        RuntimeError("Core Audio capture cleanup remains pending")
+                    )
+
+                terminal_state = "cleanup_failed" if self.needs_cleanup else "idle"
+                lifecycle_published, lifecycle_errors = (
+                    self._publish_lifecycle_state_with_retry(terminal_state)
+                )
+                for lifecycle_error in lifecycle_errors:
+                    record_cleanup_error(lifecycle_error)
+                if not lifecycle_published:
+                    record_cleanup_error(
+                        RuntimeError(
+                            "Failed to publish recorder lifecycle state "
+                            f"{terminal_state!r}"
+                        )
+                    )
 
         if cleanup_errors:
-            raise _combine_errors("Failed to stop recording cleanly", cleanup_errors)
+            raise _combine_errors(
+                "Failed to stop recording cleanly",
+                cleanup_errors,
+            )
 
     @property
     def is_recording(self) -> bool:
         """True if currently recording."""
         return self._is_recording
+
+    @property
+    def needs_cleanup(self) -> bool:
+        """True when a failed teardown still owns retryable resources."""
+        return (
+            self._capture_session is not None
+            or self._native_recorder is not None
+            or self._native_drain_thread is not None
+            or self._worker.needs_cleanup
+        )
 
     @property
     def frames_recorded(self) -> int:

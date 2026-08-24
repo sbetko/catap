@@ -116,6 +116,29 @@ def test_record_duration_must_be_positive(
     assert "must be greater than 0" in captured.err
 
 
+@pytest.mark.parametrize("duration", ["nan", "inf", "-inf"])
+def test_record_duration_must_be_finite(
+    duration: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record", "Music", f"--duration={duration}"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "must be finite" in captured.err
+
+
+def test_record_output_path_must_not_be_empty(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record", "Music", "-o", ""])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "output path must not be empty" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_record_requires_app_name_when_not_recording_system_audio(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -159,6 +182,125 @@ def test_record_does_not_report_output_error_as_permissions_issue(
     assert exit_code == 1
     assert "This looks like an output file problem" in captured.err
     assert "Screen & System Audio Recording" not in captured.err
+
+
+def test_record_reports_core_audio_oserror_with_permission_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_tap = object()
+
+    class _FakeSession:
+        def __init__(self, tap_desc: object, output: str) -> None:
+            self.tap_desc = tap_desc
+            self.output = output
+
+        def start(self) -> None:
+            raise OSError("Core Audio rejected capture")
+
+        def close(self) -> None:
+            return None
+
+    _set_cli_symbols(
+        monkeypatch,
+        _build_app_tap=lambda app_name, mute: fake_tap,
+        RecordingSession=_FakeSession,
+    )
+
+    exit_code = main(["record", "Music"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Error starting recording: Core Audio rejected capture" in captured.err
+    assert "Screen & System Audio Recording" in captured.err
+    assert "output file problem" not in captured.err
+
+
+def test_record_reports_runtime_error_during_start_without_hint_or_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_tap = object()
+
+    class _FakeSession:
+        def __init__(self, tap_desc: object, output: str) -> None:
+            self.tap_desc = tap_desc
+            self.output = output
+
+        def start(self) -> None:
+            raise RuntimeError("native recorder unavailable")
+
+        def close(self) -> None:
+            raise RuntimeError("cleanup also failed")
+
+    _set_cli_symbols(
+        monkeypatch,
+        _build_app_tap=lambda app_name, mute: fake_tap,
+        RecordingSession=_FakeSession,
+    )
+
+    exit_code = main(["record", "Music"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Error starting recording: native recorder unavailable" in captured.err
+    assert "cleanup also failed" not in captured.err
+    assert "Screen & System Audio Recording" not in captured.err
+    assert "output file problem" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_record_reports_runtime_error_during_stop_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_tap = object()
+
+    class _FakeSession(_SuccessfulSession):
+        def stop(self) -> None:
+            raise RuntimeError("dropped native audio buffers")
+
+        def close(self) -> None:
+            raise RuntimeError("cleanup also failed")
+
+    _set_cli_symbols(
+        monkeypatch,
+        _build_app_tap=lambda app_name, mute: fake_tap,
+        RecordingSession=_FakeSession,
+    )
+
+    exit_code = main(["record", "Music", "-d", "0.001"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Recording error: dropped native audio buffers" in captured.err
+    assert "cleanup also failed" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_record_suppresses_runtime_error_from_final_close(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_tap = object()
+
+    class _FakeSession(_SuccessfulSession):
+        def close(self) -> None:
+            raise RuntimeError("already closed")
+
+    _set_cli_symbols(
+        monkeypatch,
+        _build_app_tap=lambda app_name, mute: fake_tap,
+        RecordingSession=_FakeSession,
+    )
+
+    exit_code = main(["record", "Music", "-d", "0.001"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Saved to: output.wav" in captured.out
+    assert "already closed" not in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_record_reports_ambiguous_process_matches(

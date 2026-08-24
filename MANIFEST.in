@@ -1,3 +1,4 @@
 include CHANGELOG.md
 include scripts/build_native_coreaudio.py
 recursive-include native/catap_coreaudio *.c *.h
+exclude src/catap/native/*.dylib

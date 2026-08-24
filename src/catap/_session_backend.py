@@ -18,6 +18,7 @@ class _RecorderLike(Protocol):
     """Recorder methods used by the session layer."""
 
     is_recording: bool
+    needs_cleanup: bool
     frames_recorded: int
     duration_seconds: float
     stream_format: AudioStreamFormat | None

@@ -382,6 +382,16 @@ class NativeCoreAudioRecorder:
         self._handle = ctypes.c_void_p()
         self._library.cdll.catap_recorder_destroy(handle)
 
+    def abandon(self) -> None:
+        """Leak native state that Core Audio may still reference.
+
+        This is reserved for failed IOProc deregistration. Clearing the Python
+        handle prevents ``__del__`` from freeing client data that a live HAL
+        callback may still access; the operating system reclaims it at process
+        exit.
+        """
+        self._handle = ctypes.c_void_p()
+
     def __enter__(self) -> NativeCoreAudioRecorder:
         return self
 
