@@ -23,12 +23,12 @@ class build_py(_build_py):
         self._build_native_coreaudio()
 
     def _build_native_coreaudio(self) -> None:
-        output = (
-            Path(self.build_lib)
-            / "catap"
-            / "native"
-            / "libcatap_coreaudio.dylib"
+        package_dir = (
+            Path(self.get_package_dir("catap"))
+            if self.editable_mode
+            else Path(self.build_lib) / "catap"
         )
+        output = package_dir / "native" / "libcatap_coreaudio.dylib"
         command = [
             sys.executable,
             "scripts/build_native_coreaudio.py",

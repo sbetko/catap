@@ -69,6 +69,16 @@ include-package-data = false
 [tool.setuptools.package-data]
 catap = ["py.typed", "native/*.dylib"]
 
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { file = "MANIFEST.in" },
+    { file = "scripts/build_native_coreaudio.py" },
+    { file = "native/catap_coreaudio/**/*.c" },
+    { file = "native/catap_coreaudio/**/*.h" },
+]
+
 [tool.ruff]
 src = ["src", "tests"]
 

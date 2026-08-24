@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -107,6 +108,54 @@ def test_loads_native_library(native_library_path: Path) -> None:
 
     assert library.abi_version() == 1
     assert library.status_name(CATAP_STATUS_OK) == "OK"
+
+
+def test_editable_build_generates_bundled_native_library(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    editable_project = tmp_path / "editable-project"
+    editable_project.mkdir()
+
+    for filename in (
+        "CHANGELOG.md",
+        "LICENSE",
+        "MANIFEST.in",
+        "README.md",
+        "pyproject.toml",
+        "setup.py",
+    ):
+        shutil.copy2(project_root / filename, editable_project / filename)
+    for directory in ("native", "scripts", "src"):
+        shutil.copytree(
+            project_root / directory,
+            editable_project / directory,
+            ignore=shutil.ignore_patterns("*.dylib", "*.egg-info", "__pycache__"),
+        )
+
+    bundled_library = (
+        editable_project
+        / "src"
+        / "catap"
+        / "native"
+        / "libcatap_coreaudio.dylib"
+    )
+    assert not bundled_library.exists()
+
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from setuptools.build_meta import build_editable; "
+            "build_editable('wheelhouse')",
+        ],
+        cwd=editable_project,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert build.returncode == 0, build.stdout + build.stderr
+    assert bundled_library.is_file()
+    assert load_native_coreaudio(bundled_library).abi_version() == 1
 
 
 def test_abandoned_recorder_handle_is_not_destroyed() -> None:
