@@ -66,16 +66,24 @@ class AudioRecorder:
 
         tap_desc = TapDescription.stereo_mixdown_of_processes([process_id])
         tap_id = create_process_tap(tap_desc)
+        recorder = AudioRecorder(tap_id, "output.wav")
         try:
-            recorder = AudioRecorder(tap_id, "output.wav")
             recorder.start()
-            try:
-                time.sleep(5)
-            finally:
-                recorder.stop()
+            time.sleep(5)
         finally:
-            destroy_process_tap(tap_id)
+            try:
+                if recorder.is_recording or recorder.needs_cleanup:
+                    recorder.stop()
+            finally:
+                if not recorder.needs_cleanup:
+                    destroy_process_tap(tap_id)
 
+    If ``stop()`` raises while ``needs_cleanup`` is still true, the recorder
+    kept the Core Audio objects it could not safely release. Call ``stop()``
+    again to retry the teardown, and destroy the tap only once cleanup
+    succeeds: a tap with mute enabled keeps its process muted for as long as
+    the tap exists. The higher-level ``RecordingSession`` implements this
+    retry contract automatically.
     """
 
     def __init__(
@@ -803,6 +811,13 @@ class AudioRecorder:
 
     def stop(self) -> None:
         """Stop recording and finalize any WAV output.
+
+        Queued audio is still delivered to ``on_buffer`` during shutdown, and
+        the in-flight callback is waited on, so a callback that never returns
+        blocks this method indefinitely.
+
+        If this method raises while ``needs_cleanup`` is still true, call it
+        again to retry the failed teardown.
 
         Raises:
             OSError: If Core Audio cleanup fails

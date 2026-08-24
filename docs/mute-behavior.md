@@ -29,3 +29,10 @@ Local listening tests showed:
 Neither `kAudioHardwarePropertyProcessIsAudible` nor
 `kAudioDevicePropertyProcessMute` tracked these transitions during the
 tests, so the audible behavior is the useful signal.
+
+## Cleanup retries
+
+`RecordingSession` destroys its tap only after recorder teardown succeeds. If
+a `stop()` or `close()` fails and `session.needs_cleanup` stays true, the tap
+continues to exist — and a `MUTED` tap keeps its process muted — until a
+retried `close()` succeeds or the recording process exits.

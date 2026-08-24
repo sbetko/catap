@@ -142,6 +142,11 @@ finally:
 Once recording has started, `session.stream_format` exposes the callback
 `AudioStreamFormat` without waiting for the next buffer.
 
+Stopping waits for the callback: queued buffers are still delivered to
+`on_buffer` during shutdown, and the in-flight callback is joined before
+`stop()` returns. A callback that never returns blocks shutdown indefinitely,
+so keep callbacks bounded and quick.
+
 To control the recording lifetime yourself, use the session as a context
 manager:
 
@@ -195,17 +200,28 @@ tap_desc.mute_behavior = TapMuteBehavior.UNMUTED  # or MUTED
 import time
 
 tap_id = create_process_tap(tap_desc)
+recorder = AudioRecorder(tap_id, "output.wav")
 try:
-    recorder = AudioRecorder(tap_id, "output.wav")
     recorder.start()
-    try:
-        time.sleep(5)
-    finally:
-        recorder.stop()
-    print(f"Recorded {recorder.duration_seconds:.2f} seconds")
+    time.sleep(5)
 finally:
-    destroy_process_tap(tap_id)
+    try:
+        if recorder.is_recording or recorder.needs_cleanup:
+            recorder.stop()
+    finally:
+        if not recorder.needs_cleanup:
+            destroy_process_tap(tap_id)
+
+print(f"Recorded {recorder.duration_seconds:.2f} seconds")
 ```
+
+If `stop()` raises while `recorder.needs_cleanup` is still true, the recorder
+kept the Core Audio objects it could not safely release. Call `stop()` again
+to retry the teardown, and destroy the tap only once cleanup succeeds: a tap
+created with mute enabled keeps its process muted for as long as the tap
+exists. The high-level `RecordingSession` implements this retry contract for
+you and exposes the same state as `session.needs_cleanup`; if a
+`session.close()` fails, call it again to retry.
 
 If another app has already created a non-private tap, you can discover it and
 attach a recorder without taking ownership of the tap itself:

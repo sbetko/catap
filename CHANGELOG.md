@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Documented the retryable cleanup contract in the README, the low-level
+  `AudioRecorder` example, and the mute-behavior notes, and documented that
+  shutdown drains queued buffers through `on_buffer` and waits on the
+  in-flight callback.
 - Added `RecordingSession.needs_cleanup`, making retryable cleanup an explicit
   public contract: after a failed `stop()` or `close()`, the property stays
   true until a retried `close()` succeeds, and a tap created with `mute=True`
