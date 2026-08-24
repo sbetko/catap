@@ -76,10 +76,39 @@ jobs:
       - name: Test
         run: uv run --python ${{ matrix.python-version }} --group dev pytest
 
+  intel-slice:
+    name: Intel slice (Rosetta, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rosetta 2
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Install x86_64 Python
+        run: uv python install cpython-3.12-macos-x86_64-none
+
+      - name: Verify x86_64 interpreter
+        run: |
+          uv run --python cpython-3.12-macos-x86_64-none --group dev python -c \
+            "import platform; assert platform.machine() == 'x86_64', platform.machine()"
+
+      - name: Test under Rosetta
+        run: uv run --python cpython-3.12-macos-x86_64-none --group dev pytest
+
   package:
     name: Build Package
     runs-on: macos-26
-    needs: [quality, free-threaded]
+    needs: [quality, free-threaded, intel-slice]
 
     steps:
       - name: Checkout
@@ -101,6 +130,28 @@ jobs:
 
       - name: Verify metadata
         run: uv run --group dev twine check dist/*
+
+      - name: Verify installed wheel
+        run: |
+          uv venv --python 3.12 --seed /tmp/catap-wheel-check
+          /tmp/catap-wheel-check/bin/pip install --quiet dist/*.whl
+          /tmp/catap-wheel-check/bin/python - <<'PY'
+          import pathlib
+          import tomllib
+
+          import catap
+          from catap._native_coreaudio import load_native_coreaudio
+
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          expected_version = pyproject["project"]["version"]
+          assert catap.__version__ == expected_version, (
+              catap.__version__,
+              expected_version,
+          )
+          library = load_native_coreaudio()
+          print("native dylib:", library.path, "ABI", library.abi_version())
+          PY
+          /tmp/catap-wheel-check/bin/catap --help > /dev/null
 
       - name: Upload distributions
         uses: actions/upload-artifact@v7

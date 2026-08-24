@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- CI now installs the built wheel into a clean environment and verifies the
+  package version, native dylib load and ABI, and the `catap` entry point
+  before uploading artifacts, in the CI and both publish workflows.
+- CI now executes the x86_64 slice of the universal2 dylib by running the
+  test suite under an x86_64 CPython through Rosetta 2 on Apple Silicon
+  runners.
 - Added an opt-in known-tone acceptance gate
   (`CATAP_RUN_TONE_INTEGRATION=1`): it plays a 1 kHz tone through the default
   output device and fails unless the capture actually contains it,

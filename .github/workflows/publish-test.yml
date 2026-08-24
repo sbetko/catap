@@ -31,6 +31,28 @@ jobs:
       - name: Verify metadata
         run: uv run --group dev twine check dist/*
 
+      - name: Verify installed wheel
+        run: |
+          uv venv --python 3.12 --seed /tmp/catap-wheel-check
+          /tmp/catap-wheel-check/bin/pip install --quiet dist/*.whl
+          /tmp/catap-wheel-check/bin/python - <<'PY'
+          import pathlib
+          import tomllib
+
+          import catap
+          from catap._native_coreaudio import load_native_coreaudio
+
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          expected_version = pyproject["project"]["version"]
+          assert catap.__version__ == expected_version, (
+              catap.__version__,
+              expected_version,
+          )
+          library = load_native_coreaudio()
+          print("native dylib:", library.path, "ABI", library.abi_version())
+          PY
+          /tmp/catap-wheel-check/bin/catap --help > /dev/null
+
       - name: Upload distributions
         uses: actions/upload-artifact@v7
         with:
