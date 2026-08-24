@@ -320,6 +320,9 @@ CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
 
 Opt-in. Exercises the real macOS Core Audio bridge: process enumeration and
 a short recording that covers tap startup, shutdown, and WAV finalization.
+Additionally setting `CATAP_RUN_TONE_INTEGRATION=1` plays a short tone aloud
+and requires the capture to contain it; see
+[`RELEASE.md`](RELEASE.md) for the release gate.
 
 See [`RELEASE.md`](RELEASE.md) for the release checklist.
 

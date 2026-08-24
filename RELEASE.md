@@ -25,11 +25,18 @@ uv run --group dev twine check dist/*
 ```
 
 If the current Mac has already granted system-audio permission to your
-terminal app, also run the opt-in integration smoke tests:
+terminal app, also run the opt-in integration smoke tests, including the
+audible known-tone gate. The tone test plays a short 1 kHz tone through the
+default output device and fails unless the capture actually contains it, so
+run it with output audible (not muted):
 
 ```bash
-CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
+CATAP_RUN_INTEGRATION=1 CATAP_RUN_TONE_INTEGRATION=1 \
+  uv run --group dev pytest -m integration
 ```
+
+The tone gate is required before every release; hosted CI cannot run it
+because macOS system-audio permission cannot be granted headlessly.
 
 4. Commit and tag:
 

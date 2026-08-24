@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added an opt-in known-tone acceptance gate
+  (`CATAP_RUN_TONE_INTEGRATION=1`): it plays a 1 kHz tone through the default
+  output device and fails unless the capture actually contains it,
+  distinguishing real audio delivery from permission-zeroed silence. The
+  existing smoke test now also requires the WAV frame count to match
+  `frames_recorded`.
 - Documented the retryable cleanup contract in the README, the low-level
   `AudioRecorder` example, and the mute-behavior notes, and documented that
   shutdown drains queued buffers through `on_buffer` and waits on the
