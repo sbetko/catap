@@ -479,27 +479,163 @@ def test_recorder_rejects_stop_from_callback_before_lifecycle_mutation() -> None
     assert recorder._worker.thread is None
 
 
-def test_worker_stop_retains_state_when_finalization_is_interrupted(tmp_path) -> None:
+def test_worker_stop_finishes_cleanup_when_finalization_is_interrupted(
+    tmp_path,
+) -> None:
     consume_calls = 0
+    interrupt = KeyboardInterrupt("finalization interrupted")
 
     def _consume_dropped_stats() -> tuple[int, int]:
         nonlocal consume_calls
         consume_calls += 1
         if consume_calls == 1:
-            raise KeyboardInterrupt("finalization interrupted")
+            raise interrupt
         return (0, 0)
 
     worker = _make_worker(consume_dropped_stats=_consume_dropped_stats)
     worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
 
-    with pytest.raises(KeyboardInterrupt, match="finalization interrupted"):
+    with pytest.raises(KeyboardInterrupt, match="finalization interrupted") as exc_info:
         worker.stop()
 
+    assert exc_info.value is interrupt
+    assert worker.thread is None
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_stop_confirms_exit_after_join_is_interrupted(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("join interrupted")
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+    thread = worker.thread
+    assert thread is not None
+    real_join = thread.join
+    join_calls = 0
+
+    def _interrupt_first_join() -> None:
+        nonlocal join_calls
+        join_calls += 1
+        if join_calls == 1:
+            raise interrupt
+        real_join()
+
+    monkeypatch.setattr(thread, "join", _interrupt_first_join)
+
+    with pytest.raises(KeyboardInterrupt, match="join interrupted") as exc_info:
+        worker.stop()
+
+    assert exc_info.value is interrupt
+    assert join_calls == 1
+    assert worker.thread is None
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_stop_retries_sentinel_after_keyboard_interrupt(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("queue put interrupted")
+    real_queue_type = worker_module.queue.SimpleQueue
+    put_calls = 0
+
+    class _InterruptingQueue:
+        def __init__(self) -> None:
+            self._queue = real_queue_type()
+
+        def put(self, item: object) -> None:
+            nonlocal put_calls
+            if item is None:
+                put_calls += 1
+                if put_calls == 1:
+                    raise interrupt
+            self._queue.put(item)
+
+        def get(self) -> object:
+            return self._queue.get()
+
+    monkeypatch.setattr(worker_module.queue, "SimpleQueue", _InterruptingQueue)
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    with pytest.raises(KeyboardInterrupt, match="queue put interrupted") as exc_info:
+        worker.stop()
+
+    assert exc_info.value is interrupt
+    assert put_calls == 2
+    assert worker.thread is None
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_stop_retries_temp_discard_after_keyboard_interrupt(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("discard interrupted")
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+    real_discard = worker._discard_temporary_output
+    discard_calls = 0
+
+    def _interrupt_first_discard(
+        state: worker_module._WorkerState,
+    ) -> OSError | None:
+        nonlocal discard_calls
+        discard_calls += 1
+        if discard_calls == 1:
+            raise interrupt
+        return real_discard(state)
+
+    monkeypatch.setattr(worker, "_discard_temporary_output", _interrupt_first_discard)
+
+    with pytest.raises(KeyboardInterrupt, match="discard interrupted") as exc_info:
+        worker.stop(publish=False)
+
+    assert exc_info.value is interrupt
+    assert discard_calls == 2
+    assert worker.thread is None
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_stop_retains_state_until_interrupted_discard_succeeds(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_interrupt = KeyboardInterrupt("first discard interrupted")
+    second_interrupt = KeyboardInterrupt("second discard interrupted")
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+    real_discard = worker._discard_temporary_output
+    discard_calls = 0
+
+    def _interrupt_twice(
+        state: worker_module._WorkerState,
+    ) -> OSError | None:
+        nonlocal discard_calls
+        discard_calls += 1
+        if discard_calls == 1:
+            raise first_interrupt
+        if discard_calls == 2:
+            raise second_interrupt
+        return real_discard(state)
+
+    monkeypatch.setattr(worker, "_discard_temporary_output", _interrupt_twice)
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="first discard interrupted",
+    ) as exc_info:
+        worker.stop(publish=False)
+
+    assert exc_info.value is first_interrupt
     assert worker.thread is not None
-    assert worker.thread.is_alive() is False
-    assert len(list(tmp_path.glob(".recording.wav.*.tmp"))) == 1
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) != []
 
     worker.stop(publish=False)
+
+    assert discard_calls == 3
     assert worker.thread is None
     assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
 
@@ -581,11 +717,19 @@ def test_stop_reports_core_audio_cleanup_failures(
     ) as exc_info:
         recorder.stop()
 
-    assert calls == ["stop:55:77", "destroy-io:55:77", "destroy-device:55"]
-    assert recorder._aggregate_device_id is None
-    assert recorder._io_proc_id is None
+    assert calls == [
+        "stop:55:77",
+        "destroy-io:55:77",
+        "destroy-device:55",
+        "stop:55:77",
+        "destroy-io:55:77",
+        "destroy-device:55",
+    ]
+    assert recorder._aggregate_device_id == 55
+    assert recorder._io_proc_id is capture_session.io_proc_id
     assert recorder.is_recording is False
-    assert recorder._lifecycle_state == "idle"
+    assert recorder.needs_cleanup is True
+    assert recorder._lifecycle_state == "cleanup_failed"
     assert native_recorder.closed is False
     assert native_recorder.abandoned is True
     assert abandoned_captures == [(capture_session, native_recorder)]
@@ -648,6 +792,380 @@ def test_stop_releases_native_recorder_after_io_proc_destruction(
     assert abandoned_captures == []
 
 
+def test_stop_finishes_cleanup_after_capture_interrupt() -> None:
+    interrupt = KeyboardInterrupt("capture cleanup interrupted")
+
+    class _InterruptingCaptureEngine:
+        def close(self, session: capture_module._TapCaptureSession) -> None:
+            session.started = False
+            session.io_proc_destroyed = True
+            session.aggregate_device_destroyed = True
+            raise interrupt
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    native_recorder = _InspectableNativeRecorder()
+    capture_session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
+    recorder._capture_engine = cast(Any, _InterruptingCaptureEngine())
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+    recorder._native_recorder = cast(Any, native_recorder)
+    recorder._capture_session = capture_session
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="capture cleanup interrupted",
+    ) as exc_info:
+        recorder.stop()
+
+    assert exc_info.value is interrupt
+    assert native_recorder.closed is True
+    assert native_recorder.abandoned is False
+    assert recorder._capture_session is None
+    assert recorder._native_recorder is None
+    assert recorder.is_recording is False
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_stop_retries_interrupted_lifecycle_publication() -> None:
+    interrupt = KeyboardInterrupt("lifecycle publication interrupted")
+
+    class _InterruptingLock:
+        def __init__(self) -> None:
+            self.enter_calls = 0
+
+        def __enter__(self) -> None:
+            self.enter_calls += 1
+            if self.enter_calls == 2:
+                raise interrupt
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+    lifecycle_lock = _InterruptingLock()
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._lifecycle_lock = cast(Any, lifecycle_lock)
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="lifecycle publication interrupted",
+    ) as exc_info:
+        recorder.stop()
+
+    assert exc_info.value is interrupt
+    assert lifecycle_lock.enter_calls == 3
+    assert recorder.is_recording is False
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_stop_restores_terminal_state_after_lifecycle_claim_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("interrupted after stop claim")
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+    monkeypatch.setattr(
+        recorder,
+        "_finish_stop",
+        lambda: (_ for _ in ()).throw(interrupt),
+    )
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="interrupted after stop claim",
+    ) as exc_info:
+        recorder.stop()
+
+    assert exc_info.value is interrupt
+    assert recorder.is_recording is False
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_stop_abandons_native_state_when_drain_is_not_quiesced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("drain join interrupted")
+    abandoned_captures: list[tuple[capture_module._TapCaptureSession, object]] = []
+    drain_stop_calls = 0
+    drain_remaining_values: list[bool] = []
+
+    class _LiveDrain:
+        @staticmethod
+        def is_alive() -> bool:
+            return True
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    native_recorder = _InspectableNativeRecorder()
+    capture_session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        io_proc_destroyed=True,
+        aggregate_device_destroyed=True,
+    )
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+    recorder._native_recorder = cast(Any, native_recorder)
+    recorder._capture_session = capture_session
+    recorder._native_drain_thread = cast(Any, _LiveDrain())
+    recorder._native_drain_abort_event = threading.Event()
+    recorder._native_drain_done_event = threading.Event()
+
+    def _interrupt_drain_stop(**kwargs: object) -> None:
+        nonlocal drain_stop_calls
+        drain_remaining_values.append(cast(bool, kwargs["drain_remaining"]))
+        drain_stop_calls += 1
+        if drain_stop_calls <= 2:
+            raise interrupt
+        recorder._native_drain_thread = None
+        recorder._native_drain_stop_event = None
+        recorder._native_drain_abort_event = None
+        recorder._native_drain_done_event = None
+
+    monkeypatch.setattr(recorder, "_stop_native_drain", _interrupt_drain_stop)
+    monkeypatch.setattr(
+        recorder_module,
+        "_ABANDONED_NATIVE_CAPTURES",
+        abandoned_captures,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="drain join interrupted") as exc_info:
+        recorder.stop()
+
+    assert exc_info.value is interrupt
+    assert native_recorder.closed is False
+    assert native_recorder.abandoned is True
+    assert abandoned_captures == [(capture_session, native_recorder)]
+    assert recorder._native_recorder is None
+    assert recorder._native_drain_abort_event is not None
+    assert recorder._native_drain_abort_event.is_set()
+    assert recorder.needs_cleanup is True
+    assert recorder._lifecycle_state == "cleanup_failed"
+
+    recorder.stop()
+
+    assert drain_stop_calls == 3
+    assert drain_remaining_values == [True, True, False]
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_stop_retries_interrupted_native_retention_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("retention interrupted")
+    append_calls = 0
+
+    class _InterruptingCaptureEngine:
+        @staticmethod
+        def close(session: capture_module._TapCaptureSession) -> None:
+            session.started = False
+
+    class _InterruptingList(list[tuple[object, object]]):
+        def append(self, item: tuple[object, object]) -> None:
+            nonlocal append_calls
+            append_calls += 1
+            if append_calls == 1:
+                raise interrupt
+            super().append(item)
+
+    abandoned_captures = _InterruptingList()
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    native_recorder = _InspectableNativeRecorder()
+    capture_session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
+    recorder._capture_engine = cast(Any, _InterruptingCaptureEngine())
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+    recorder._native_recorder = cast(Any, native_recorder)
+    recorder._capture_session = capture_session
+    monkeypatch.setattr(
+        recorder_module,
+        "_ABANDONED_NATIVE_CAPTURES",
+        abandoned_captures,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="retention interrupted") as exc_info:
+        recorder.stop()
+
+    assert exc_info.value is interrupt
+    assert append_calls == 2
+    assert abandoned_captures == [(capture_session, native_recorder)]
+    assert native_recorder.closed is False
+    assert native_recorder.abandoned is True
+    assert recorder._native_recorder is None
+    assert recorder._capture_session is capture_session
+    assert recorder.needs_cleanup is True
+    assert recorder._lifecycle_state == "cleanup_failed"
+
+
+def test_stop_finishes_lifetime_boundary_after_drain_check_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("drain state interrupted")
+    drain_checks = 0
+    drain_stop_calls = 0
+
+    class _ClosingCaptureEngine:
+        @staticmethod
+        def close(session: capture_module._TapCaptureSession) -> None:
+            session.started = False
+            session.io_proc_destroyed = True
+            session.aggregate_device_destroyed = True
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    native_recorder = _InspectableNativeRecorder()
+    capture_session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
+    recorder._capture_engine = cast(Any, _ClosingCaptureEngine())
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+    recorder._native_recorder = cast(Any, native_recorder)
+    recorder._capture_session = capture_session
+    recorder._native_drain_thread = cast(Any, object())
+
+    def _finish_drain_on_retry(**kwargs: object) -> None:
+        nonlocal drain_stop_calls
+        del kwargs
+        drain_stop_calls += 1
+        if drain_stop_calls == 2:
+            recorder._native_drain_thread = None
+
+    def _interrupt_first_drain_check() -> bool:
+        nonlocal drain_checks
+        drain_checks += 1
+        if drain_checks == 1:
+            raise interrupt
+        return True
+
+    monkeypatch.setattr(
+        recorder,
+        "_native_drain_is_quiesced",
+        _interrupt_first_drain_check,
+    )
+    monkeypatch.setattr(recorder, "_stop_native_drain", _finish_drain_on_retry)
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="drain state interrupted",
+    ) as exc_info:
+        recorder.stop()
+
+    assert exc_info.value is interrupt
+    assert drain_checks == 2
+    assert drain_stop_calls == 2
+    assert native_recorder.closed is True
+    assert native_recorder.abandoned is False
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_interrupted_native_drain_start_publishes_cleanup_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_thread_type = threading.Thread
+    native_recorder = _InspectableNativeRecorder()
+
+    class _InterruptingThread:
+        def __init__(
+            self,
+            *,
+            target: Callable[..., None],
+            args: tuple[object, ...],
+            name: str,
+            daemon: bool,
+        ) -> None:
+            self._thread = real_thread_type(
+                target=target,
+                args=args,
+                name=name,
+                daemon=daemon,
+            )
+
+        @property
+        def ident(self) -> int | None:
+            return self._thread.ident
+
+        def start(self) -> None:
+            self._thread.start()
+            raise KeyboardInterrupt("interrupted after native drain start")
+
+        def join(self) -> None:
+            self._thread.join()
+
+        def is_alive(self) -> bool:
+            return self._thread.is_alive()
+
+    monkeypatch.setattr(recorder_module.threading, "Thread", _InterruptingThread)
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="interrupted after native drain start",
+    ):
+        recorder._start_native_drain(cast(Any, native_recorder))
+
+    assert recorder._native_drain_thread is not None
+    recorder._stop_native_drain()
+    assert recorder._native_drain_thread is None
+    assert recorder._native_drain_done_event is None
+
+
+def test_native_drain_records_base_exception_and_signals_completion() -> None:
+    interrupt = SystemExit("native read exited")
+
+    class _FailingNativeRecorder(_InspectableNativeRecorder):
+        def read(self) -> object | None:
+            raise interrupt
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    done_event = threading.Event()
+    recorder._native_drain_loop(
+        cast(Any, _FailingNativeRecorder()),
+        threading.Event(),
+        threading.Event(),
+        done_event,
+    )
+
+    assert done_event.is_set()
+    assert len(recorder._native_drain_failures) == 1
+    assert isinstance(recorder._native_drain_failures[0].__cause__, SystemExit)
+
+
+def test_native_drain_abort_skips_remaining_native_reads() -> None:
+    class _UnexpectedReadRecorder(_InspectableNativeRecorder):
+        def read(self) -> object | None:
+            raise AssertionError("native ring should not be read after abort")
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    abort_event = threading.Event()
+    done_event = threading.Event()
+    abort_event.set()
+
+    recorder._native_drain_loop(
+        cast(Any, _UnexpectedReadRecorder()),
+        threading.Event(),
+        abort_event,
+        done_event,
+    )
+
+    assert done_event.is_set()
+    assert recorder._native_drain_failures == []
+
+
 def test_failed_start_does_not_clobber_existing_output_file(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -706,6 +1224,7 @@ def test_failed_device_start_does_not_clobber_existing_output_file(tmp_path) -> 
             raise OSError("device start failed")
 
         def close(self, session: capture_module._TapCaptureSession) -> None:
+            session.started = False
             session.io_proc_destroyed = True
             session.aggregate_device_destroyed = True
 
@@ -787,6 +1306,164 @@ def test_failed_start_abandons_native_state_when_io_proc_cleanup_fails(
     )
 
 
+def test_failed_start_retains_recovered_capture_until_native_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_recorder = _InspectableNativeRecorder()
+    capture_session = capture_module._TapCaptureSession(55, ctypes.c_void_p(77))
+    append_calls = 0
+
+    class _TwiceFailingList(list[tuple[object, object]]):
+        def append(self, item: tuple[object, object]) -> None:
+            nonlocal append_calls
+            append_calls += 1
+            if append_calls <= 2:
+                raise RuntimeError("retention publication failed")
+            super().append(item)
+
+    abandoned_captures = _TwiceFailingList()
+
+    class _CaptureEngine:
+        failed_capture_session = capture_session
+
+        @staticmethod
+        def describe_tap_stream(tap_id: int) -> capture_module._TapStreamFormat:
+            del tap_id
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                16,
+                False,
+                bytes_per_frame=4,
+            )
+
+        @staticmethod
+        def open_tap_capture(
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> capture_module._TapCaptureSession:
+            del tap_id, callback, client_data
+            raise OSError("capture ownership publication failed")
+
+        @staticmethod
+        def close(session: capture_module._TapCaptureSession) -> None:
+            session.started = False
+            session.aggregate_device_destroyed = True
+
+    monkeypatch.setattr(
+        recorder_module,
+        "NativeCoreAudioRecorder",
+        lambda **kwargs: native_recorder,
+    )
+    monkeypatch.setattr(
+        recorder_module,
+        "_ABANDONED_NATIVE_CAPTURES",
+        abandoned_captures,
+    )
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, _CaptureEngine())
+
+    with pytest.raises(OSError, match="capture ownership publication failed"):
+        recorder.start()
+
+    assert append_calls == 2
+    assert native_recorder.closed is False
+    assert native_recorder.abandoned is False
+    assert recorder._native_recorder is native_recorder
+    assert recorder._capture_session is capture_session
+    assert recorder.needs_cleanup is True
+    assert recorder._lifecycle_state == "cleanup_failed"
+
+    with pytest.raises(RuntimeError, match="Retained native recorder state"):
+        recorder.stop()
+
+    assert append_calls == 3
+    assert abandoned_captures == [(capture_session, native_recorder)]
+    assert native_recorder.closed is False
+    assert native_recorder.abandoned is True
+    assert recorder._native_recorder is None
+
+
+def test_start_cleans_capture_after_return_handoff_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("capture return handoff interrupted")
+    native_recorder = _InspectableNativeRecorder()
+    cleanup_calls: list[str] = []
+
+    class _InterruptAfterReturnEngine(capture_module._TapCaptureEngine):
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> capture_module._TapCaptureSession:
+            super().open_tap_capture(tap_id, callback, client_data)
+            raise interrupt
+
+    def _create_io_proc(
+        device_id: int,
+        callback: object,
+        client_data: object,
+        io_proc_id: object,
+    ) -> int:
+        del callback, client_data
+        pointer = ctypes.cast(cast(Any, io_proc_id), ctypes.POINTER(ctypes.c_void_p))
+        pointer[0] = ctypes.c_void_p(77)
+        cleanup_calls.append(f"create:{device_id}")
+        return 0
+
+    monkeypatch.setattr(capture_module, "_get_tap_format", _stub_tap_format)
+    monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(
+        capture_module,
+        "_create_aggregate_device_for_tap",
+        lambda tap_uid, name: 55,
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_AudioDeviceCreateIOProcID",
+        _create_io_proc,
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_io_proc",
+        lambda device_id, io_proc_id: cleanup_calls.append(
+            f"destroy-io:{device_id}:{io_proc_id.value}"
+        ),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_aggregate_device",
+        lambda device_id: cleanup_calls.append(f"destroy-device:{device_id}"),
+    )
+    monkeypatch.setattr(
+        recorder_module,
+        "NativeCoreAudioRecorder",
+        lambda **kwargs: native_recorder,
+    )
+
+    engine = _InterruptAfterReturnEngine()
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = engine
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="capture return handoff interrupted",
+    ) as exc_info:
+        recorder.start()
+
+    assert exc_info.value is interrupt
+    assert cleanup_calls == ["create:55", "destroy-io:55:77", "destroy-device:55"]
+    assert native_recorder.closed is True
+    assert native_recorder.abandoned is False
+    assert engine.failed_capture_session is None
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
 def test_start_uses_native_io_proc_when_dylib_is_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -852,6 +1529,7 @@ def test_start_uses_native_io_proc_when_dylib_is_available(
             session.started = False
 
         def close(self, session: capture_module._TapCaptureSession) -> None:
+            session.started = False
             session.io_proc_destroyed = True
             session.aggregate_device_destroyed = True
 
@@ -988,6 +1666,70 @@ def test_start_raises_audio_tap_not_found_error_for_stale_tap(
     assert recorder._lifecycle_state == "idle"
 
 
+def test_start_preserves_primary_when_lifecycle_publication_is_interrupted() -> None:
+    primary = OSError("stream description failed")
+    interrupt = KeyboardInterrupt("lifecycle publication interrupted")
+
+    class _InterruptingLock:
+        def __init__(self) -> None:
+            self.enter_calls = 0
+
+        def __enter__(self) -> None:
+            self.enter_calls += 1
+            if self.enter_calls == 2:
+                raise interrupt
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+    class _StartFailingCaptureEngine:
+        @staticmethod
+        def describe_tap_stream(tap_id: int) -> capture_module._TapStreamFormat:
+            del tap_id
+            raise primary
+
+    lifecycle_lock = _InterruptingLock()
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, _StartFailingCaptureEngine())
+    recorder._lifecycle_lock = cast(Any, lifecycle_lock)
+
+    with pytest.raises(OSError, match="stream description failed") as exc_info:
+        recorder.start()
+
+    assert exc_info.value is primary
+    assert lifecycle_lock.enter_calls == 3
+    assert any(
+        "lifecycle publication interrupted" in note
+        for note in exc_info.value.__notes__
+    )
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_start_restores_terminal_state_after_lifecycle_claim_interrupt() -> None:
+    interrupt = KeyboardInterrupt("interrupted after start claim")
+
+    class _InterruptingCaptureEngine:
+        @staticmethod
+        def describe_tap_stream(tap_id: int) -> capture_module._TapStreamFormat:
+            del tap_id
+            raise interrupt
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, _InterruptingCaptureEngine())
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="interrupted after start claim",
+    ) as exc_info:
+        recorder.start()
+
+    assert exc_info.value is interrupt
+    assert recorder.is_recording is False
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
 def test_start_worker_failure_closes_resources_without_join(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1093,6 +1835,56 @@ def test_worker_start_preserves_primary_when_temp_unlink_fails(
     temporary_files[0].unlink()
 
 
+def test_recorder_retries_worker_state_after_startup_temp_cleanup_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingThread:
+        ident = None
+
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        @staticmethod
+        def start() -> None:
+            raise RuntimeError("thread start failed")
+
+        @staticmethod
+        def join() -> None:
+            raise AssertionError("never-started thread should not be joined")
+
+        @staticmethod
+        def is_alive() -> bool:
+            return False
+
+    worker = _make_worker()
+    real_unlink = worker._unlink_path
+
+    def _fail_unlink(path: Path) -> None:
+        del path
+        raise PermissionError("startup unlink denied")
+
+    monkeypatch.setattr(worker_module.threading, "Thread", _FailingThread)
+    monkeypatch.setattr(worker, "_unlink_path", _fail_unlink)
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    assert worker.needs_cleanup is True
+    assert len(list(tmp_path.glob(".recording.wav.*.tmp"))) == 1
+
+    monkeypatch.setattr(worker, "_unlink_path", real_unlink)
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._worker = worker
+    assert recorder.needs_cleanup is True
+
+    recorder.stop()
+
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
 def test_worker_start_preserves_primary_when_raw_fd_close_fails(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1171,6 +1963,121 @@ def test_worker_start_reclaims_thread_when_start_is_interrupted(
     assert len(created_threads) == 1
     interrupted_thread = created_threads[0]
     assert interrupted_thread.is_alive() is False
+    assert worker.thread is None
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_start_retries_interrupted_cleanup_sentinel(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_thread_type = threading.Thread
+    real_queue_type = worker_module.queue.SimpleQueue
+    cleanup_interrupt = KeyboardInterrupt("cleanup sentinel interrupted")
+    created_threads: list[Any] = []
+    sentinel_puts = 0
+
+    class _FailingStartThread:
+        def __init__(
+            self,
+            *,
+            target: Callable[..., None],
+            args: tuple[object, ...],
+            name: str,
+            daemon: bool,
+        ) -> None:
+            self._thread = real_thread_type(
+                target=target,
+                args=args,
+                name=name,
+                daemon=daemon,
+            )
+            created_threads.append(self)
+
+        @property
+        def ident(self) -> int | None:
+            return self._thread.ident
+
+        def start(self) -> None:
+            self._thread.start()
+            raise OSError("thread start wrapper failed")
+
+        def join(self) -> None:
+            self._thread.join()
+
+        def is_alive(self) -> bool:
+            return self._thread.is_alive()
+
+    class _InterruptingQueue:
+        def __init__(self) -> None:
+            self._queue = real_queue_type()
+
+        def put(self, item: object) -> None:
+            nonlocal sentinel_puts
+            if item is None:
+                sentinel_puts += 1
+                if sentinel_puts == 1:
+                    raise cleanup_interrupt
+            self._queue.put(item)
+
+        def get(self) -> object:
+            return self._queue.get()
+
+    monkeypatch.setattr(worker_module.threading, "Thread", _FailingStartThread)
+    monkeypatch.setattr(worker_module.queue, "SimpleQueue", _InterruptingQueue)
+    worker = _make_worker()
+
+    with pytest.raises(OSError, match="thread start wrapper failed") as exc_info:
+        worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    assert sentinel_puts == 2
+    assert len(created_threads) == 1
+    assert created_threads[0].is_alive() is False
+    assert any(
+        "cleanup sentinel interrupted" in note
+        for note in exc_info.value.__notes__
+    )
+    assert worker.thread is None
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_start_cleans_state_after_ownership_handoff_interrupt(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("worker ownership handoff interrupted")
+    real_thread_type = threading.Thread
+    real_pop_all = worker_module.contextlib.ExitStack.pop_all
+    created_threads: list[threading.Thread] = []
+
+    def _create_thread(**kwargs: object) -> threading.Thread:
+        thread = real_thread_type(**cast(Any, kwargs))
+        created_threads.append(thread)
+        return thread
+
+    def _interrupt_after_pop_all(
+        stack: worker_module.contextlib.ExitStack,
+    ) -> worker_module.contextlib.ExitStack:
+        real_pop_all(stack)
+        raise interrupt
+
+    monkeypatch.setattr(worker_module.threading, "Thread", _create_thread)
+    monkeypatch.setattr(
+        worker_module.contextlib.ExitStack,
+        "pop_all",
+        _interrupt_after_pop_all,
+    )
+    worker = _make_worker()
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="worker ownership handoff interrupted",
+    ) as exc_info:
+        worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    assert exc_info.value is interrupt
+    assert len(created_threads) == 1
+    assert created_threads[0].is_alive() is False
     assert worker.thread is None
     assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
 

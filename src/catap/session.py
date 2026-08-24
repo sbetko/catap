@@ -56,6 +56,11 @@ def _resolve_processes(
     return [_resolve_process(process, backend) for process in processes]
 
 
+def _recorder_requires_cleanup(recorder: _RecorderLike | None) -> bool:
+    """Return whether a recorder is active or owns retryable cleanup state."""
+    return recorder is not None and (recorder.is_recording or recorder.needs_cleanup)
+
+
 def build_process_tap_description(
     process: AudioProcess, *, mute: bool = False
 ) -> TapDescription:
@@ -302,18 +307,24 @@ class RecordingSession:
             self._recorder = recorder
             recorder.start()
         except BaseException as exc:
-            recorder_is_active = (
-                self._recorder is not None and self._recorder.is_recording
-            )
-            if not recorder_is_active:
-                cleanup_error = self._destroy_tap()
-                if cleanup_error is not None:
+            if not _recorder_requires_cleanup(self._recorder):
+                try:
+                    cleanup_error = self._destroy_tap()
+                except BaseException as cleanup_exc:
                     _add_secondary_failure(
                         exc,
                         "Cleanup failure during session startup",
-                        cleanup_error,
+                        cleanup_exc,
                     )
-                self._recorder = None
+                else:
+                    if cleanup_error is not None:
+                        _add_secondary_failure(
+                            exc,
+                            "Cleanup failure during session startup",
+                            cleanup_error,
+                        )
+                finally:
+                    self._recorder = None
             raise
 
     def stop(self) -> None:
@@ -325,25 +336,26 @@ class RecordingSession:
             OSError: If stopping or cleanup fails
         """
         recorder = self._recorder
-        recorder_is_active = recorder is not None and recorder.is_recording
-        if not recorder_is_active and self._tap_id is None:
+        recorder_requires_cleanup = _recorder_requires_cleanup(recorder)
+        if not recorder_requires_cleanup and self._tap_id is None:
             raise RuntimeError("Not recording")
 
-        stop_error: OSError | RuntimeError | None = None
-        if recorder_is_active:
+        stop_error: BaseException | None = None
+        if recorder_requires_cleanup:
             assert recorder is not None
             try:
                 recorder.stop()
-            except (OSError, RuntimeError) as exc:
+            except BaseException as exc:
                 stop_error = exc
-            if recorder.is_recording and stop_error is None:
-                stop_error = RuntimeError("Recorder remained active after stop")
+            if _recorder_requires_cleanup(recorder) and stop_error is None:
+                stop_error = RuntimeError("Recorder cleanup remained pending")
 
-        destroy_error = (
-            None
-            if recorder is not None and recorder.is_recording
-            else self._destroy_tap()
-        )
+        destroy_error: BaseException | None = None
+        if not _recorder_requires_cleanup(recorder):
+            try:
+                destroy_error = self._destroy_tap()
+            except BaseException as exc:
+                destroy_error = exc
 
         errors = [error for error in (stop_error, destroy_error) if error is not None]
         if errors:
@@ -356,20 +368,22 @@ class RecordingSession:
         This method is idempotent.
         """
         recorder = self._recorder
-        stop_error: OSError | RuntimeError | None = None
-        if recorder is not None and recorder.is_recording:
+        stop_error: BaseException | None = None
+        if _recorder_requires_cleanup(recorder):
+            assert recorder is not None
             try:
                 recorder.stop()
-            except (OSError, RuntimeError) as exc:
+            except BaseException as exc:
                 stop_error = exc
-            if recorder.is_recording and stop_error is None:
-                stop_error = RuntimeError("Recorder remained active after stop")
+            if _recorder_requires_cleanup(recorder) and stop_error is None:
+                stop_error = RuntimeError("Recorder cleanup remained pending")
 
-        destroy_error = (
-            None
-            if recorder is not None and recorder.is_recording
-            else self._destroy_tap()
-        )
+        destroy_error: BaseException | None = None
+        if not _recorder_requires_cleanup(recorder):
+            try:
+                destroy_error = self._destroy_tap()
+            except BaseException as exc:
+                destroy_error = exc
 
         errors = [error for error in (stop_error, destroy_error) if error is not None]
         if errors:
@@ -386,7 +400,7 @@ class RecordingSession:
             This session instance
 
         Raises:
-            ValueError: If duration is not positive
+            ValueError: If duration is not finite and positive
         """
         if not math.isfinite(duration):
             raise ValueError("duration must be finite")

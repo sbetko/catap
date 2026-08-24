@@ -5,11 +5,12 @@ from __future__ import annotations
 import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TypeAlias
+from typing import TypeAlias, TypeVar
 
 from catap.audio_buffer import AudioBuffer
 
 _RecordingFailure: TypeAlias = OSError | RuntimeError
+_ErrorT = TypeVar("_ErrorT", bound=BaseException)
 
 _DEFAULT_MAX_PENDING_BUFFERS = 256
 
@@ -47,8 +48,8 @@ def _add_secondary_failure(
 
 def _combine_errors(
     summary: str,
-    errors: Sequence[_RecordingFailure],
-) -> _RecordingFailure:
+    errors: Sequence[_ErrorT],
+) -> _ErrorT:
     """Annotate the primary error with summary and secondary tracebacks."""
     primary = errors[0]
     primary.add_note(summary)

@@ -315,6 +315,35 @@ def test_open_tap_capture_preserves_session_when_io_proc_unwind_fails(
     assert any("destroy io failed" in note for note in exc_info.value.__notes__)
 
 
+def test_open_tap_capture_publishes_ownership_until_caller_acknowledges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def create_io_proc(
+        device_id: int,
+        callback: object,
+        client_data: object,
+        io_proc_id: object,
+    ) -> int:
+        del device_id, callback, client_data
+        _set_void_p(io_proc_id, 77)
+        return 0
+
+    monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(
+        capture_module,
+        "_create_aggregate_device_for_tap",
+        lambda tap_uid, name: 55,
+    )
+    monkeypatch.setattr(capture_module, "_AudioDeviceCreateIOProcID", create_io_proc)
+    engine = capture_module._TapCaptureEngine()
+
+    session = engine.open_tap_capture(123, object())
+
+    assert engine.failed_capture_session is session
+    engine.acknowledge_capture_session(session)
+    assert engine.failed_capture_session is None
+
+
 def test_start_marks_session_started_only_after_core_audio_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -433,6 +462,48 @@ def test_close_combines_io_proc_and_aggregate_cleanup_failures(
     assert any("destroy aggregate failed" in note for note in notes)
     assert session.io_proc_destroyed is False
     assert session.aggregate_device_destroyed is False
+
+
+def test_close_finishes_cleanup_after_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt = KeyboardInterrupt("stop interrupted")
+    session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        capture_module,
+        "_stop_audio_device",
+        lambda device_id, io_proc_id: (_ for _ in ()).throw(interrupt),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_io_proc",
+        lambda device_id, io_proc_id: calls.append("destroy-io"),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_aggregate_device",
+        lambda device_id: (_ for _ in ()).throw(
+            OSError("destroy aggregate failed")
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="stop interrupted") as exc_info:
+        capture_module._TapCaptureEngine().close(session)
+
+    assert exc_info.value is interrupt
+    assert calls == ["destroy-io"]
+    assert session.started is False
+    assert session.io_proc_destroyed is True
+    assert session.aggregate_device_destroyed is False
+    assert any(
+        "destroy aggregate failed" in note for note in exc_info.value.__notes__
+    )
 
 
 def test_close_tracks_aggregate_success_without_assuming_io_proc_stopped(

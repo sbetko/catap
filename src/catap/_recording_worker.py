@@ -67,6 +67,7 @@ class _WorkerState:
     final_output_path: Path | None = None
     temporary_output_path: Path | None = None
     failures: list[_WorkerFailure] = field(default_factory=list)
+    done_event: threading.Event = field(default_factory=threading.Event)
     # Keep the two sink failures independent so one broken sink does not
     # silence the other for the rest of the capture.
     callback_failed: bool = False
@@ -114,13 +115,17 @@ class _AudioWorker:
         state = self._state
         return state is not None and state.thread is threading.current_thread()
 
+    @property
+    def needs_cleanup(self) -> bool:
+        """True while worker state still needs finalization."""
+        return self._state is not None
+
     def start(self, config: _WorkerConfig) -> None:
         """Start the background worker for file writes and user callbacks."""
         if self._state is not None:
             raise RuntimeError("Audio worker already started")
 
-        state = self._create_state(config)
-        self._state = state
+        self._create_state(config)
 
     def stop(self, *, publish: bool = True) -> None:
         """Flush and stop the background worker."""
@@ -134,30 +139,77 @@ class _AudioWorker:
                 "signal the owning thread to call stop() instead"
             )
 
-        if state.thread is not None and state.thread.is_alive():
-            state.work_queue.put(None)
-
+        cleanup_errors: list[BaseException] = []
+        publish_output = publish
         if state.thread is not None:
-            state.thread.join()
+            stop_signaled = False
+            try:
+                state.work_queue.put(None)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                publish_output = False
+                try:
+                    state.work_queue.put(None)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+                else:
+                    stop_signaled = True
+            else:
+                stop_signaled = True
 
-        worker_errors = list(state.failures)
-        dropped_buffers, dropped_frames = self._consume_dropped_stats()
-        if dropped_buffers > 0:
-            worker_errors.append(
-                RuntimeError(
-                    "Dropped "
-                    f"{dropped_buffers} audio buffer(s) "
-                    f"({dropped_frames} frame(s)) because the background worker "
-                    "fell behind. Try a faster output path or a lighter on_buffer "
-                    "callback."
-                )
+            if stop_signaled:
+                try:
+                    state.thread.join()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                    publish_output = False
+                    try:
+                        if not state.done_event.is_set():
+                            state.done_event.wait()
+                    except BaseException as cleanup_exc:
+                        cleanup_errors.append(cleanup_exc)
+
+            try:
+                thread_is_alive = state.thread.is_alive()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                thread_is_alive = True
+            thread_never_started = (
+                not thread_is_alive
+                and getattr(state.thread, "ident", None) is None
             )
+            worker_is_done = thread_never_started or state.done_event.is_set()
+            if not worker_is_done:
+                if not cleanup_errors:
+                    cleanup_errors.append(
+                        RuntimeError("Audio worker did not stop after being signaled")
+                    )
+                raise _combine_errors(
+                    "Failed to stop audio worker thread",
+                    cleanup_errors,
+                )
+
+        worker_errors = [*cleanup_errors, *state.failures]
+        try:
+            dropped_buffers, dropped_frames = self._consume_dropped_stats()
+        except BaseException as exc:
+            worker_errors.append(exc)
+            publish_output = False
+        else:
+            if dropped_buffers > 0:
+                worker_errors.append(
+                    RuntimeError(
+                        "Dropped "
+                        f"{dropped_buffers} audio buffer(s) "
+                        f"({dropped_frames} frame(s)) because the background worker "
+                        "fell behind. Try a faster output path or a lighter on_buffer "
+                        "callback."
+                    )
+                )
 
         if state.temporary_output_path is not None:
-            if worker_errors or not publish:
-                discard_error = self._discard_temporary_output(state)
-                if discard_error is not None:
-                    worker_errors.append(discard_error)
+            if worker_errors or not publish_output:
+                self._finish_discard_after_interruption(state, worker_errors)
             else:
                 try:
                     assert state.final_output_path is not None
@@ -170,9 +222,10 @@ class _AudioWorker:
                             exc,
                         )
                     )
-                    discard_error = self._discard_temporary_output(state)
-                    if discard_error is not None:
-                        worker_errors.append(discard_error)
+                    self._finish_discard_after_interruption(state, worker_errors)
+                except BaseException as exc:
+                    worker_errors.append(exc)
+                    self._finish_discard_after_interruption(state, worker_errors)
                 else:
                     state.temporary_output_path = None
 
@@ -181,9 +234,31 @@ class _AudioWorker:
             if worker_errors
             else None
         )
-        self._state = None
+        if state.temporary_output_path is None:
+            self._state = None
         if worker_error is not None:
             raise worker_error
+        if self._state is not None:
+            raise RuntimeError("Failed to finalize temporary WAV output")
+
+    def _finish_discard_after_interruption(
+        self,
+        state: _WorkerState,
+        worker_errors: list[BaseException],
+    ) -> None:
+        """Discard temporary output, retrying once after an interruption."""
+        try:
+            discard_error = self._discard_temporary_output(state)
+        except BaseException as exc:
+            worker_errors.append(exc)
+            try:
+                discard_error = self._discard_temporary_output(state)
+            except BaseException as cleanup_exc:
+                worker_errors.append(cleanup_exc)
+                return
+
+        if discard_error is not None:
+            worker_errors.append(discard_error)
 
     def enqueue_audio_bytes(
         self,
@@ -208,7 +283,7 @@ class _AudioWorker:
         state.work_queue.put(item)
         return True
 
-    def _create_state(self, config: _WorkerConfig) -> _WorkerState:
+    def _create_state(self, config: _WorkerConfig) -> None:
         """Create worker-owned queueing state and start the worker thread."""
         stream_format = config.stream_format
         state = _WorkerState(
@@ -295,10 +370,16 @@ class _AudioWorker:
                     lambda: self._stop_thread_during_startup_unwind(state),
                     cleanup_failures,
                 )
+                self._state = state
                 thread.start()
 
                 stack.pop_all()
         except BaseException as exc:
+            if self._state is state:
+                try:
+                    self.stop(publish=False)
+                except BaseException as cleanup_exc:
+                    cleanup_failures.append(cleanup_exc)
             for cleanup_exc in cleanup_failures:
                 _add_secondary_failure(
                     exc,
@@ -306,8 +387,6 @@ class _AudioWorker:
                     cleanup_exc,
                 )
             raise
-
-        return state
 
     @staticmethod
     def _unlink_path(path: Path) -> None:
@@ -329,10 +408,63 @@ class _AudioWorker:
     def _stop_thread_during_startup_unwind(state: _WorkerState) -> None:
         """Stop a thread that may have started before startup was interrupted."""
         thread = state.thread
-        if thread is not None and thread.is_alive():
-            state.work_queue.put(None)
-            thread.join()
-        state.thread = None
+        if thread is None:
+            return
+
+        cleanup_errors: list[BaseException] = []
+        try:
+            thread_is_alive = thread.is_alive()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+            thread_is_alive = True
+
+        if thread_is_alive:
+            stop_signaled = False
+            try:
+                state.work_queue.put(None)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                try:
+                    state.work_queue.put(None)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+                else:
+                    stop_signaled = True
+            else:
+                stop_signaled = True
+
+            if stop_signaled:
+                try:
+                    thread.join()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                    try:
+                        if not state.done_event.is_set():
+                            state.done_event.wait()
+                    except BaseException as cleanup_exc:
+                        cleanup_errors.append(cleanup_exc)
+
+        try:
+            thread_is_alive = thread.is_alive()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+            thread_is_alive = True
+        thread_never_started = (
+            not thread_is_alive and getattr(thread, "ident", None) is None
+        )
+        worker_is_done = thread_never_started or state.done_event.is_set()
+        if worker_is_done:
+            state.thread = None
+        elif not cleanup_errors:
+            cleanup_errors.append(
+                RuntimeError("Audio worker did not stop during startup cleanup")
+            )
+
+        if cleanup_errors:
+            raise _combine_errors(
+                "Failed to stop audio worker during startup cleanup",
+                cleanup_errors,
+            )
 
     def _discard_temporary_output(self, state: _WorkerState) -> OSError | None:
         """Discard a temporary WAV file and return any cleanup failure."""
@@ -411,7 +543,10 @@ class _AudioWorker:
                 finally:
                     state.pending_slots.release()
         finally:
-            self._close_resources(state)
+            try:
+                self._close_resources(state)
+            finally:
+                state.done_event.set()
 
     def _close_resources(self, state: _WorkerState) -> None:
         """Close worker-owned resources and retain any failures."""
