@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-24
+
+- Hardened Core Audio teardown so native callback state is never released until
+  IOProc deregistration and background draining are confirmed safe, including
+  cleanup paths interrupted by `KeyboardInterrupt` or `SystemExit`.
+- Rejected recorder and session stops from inside `on_buffer` callbacks before
+  lifecycle state changes, and documented the owning-thread event pattern.
+- Made session tap cleanup retryable and preserved primary exceptions when
+  context-manager, fixed-duration, or startup cleanup also fails.
+- Kept WAV publication transactional across callback, conversion, publish, and
+  temporary-file cleanup failures.
+- Reported CLI runtime failures without tracebacks or misleading permission
+  hints, and rejected empty output paths and non-finite durations.
+- Built the native Core Audio library correctly for editable installs, kept
+  generated binaries out of source distributions, and made uv invalidate
+  cached editable builds when native sources or headers change.
+
 ## [0.5.0] - 2026-05-05
 
 - BREAKING: Replaced streaming callbacks from `on_data(data, num_frames)` with
