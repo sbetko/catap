@@ -113,6 +113,32 @@ session = record_process("Safari", on_buffer=on_buffer)
 session.record_for(5)
 ```
 
+Do not call `session.stop()` or `recorder.stop()` directly from `on_buffer`.
+The callback runs on the worker that `stop()` must join and finalize. Signal the
+owning thread instead, then let that thread stop the session:
+
+```python
+from threading import Event
+
+from catap import AudioBuffer, record_process
+
+stop_requested = Event()
+frames_received = 0
+
+def on_buffer(buffer: AudioBuffer) -> None:
+    global frames_received
+    frames_received += buffer.frame_count
+    if frames_received >= buffer.format.sample_rate * 5:
+        stop_requested.set()
+
+session = record_process("Safari", on_buffer=on_buffer)
+session.start()
+try:
+    stop_requested.wait()
+finally:
+    session.stop()
+```
+
 Once recording has started, `session.stream_format` exposes the callback
 `AudioStreamFormat` without waiting for the next buffer.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import struct
 import threading
 import wave
@@ -404,6 +405,103 @@ def test_worker_rejects_double_start(tmp_path) -> None:
         worker.start(config)
 
     worker.stop()
+
+
+def test_worker_rejects_stop_from_callback_without_poisoning_state() -> None:
+    callback_finished = threading.Event()
+    stop_errors: list[RuntimeError] = []
+    worker = _make_worker()
+
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
+        del buffer
+        try:
+            worker.stop()
+        except RuntimeError as exc:
+            stop_errors.append(exc)
+        finally:
+            callback_finished.set()
+
+    config = _make_worker_config(on_buffer=on_buffer)
+    worker.start(config)
+
+    assert worker.enqueue_audio_bytes(b"\x00\x01", 1)
+    assert callback_finished.wait(timeout=1)
+    assert len(stop_errors) == 1
+    assert "signal the owning thread" in str(stop_errors[0])
+    assert worker.thread is not None
+    assert worker.thread.is_alive()
+
+    worker.stop()
+    worker.start(config)
+    worker.stop()
+
+
+def test_recorder_rejects_stop_from_callback_before_lifecycle_mutation() -> None:
+    callback_finished = threading.Event()
+    stop_errors: list[RuntimeError] = []
+    recorder: AudioRecorder
+
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
+        del buffer
+        try:
+            recorder.stop()
+        except RuntimeError as exc:
+            stop_errors.append(exc)
+        finally:
+            callback_finished.set()
+
+    recorder = AudioRecorder(123, on_buffer=on_buffer)
+    recorder._apply_stream_format(
+        capture_module._TapStreamFormat(
+            44_100.0,
+            2,
+            16,
+            False,
+            bytes_per_frame=4,
+            is_signed_integer=True,
+        )
+    )
+    recorder._worker.start(recorder._make_worker_config())
+    recorder._lifecycle_state = "recording"
+    recorder._is_recording = True
+
+    assert recorder._worker.enqueue_audio_bytes(b"\x00\x01\x02\x03", 1)
+    assert callback_finished.wait(timeout=1)
+
+    assert len(stop_errors) == 1
+    assert "threading.Event" in str(stop_errors[0])
+    assert recorder.is_recording is True
+    assert recorder._lifecycle_state == "recording"
+
+    recorder.stop()
+    assert recorder.is_recording is False
+    assert recorder._lifecycle_state == "idle"
+    assert recorder._worker.thread is None
+
+
+def test_worker_stop_retains_state_when_finalization_is_interrupted(tmp_path) -> None:
+    consume_calls = 0
+
+    def _consume_dropped_stats() -> tuple[int, int]:
+        nonlocal consume_calls
+        consume_calls += 1
+        if consume_calls == 1:
+            raise KeyboardInterrupt("finalization interrupted")
+        return (0, 0)
+
+    worker = _make_worker(consume_dropped_stats=_consume_dropped_stats)
+    worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    with pytest.raises(KeyboardInterrupt, match="finalization interrupted"):
+        worker.stop()
+
+    assert worker.thread is not None
+    assert worker.thread.is_alive() is False
+    assert len(list(tmp_path.glob(".recording.wav.*.tmp"))) == 1
+
+    worker.stop(publish=False)
+    assert worker.thread is None
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
 
 
 def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
@@ -934,6 +1032,213 @@ def test_start_worker_failure_closes_resources_without_join(
     assert worker.pcm_converter is None
 
 
+def test_worker_start_closes_fd_and_temp_file_on_base_exception(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened_fds: list[int] = []
+
+    def _interrupt_fdopen(fd: int, mode: str) -> Any:
+        del mode
+        opened_fds.append(fd)
+        raise KeyboardInterrupt("interrupted while opening output")
+
+    monkeypatch.setattr(worker_module.os, "fdopen", _interrupt_fdopen)
+    worker = _make_worker()
+    config = _make_worker_config(output_path=tmp_path / "recording.wav")
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted while opening output"):
+        worker.start(config)
+
+    assert len(opened_fds) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(opened_fds[0])
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+    assert worker.thread is None
+
+
+def test_worker_start_preserves_primary_when_temp_unlink_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened_fds: list[int] = []
+    worker = _make_worker()
+
+    def _interrupt_fdopen(fd: int, mode: str) -> Any:
+        del mode
+        opened_fds.append(fd)
+        raise KeyboardInterrupt("fdopen interrupted")
+
+    def _fail_unlink(path: Path) -> None:
+        del path
+        raise PermissionError("startup unlink denied")
+
+    monkeypatch.setattr(worker_module.os, "fdopen", _interrupt_fdopen)
+    monkeypatch.setattr(worker, "_unlink_path", _fail_unlink)
+
+    with pytest.raises(KeyboardInterrupt, match="fdopen interrupted") as exc_info:
+        worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    assert len(opened_fds) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(opened_fds[0])
+    assert any(
+        "Cleanup failure while starting audio worker" in note
+        and "startup unlink denied" in note
+        for note in exc_info.value.__notes__
+    )
+
+    temporary_files = list(tmp_path.glob(".recording.wav.*.tmp"))
+    assert len(temporary_files) == 1
+    temporary_files[0].unlink()
+
+
+def test_worker_start_preserves_primary_when_raw_fd_close_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened_fds: list[int] = []
+    real_close = os.close
+
+    def _interrupt_fdopen(fd: int, mode: str) -> Any:
+        del mode
+        opened_fds.append(fd)
+        raise KeyboardInterrupt("fdopen interrupted")
+
+    def _fail_close(fd: int) -> None:
+        del fd
+        raise PermissionError("raw close denied")
+
+    monkeypatch.setattr(worker_module.os, "fdopen", _interrupt_fdopen)
+    monkeypatch.setattr(worker_module.os, "close", _fail_close)
+    worker = _make_worker()
+
+    with pytest.raises(KeyboardInterrupt, match="fdopen interrupted") as exc_info:
+        worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    assert len(opened_fds) == 1
+    assert any(
+        "Cleanup failure while starting audio worker" in note
+        and "raw close denied" in note
+        for note in exc_info.value.__notes__
+    )
+    real_close(opened_fds[0])
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_start_reclaims_thread_when_start_is_interrupted(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_thread_type = threading.Thread
+    created_threads: list[Any] = []
+
+    class _InterruptingThread:
+        def __init__(
+            self,
+            *,
+            target: Callable[..., None],
+            args: tuple[object, ...],
+            name: str,
+            daemon: bool,
+        ) -> None:
+            self._thread = real_thread_type(
+                target=target,
+                args=args,
+                name=name,
+                daemon=daemon,
+            )
+            self.daemon = daemon
+            created_threads.append(self)
+
+        def start(self) -> None:
+            self._thread.start()
+            raise KeyboardInterrupt("interrupted after thread start")
+
+        def join(self) -> None:
+            self._thread.join()
+
+        def is_alive(self) -> bool:
+            return self._thread.is_alive()
+
+    monkeypatch.setattr(worker_module.threading, "Thread", _InterruptingThread)
+    worker = _make_worker()
+    config = _make_worker_config(output_path=tmp_path / "recording.wav")
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted after thread start"):
+        worker.start(config)
+
+    assert len(created_threads) == 1
+    interrupted_thread = created_threads[0]
+    assert interrupted_thread.is_alive() is False
+    assert worker.thread is None
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_records_system_exit_from_callback_and_discards_output(
+    tmp_path,
+) -> None:
+    callback_seen = threading.Event()
+    output_path = tmp_path / "recording.wav"
+
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
+        del buffer
+        callback_seen.set()
+        raise SystemExit("callback requested exit")
+
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=output_path, on_buffer=on_buffer))
+
+    assert worker.enqueue_audio_bytes(b"\x00\x01\x02\x03", 1)
+    assert callback_seen.wait(timeout=1)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Audio buffer callback failed: callback requested exit",
+    ) as exc_info:
+        worker.stop()
+
+    assert isinstance(exc_info.value.__cause__, SystemExit)
+    assert not output_path.exists()
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_worker_records_keyboard_interrupt_from_converter_and_discards_output(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "recording.wav"
+    worker = _make_worker()
+    worker.start(
+        _make_worker_config(
+            output_path=output_path,
+            sample_rate=48_000,
+            bits_per_sample=32,
+            output_bits_per_sample=16,
+            convert_float_output=True,
+        )
+    )
+    converter = worker.pcm_converter
+    assert converter is not None
+
+    def _interrupt_conversion(data: object) -> None:
+        del data
+        raise KeyboardInterrupt("conversion interrupted")
+
+    monkeypatch.setattr(converter, "convert", _interrupt_conversion)
+    assert worker.enqueue_audio_bytes(struct.pack("<2f", 0.5, -0.5), 1)
+
+    with pytest.raises(
+        OSError,
+        match="Failed to write WAV data: conversion interrupted",
+    ) as exc_info:
+        worker.stop()
+
+    assert isinstance(exc_info.value.__cause__, KeyboardInterrupt)
+    assert not output_path.exists()
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
 def test_stop_preserves_callback_failure_cause() -> None:
     callback_seen = threading.Event()
 
@@ -999,6 +1304,76 @@ def test_stop_preserves_write_failure_cause(
     )
     assert not output_path.exists()
     assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_publish_failure_discards_temp_and_preserves_existing_output(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "recording.wav"
+    output_path.write_bytes(b"existing audio")
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=output_path))
+
+    def _fail_replace(source: Path, destination: Path) -> Path:
+        del source, destination
+        raise PermissionError("publish denied")
+
+    monkeypatch.setattr(Path, "replace", _fail_replace)
+
+    with pytest.raises(
+        OSError,
+        match="Failed to publish WAV file: publish denied",
+    ) as exc_info:
+        worker.stop()
+
+    assert isinstance(exc_info.value.__cause__, PermissionError)
+    assert output_path.read_bytes() == b"existing audio"
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_temp_discard_failure_does_not_mask_callback_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback_seen = threading.Event()
+
+    def on_buffer(buffer: PublicAudioBuffer) -> None:
+        del buffer
+        callback_seen.set()
+        raise ValueError("callback boom")
+
+    worker = _make_worker()
+    worker.start(
+        _make_worker_config(
+            output_path=tmp_path / "recording.wav",
+            on_buffer=on_buffer,
+        )
+    )
+
+    def _fail_unlink(path: Path) -> None:
+        del path
+        raise PermissionError("unlink denied")
+
+    monkeypatch.setattr(worker, "_unlink_path", _fail_unlink)
+    assert worker.enqueue_audio_bytes(b"\x00\x01\x02\x03", 1)
+    assert callback_seen.wait(timeout=1)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Audio buffer callback failed: callback boom",
+    ) as exc_info:
+        worker.stop()
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert any(
+        "Failed to discard temporary WAV file: unlink denied" in note
+        for note in exc_info.value.__notes__
+    )
+
+    temporary_files = list(tmp_path.glob(".recording.wav.*.tmp"))
+    assert len(temporary_files) == 1
+    temporary_files[0].unlink()
 
 
 def test_stop_preserves_finalize_failure_cause(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -235,7 +236,7 @@ class RecordingSession:
 
     @property
     def tap_id(self) -> int | None:
-        """Current Core Audio tap ID, if the session is active."""
+        """Current Core Audio tap ID, including one awaiting cleanup."""
         return self._tap_id
 
     @property
@@ -279,12 +280,17 @@ class RecordingSession:
         """
         if self.is_recording:
             raise RuntimeError("Already recording")
+        if self._tap_id is not None:
+            raise RuntimeError(
+                "Session has pending tap cleanup; call close() before restarting"
+            )
 
         tap_id = (
             self._existing_tap_id
             if self._existing_tap_id is not None
             else self._backend.create_process_tap(self.tap_description)
         )
+        self._tap_id = tap_id
 
         try:
             recorder = self._backend.create_recorder(
@@ -293,21 +299,21 @@ class RecordingSession:
                 on_buffer=self._on_buffer,
                 max_pending_buffers=self._max_pending_buffers,
             )
-            self._tap_id = tap_id
             self._recorder = recorder
             recorder.start()
-        except Exception as exc:
-            if self._owns_tap:
-                try:
-                    self._backend.destroy_process_tap(tap_id)
-                except OSError as cleanup_exc:
+        except BaseException as exc:
+            recorder_is_active = (
+                self._recorder is not None and self._recorder.is_recording
+            )
+            if not recorder_is_active:
+                cleanup_error = self._destroy_tap()
+                if cleanup_error is not None:
                     _add_secondary_failure(
                         exc,
                         "Cleanup failure during session startup",
-                        cleanup_exc,
+                        cleanup_error,
                     )
-            self._tap_id = None
-            self._recorder = None
+                self._recorder = None
             raise
 
     def stop(self) -> None:
@@ -318,16 +324,26 @@ class RecordingSession:
             RuntimeError: If not recording
             OSError: If stopping or cleanup fails
         """
-        if not self.is_recording or self._recorder is None:
+        recorder = self._recorder
+        recorder_is_active = recorder is not None and recorder.is_recording
+        if not recorder_is_active and self._tap_id is None:
             raise RuntimeError("Not recording")
 
         stop_error: OSError | RuntimeError | None = None
-        try:
-            self._recorder.stop()
-        except (OSError, RuntimeError) as exc:
-            stop_error = exc
+        if recorder_is_active:
+            assert recorder is not None
+            try:
+                recorder.stop()
+            except (OSError, RuntimeError) as exc:
+                stop_error = exc
+            if recorder.is_recording and stop_error is None:
+                stop_error = RuntimeError("Recorder remained active after stop")
 
-        destroy_error = self._destroy_tap()
+        destroy_error = (
+            None
+            if recorder is not None and recorder.is_recording
+            else self._destroy_tap()
+        )
 
         errors = [error for error in (stop_error, destroy_error) if error is not None]
         if errors:
@@ -339,14 +355,21 @@ class RecordingSession:
 
         This method is idempotent.
         """
+        recorder = self._recorder
         stop_error: OSError | RuntimeError | None = None
-        if self.is_recording and self._recorder is not None:
+        if recorder is not None and recorder.is_recording:
             try:
-                self._recorder.stop()
+                recorder.stop()
             except (OSError, RuntimeError) as exc:
                 stop_error = exc
+            if recorder.is_recording and stop_error is None:
+                stop_error = RuntimeError("Recorder remained active after stop")
 
-        destroy_error = self._destroy_tap()
+        destroy_error = (
+            None
+            if recorder is not None and recorder.is_recording
+            else self._destroy_tap()
+        )
 
         errors = [error for error in (stop_error, destroy_error) if error is not None]
         if errors:
@@ -365,13 +388,25 @@ class RecordingSession:
         Raises:
             ValueError: If duration is not positive
         """
+        if not math.isfinite(duration):
+            raise ValueError("duration must be finite")
         if duration <= 0:
             raise ValueError("duration must be greater than 0")
 
         self.start()
         try:
             time.sleep(duration)
-        finally:
+        except BaseException as exc:
+            try:
+                self.close()
+            except BaseException as cleanup_exc:
+                _add_secondary_failure(
+                    exc,
+                    "Cleanup failure while recording for a fixed duration",
+                    cleanup_exc,
+                )
+            raise
+        else:
             self.close()
 
         return self
@@ -382,9 +417,9 @@ class RecordingSession:
             return None
 
         tap_id = self._tap_id
-        self._tap_id = None
 
         if not self._owns_tap:
+            self._tap_id = None
             return None
 
         try:
@@ -392,6 +427,7 @@ class RecordingSession:
         except OSError as exc:
             return exc
 
+        self._tap_id = None
         return None
 
     def __enter__(self) -> Self:
@@ -412,9 +448,14 @@ class RecordingSession:
         """
         try:
             self.close()
-        except Exception:
-            if exc_type is None:
+        except BaseException as cleanup_exc:
+            if exc is None:
                 raise
+            _add_secondary_failure(
+                exc,
+                "Cleanup failure while exiting recording session",
+                cleanup_exc,
+            )
         return False
 
 

@@ -65,7 +65,7 @@ def _combine_errors(
 def _translate_exception(
     error_type: type[OSError] | type[RuntimeError],
     message: str,
-    cause: Exception,
+    cause: BaseException,
 ) -> _RecordingFailure:
     """Create an exception with an explicit cause chain."""
     try:

@@ -13,7 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, TypeAlias
 
-from catap._recording_support import _combine_errors, _translate_exception
+from catap._recording_support import (
+    _add_secondary_failure,
+    _combine_errors,
+    _translate_exception,
+)
 from catap.audio_buffer import (
     AudioBuffer,
     AudioStreamFormat,
@@ -104,6 +108,12 @@ class _AudioWorker:
         state = self._state
         return None if state is None else state.pcm_converter
 
+    @property
+    def is_worker_thread(self) -> bool:
+        """True when called from the active audio worker thread."""
+        state = self._state
+        return state is not None and state.thread is threading.current_thread()
+
     def start(self, config: _WorkerConfig) -> None:
         """Start the background worker for file writes and user callbacks."""
         if self._state is not None:
@@ -118,13 +128,17 @@ class _AudioWorker:
         if state is None:
             return
 
+        if state.thread is threading.current_thread():
+            raise RuntimeError(
+                "Cannot stop the audio worker from an on_buffer callback; "
+                "signal the owning thread to call stop() instead"
+            )
+
         if state.thread is not None and state.thread.is_alive():
             state.work_queue.put(None)
 
         if state.thread is not None:
             state.thread.join()
-
-        self._state = None
 
         worker_errors = list(state.failures)
         dropped_buffers, dropped_frames = self._consume_dropped_stats()
@@ -141,7 +155,9 @@ class _AudioWorker:
 
         if state.temporary_output_path is not None:
             if worker_errors or not publish:
-                self._discard_temporary_output(state)
+                discard_error = self._discard_temporary_output(state)
+                if discard_error is not None:
+                    worker_errors.append(discard_error)
             else:
                 try:
                     assert state.final_output_path is not None
@@ -154,9 +170,20 @@ class _AudioWorker:
                             exc,
                         )
                     )
+                    discard_error = self._discard_temporary_output(state)
+                    if discard_error is not None:
+                        worker_errors.append(discard_error)
+                else:
+                    state.temporary_output_path = None
 
-        if worker_errors:
-            raise _combine_errors("Failed to finalize audio worker", worker_errors)
+        worker_error = (
+            _combine_errors("Failed to finalize audio worker", worker_errors)
+            if worker_errors
+            else None
+        )
+        self._state = None
+        if worker_error is not None:
+            raise worker_error
 
     def enqueue_audio_bytes(
         self,
@@ -188,62 +215,97 @@ class _AudioWorker:
             work_queue=queue.SimpleQueue(),
             pending_slots=threading.BoundedSemaphore(config.max_pending_buffers),
         )
+        cleanup_failures: list[BaseException] = []
 
-        with contextlib.ExitStack() as stack:
-            if config.output_path is not None:
-                fd, temporary_name = tempfile.mkstemp(
-                    dir=config.output_path.parent,
-                    prefix=f".{config.output_path.name}.",
-                    suffix=".tmp",
-                )
-                try:
-                    output_file = stack.enter_context(os.fdopen(fd, "wb"))
-                except Exception:
-                    os.close(fd)
-                    raise
-                temporary_output_path = Path(temporary_name)
-                stack.callback(self._unlink_path, temporary_output_path)
-
-                wav_file = wave.open(output_file, "wb")  # noqa: SIM115
-                stack.callback(wav_file.close)
-                wav_file.setnchannels(stream_format.num_channels)
-                wav_file.setsampwidth(config.output_bits_per_sample // 8)
-                wav_file.setframerate(int(stream_format.sample_rate))
-
-                pcm_converter: PcmAudioConverter | None = None
-                if config.convert_float_output:
-                    pcm_converter = PcmAudioConverter(
-                        make_linear_pcm_asbd(
-                            stream_format.sample_rate,
-                            stream_format.num_channels,
-                            stream_format.bits_per_sample,
-                            is_float=True,
-                        ),
-                        make_linear_pcm_asbd(
-                            stream_format.sample_rate,
-                            stream_format.num_channels,
-                            config.output_bits_per_sample,
-                            is_float=False,
-                        ),
+        try:
+            with contextlib.ExitStack() as stack:
+                if config.output_path is not None:
+                    fd, temporary_name = tempfile.mkstemp(
+                        dir=config.output_path.parent,
+                        prefix=f".{config.output_path.name}.",
+                        suffix=".tmp",
                     )
-                    stack.callback(pcm_converter.close)
+                    temporary_output_path = Path(temporary_name)
+                    stack.callback(
+                        self._run_startup_cleanup,
+                        lambda: self._unlink_path(temporary_output_path),
+                        cleanup_failures,
+                    )
+                    try:
+                        output_file = os.fdopen(fd, "wb")
+                    except BaseException:
+                        try:
+                            os.close(fd)
+                        except BaseException as cleanup_exc:
+                            cleanup_failures.append(cleanup_exc)
+                        raise
+                    stack.callback(
+                        self._run_startup_cleanup,
+                        output_file.close,
+                        cleanup_failures,
+                    )
 
-                state.output_file = output_file
-                state.wav_file = wav_file
-                state.pcm_converter = pcm_converter
-                state.final_output_path = config.output_path
-                state.temporary_output_path = temporary_output_path
+                    wav_file = wave.open(output_file, "wb")  # noqa: SIM115
+                    stack.callback(
+                        self._run_startup_cleanup,
+                        wav_file.close,
+                        cleanup_failures,
+                    )
+                    wav_file.setnchannels(stream_format.num_channels)
+                    wav_file.setsampwidth(config.output_bits_per_sample // 8)
+                    wav_file.setframerate(int(stream_format.sample_rate))
 
-            thread = threading.Thread(
-                target=self._worker_loop,
-                args=(state, config.on_buffer, stream_format),
-                name="catap-audio-worker",
-                daemon=False,
-            )
-            thread.start()
-            state.thread = thread
+                    pcm_converter: PcmAudioConverter | None = None
+                    if config.convert_float_output:
+                        pcm_converter = PcmAudioConverter(
+                            make_linear_pcm_asbd(
+                                stream_format.sample_rate,
+                                stream_format.num_channels,
+                                stream_format.bits_per_sample,
+                                is_float=True,
+                            ),
+                            make_linear_pcm_asbd(
+                                stream_format.sample_rate,
+                                stream_format.num_channels,
+                                config.output_bits_per_sample,
+                                is_float=False,
+                            ),
+                        )
+                        stack.callback(
+                            self._run_startup_cleanup,
+                            pcm_converter.close,
+                            cleanup_failures,
+                        )
 
-            stack.pop_all()
+                    state.output_file = output_file
+                    state.wav_file = wav_file
+                    state.pcm_converter = pcm_converter
+                    state.final_output_path = config.output_path
+                    state.temporary_output_path = temporary_output_path
+
+                thread = threading.Thread(
+                    target=self._worker_loop,
+                    args=(state, config.on_buffer, stream_format),
+                    name="catap-audio-worker",
+                    daemon=False,
+                )
+                state.thread = thread
+                stack.callback(
+                    self._run_startup_cleanup,
+                    lambda: self._stop_thread_during_startup_unwind(state),
+                    cleanup_failures,
+                )
+                thread.start()
+
+                stack.pop_all()
+        except BaseException as exc:
+            for cleanup_exc in cleanup_failures:
+                _add_secondary_failure(
+                    exc,
+                    "Cleanup failure while starting audio worker",
+                    cleanup_exc,
+                )
+            raise
 
         return state
 
@@ -252,9 +314,44 @@ class _AudioWorker:
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
 
-    def _discard_temporary_output(self, state: _WorkerState) -> None:
-        if state.temporary_output_path is not None:
+    @staticmethod
+    def _run_startup_cleanup(
+        action: Callable[[], None],
+        cleanup_failures: list[BaseException],
+    ) -> None:
+        """Run one startup cleanup without masking the primary failure."""
+        try:
+            action()
+        except BaseException as exc:
+            cleanup_failures.append(exc)
+
+    @staticmethod
+    def _stop_thread_during_startup_unwind(state: _WorkerState) -> None:
+        """Stop a thread that may have started before startup was interrupted."""
+        thread = state.thread
+        if thread is not None and thread.is_alive():
+            state.work_queue.put(None)
+            thread.join()
+        state.thread = None
+
+    def _discard_temporary_output(self, state: _WorkerState) -> OSError | None:
+        """Discard a temporary WAV file and return any cleanup failure."""
+        if state.temporary_output_path is None:
+            return None
+
+        try:
             self._unlink_path(state.temporary_output_path)
+        except OSError as exc:
+            failure = _translate_exception(
+                OSError,
+                f"Failed to discard temporary WAV file: {exc}",
+                exc,
+            )
+            assert isinstance(failure, OSError)
+            return failure
+
+        state.temporary_output_path = None
+        return None
 
     def _worker_loop(
         self,
@@ -284,7 +381,7 @@ class _AudioWorker:
                                     input_sample_time=item.input_sample_time,
                                 )
                             )
-                        except Exception as exc:
+                        except BaseException as exc:
                             state.callback_failed = True
                             state.failures.append(
                                 _translate_exception(
@@ -302,7 +399,7 @@ class _AudioWorker:
                             else:
                                 output_data = data
                             state.wav_file.writeframesraw(output_data)
-                        except Exception as exc:
+                        except BaseException as exc:
                             state.writer_failed = True
                             state.failures.append(
                                 _translate_exception(
@@ -321,7 +418,7 @@ class _AudioWorker:
         if state.wav_file is not None:
             try:
                 state.wav_file.close()
-            except Exception as exc:
+            except BaseException as exc:
                 state.failures.append(
                     _translate_exception(
                         OSError,
@@ -335,7 +432,7 @@ class _AudioWorker:
         if state.output_file is not None:
             try:
                 state.output_file.close()
-            except Exception as exc:
+            except BaseException as exc:
                 state.failures.append(
                     _translate_exception(
                         OSError,
@@ -349,7 +446,7 @@ class _AudioWorker:
         if state.pcm_converter is not None:
             try:
                 state.pcm_converter.close()
-            except Exception as exc:
+            except BaseException as exc:
                 state.failures.append(
                     _translate_exception(
                         OSError,

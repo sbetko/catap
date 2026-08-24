@@ -498,6 +498,13 @@ class AudioRecorder:
             OSError: If Core Audio cleanup fails
             RuntimeError: If not recording
         """
+        if self._worker.is_worker_thread:
+            raise RuntimeError(
+                "Cannot call AudioRecorder.stop() from an on_buffer callback; "
+                "signal the owning thread with threading.Event and call stop() "
+                "there instead"
+            )
+
         with self._lifecycle_lock:
             if self._lifecycle_state == "idle":
                 raise RuntimeError("Not recording")
