@@ -475,6 +475,85 @@ def test_start_failure_retains_pending_recorder_cleanup_for_close(
     assert backend.destroyed_tap_ids == [77]
 
 
+def test_needs_cleanup_tracks_failed_stop_and_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _FakeSessionBackend(recorder_cls=_PendingCleanupStopRecorder)
+    _install_backend(monkeypatch, backend)
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+
+    assert session.needs_cleanup is False
+
+    session.start()
+    assert session.needs_cleanup is False
+
+    with pytest.raises(RuntimeError, match="native cleanup deferred"):
+        session.stop()
+
+    assert session.needs_cleanup is True
+    assert session.tap_id == 77
+
+    session.close()
+    assert session.needs_cleanup is False
+    assert session.tap_id is None
+    assert backend.destroyed_tap_ids == [77]
+
+
+def test_needs_cleanup_tracks_failed_tap_destroy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _FakeSessionBackend(destroy_error=OSError("destroy boom"))
+    _install_backend(monkeypatch, backend)
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+
+    session.start()
+    with pytest.raises(OSError, match="destroy boom"):
+        session.stop()
+
+    assert session.needs_cleanup is True
+    assert session.tap_id == 77
+
+    backend.destroy_error = None
+    session.close()
+    assert session.needs_cleanup is False
+    assert session.tap_id is None
+
+
+def test_needs_cleanup_is_false_while_recording_holds_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ResourceHoldingRecorder(_FakeRecorder):
+        """Mirrors AudioRecorder, whose needs_cleanup is true while running."""
+
+        def start(self) -> None:
+            super().start()
+            self.needs_cleanup = True
+
+        def stop(self) -> None:
+            super().stop()
+            self.needs_cleanup = False
+
+    backend = _FakeSessionBackend(recorder_cls=_ResourceHoldingRecorder)
+    _install_backend(monkeypatch, backend)
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+
+    session.start()
+    assert session.is_recording is True
+    assert session.needs_cleanup is False
+
+    session.close()
+    assert session.needs_cleanup is False
+
+
 class _InterruptedCreateBackend(_FakeSessionBackend):
     """Backend whose tap creation is interrupted after the tap exists."""
 

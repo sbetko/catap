@@ -251,6 +251,19 @@ class RecordingSession:
         return self._recorder is not None and self._recorder.is_recording
 
     @property
+    def needs_cleanup(self) -> bool:
+        """True when a failed stop or close still owns retryable resources.
+
+        Call ``close()`` again to retry the teardown. The tap survives until
+        cleanup succeeds, so a tap created with ``mute=True`` keeps its
+        process muted until a retry completes.
+        """
+        return not self.is_recording and (
+            (self._recorder is not None and self._recorder.needs_cleanup)
+            or self._tap_id is not None
+        )
+
+    @property
     def frames_recorded(self) -> int:
         """Number of frames recorded in the current or most recent capture."""
         if self._recorder is None:

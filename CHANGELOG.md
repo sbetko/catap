@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added `RecordingSession.needs_cleanup`, making retryable cleanup an explicit
+  public contract: after a failed `stop()` or `close()`, the property stays
+  true until a retried `close()` succeeds, and a tap created with `mute=True`
+  keeps its process muted until then.
 - Closed the interruption windows during tap and aggregate-device creation:
   Core Audio now writes new object IDs into caller-owned storage, so a
   `KeyboardInterrupt` between creation and Python storing the ID no longer
