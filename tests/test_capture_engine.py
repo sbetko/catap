@@ -229,6 +229,92 @@ def test_open_tap_capture_notes_cleanup_failure_when_unwind_fails(
     )
 
 
+def test_open_tap_capture_unwinds_registered_io_proc_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def create_io_proc(
+        device_id: int,
+        callback: object,
+        client_data: object,
+        io_proc_id: object,
+    ) -> int:
+        del callback, client_data
+        _set_void_p(io_proc_id, 77)
+        calls.append(f"create-io:{device_id}")
+        raise KeyboardInterrupt("interrupted after registration")
+
+    monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(
+        capture_module,
+        "_create_aggregate_device_for_tap",
+        lambda tap_uid, name: 55,
+    )
+    monkeypatch.setattr(capture_module, "_AudioDeviceCreateIOProcID", create_io_proc)
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_io_proc",
+        lambda device_id, io_proc_id: calls.append(
+            f"destroy-io:{device_id}:{io_proc_id.value}"
+        ),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_aggregate_device",
+        lambda device_id: calls.append(f"destroy-device:{device_id}"),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted after registration"):
+        capture_module._TapCaptureEngine().open_tap_capture(123, object())
+
+    assert calls == ["create-io:55", "destroy-io:55:77", "destroy-device:55"]
+
+
+def test_open_tap_capture_preserves_session_when_io_proc_unwind_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def create_io_proc(
+        device_id: int,
+        callback: object,
+        client_data: object,
+        io_proc_id: object,
+    ) -> int:
+        del device_id, callback, client_data
+        _set_void_p(io_proc_id, 77)
+        raise KeyboardInterrupt("interrupted after registration")
+
+    monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
+    monkeypatch.setattr(
+        capture_module,
+        "_create_aggregate_device_for_tap",
+        lambda tap_uid, name: 55,
+    )
+    monkeypatch.setattr(capture_module, "_AudioDeviceCreateIOProcID", create_io_proc)
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_io_proc",
+        lambda device_id, io_proc_id: (_ for _ in ()).throw(
+            OSError("destroy io failed")
+        ),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_aggregate_device",
+        lambda device_id: None,
+    )
+    engine = capture_module._TapCaptureEngine()
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        engine.open_tap_capture(123, object())
+
+    assert engine.failed_capture_session is not None
+    assert engine.failed_capture_session.io_proc_id.value == 77
+    assert engine.failed_capture_session.io_proc_destroyed is False
+    assert engine.failed_capture_session.aggregate_device_destroyed is True
+    assert any("destroy io failed" in note for note in exc_info.value.__notes__)
+
+
 def test_start_marks_session_started_only_after_core_audio_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,7 +351,7 @@ def test_stop_skips_unstarted_session(monkeypatch: pytest.MonkeyPatch) -> None:
     assert session.started is False
 
 
-def test_stop_clears_started_state_even_when_core_audio_stop_fails(
+def test_stop_preserves_started_state_when_core_audio_stop_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = capture_module._TapCaptureSession(
@@ -282,7 +368,7 @@ def test_stop_clears_started_state_even_when_core_audio_stop_fails(
     with pytest.raises(OSError, match="Failed to stop audio device: status 10"):
         capture_module._TapCaptureEngine().stop(session)
 
-    assert session.started is False
+    assert session.started is True
 
 
 def test_close_stops_started_session_before_destroying_resources(
@@ -315,6 +401,8 @@ def test_close_stops_started_session_before_destroying_resources(
 
     assert calls == ["stop:55:77", "destroy-io:55:77", "destroy-device:55"]
     assert session.started is False
+    assert session.io_proc_destroyed is True
+    assert session.aggregate_device_destroyed is True
 
 
 def test_close_combines_io_proc_and_aggregate_cleanup_failures(
@@ -343,3 +431,67 @@ def test_close_combines_io_proc_and_aggregate_cleanup_failures(
     notes = exc_info.value.__notes__
     assert "Failed to close tap capture session" in notes
     assert any("destroy aggregate failed" in note for note in notes)
+    assert session.io_proc_destroyed is False
+    assert session.aggregate_device_destroyed is False
+
+
+def test_close_tracks_aggregate_success_without_assuming_io_proc_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_AudioDeviceStop",
+        lambda device_id, io_proc_id: 10,
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_io_proc",
+        lambda device_id, io_proc_id: (_ for _ in ()).throw(
+            OSError("destroy io failed")
+        ),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_aggregate_device",
+        lambda device_id: None,
+    )
+
+    with pytest.raises(OSError, match="Failed to stop audio device"):
+        capture_module._TapCaptureEngine().close(session)
+
+    assert session.started is True
+    assert session.io_proc_destroyed is False
+    assert session.aggregate_device_destroyed is True
+
+
+def test_close_is_idempotent_after_resources_are_destroyed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        io_proc_destroyed=True,
+        aggregate_device_destroyed=True,
+    )
+
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_io_proc",
+        lambda device_id, io_proc_id: (_ for _ in ()).throw(
+            AssertionError("IOProc destruction should not be retried")
+        ),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_aggregate_device",
+        lambda device_id: (_ for _ in ()).throw(
+            AssertionError("aggregate destruction should not be retried")
+        ),
+    )
+
+    capture_module._TapCaptureEngine().close(session)

@@ -208,10 +208,15 @@ class _TapCaptureSession:
     io_proc_callback: object | None = None
     client_data: object | None = None
     started: bool = False
+    io_proc_destroyed: bool = False
+    aggregate_device_destroyed: bool = False
 
 
 class _TapCaptureEngine:
     """Owns the Core Audio object lifetimes behind a tap capture session."""
+
+    def __init__(self) -> None:
+        self.failed_capture_session: _TapCaptureSession | None = None
 
     def describe_tap_stream(
         self,
@@ -248,41 +253,66 @@ class _TapCaptureEngine:
         client_data: object | None = None,
     ) -> _TapCaptureSession:
         """Create the aggregate device and IOProc for a recorder session."""
+        self.failed_capture_session = None
         try:
             tap_uid = _get_tap_uid(tap_id)
         except OSError as exc:
             _raise_if_missing_tap(tap_id, exc)
             raise
 
-        cleanup_errors: list[OSError] = []
+        cleanup_errors: list[BaseException] = []
         aggregate_device_id: int | None = None
+        session: _TapCaptureSession | None = None
 
         try:
             aggregate_device_id = _create_aggregate_device_for_tap(
                 tap_uid, "catap Recording Device"
             )
-            io_proc_id = ctypes.c_void_p()
+            # Allocate every Python owner before handing Core Audio the client-data
+            # pointer. After successful registration, returning this already-built
+            # session cannot lose the IOProc ID to a Python allocation failure.
+            session = _TapCaptureSession(
+                aggregate_device_id=aggregate_device_id,
+                io_proc_id=ctypes.c_void_p(),
+                io_proc_callback=callback,
+                client_data=client_data,
+            )
             status = _AudioDeviceCreateIOProcID(
                 aggregate_device_id,
                 callback,
                 client_data,
-                ctypes.byref(io_proc_id),
+                ctypes.byref(session.io_proc_id),
             )
             if status != 0:
                 raise OSError(f"Failed to create IO proc: status {status}")
 
-            return _TapCaptureSession(
-                aggregate_device_id=aggregate_device_id,
-                io_proc_id=io_proc_id,
-                io_proc_callback=callback,
-                client_data=client_data,
-            )
-        except Exception as exc:
+            return session
+        except BaseException as exc:
+            if session is not None:
+                if session.io_proc_id.value is None:
+                    session.io_proc_destroyed = True
+                else:
+                    try:
+                        _destroy_io_proc(
+                            session.aggregate_device_id,
+                            session.io_proc_id,
+                        )
+                    except BaseException as cleanup_exc:
+                        cleanup_errors.append(cleanup_exc)
+                    else:
+                        session.io_proc_destroyed = True
+
             if aggregate_device_id is not None:
                 try:
                     _destroy_aggregate_device(aggregate_device_id)
-                except OSError as cleanup_exc:
+                except BaseException as cleanup_exc:
                     cleanup_errors.append(cleanup_exc)
+                else:
+                    if session is not None:
+                        session.aggregate_device_destroyed = True
+
+            if session is not None and not session.io_proc_destroyed:
+                self.failed_capture_session = session
 
             for cleanup_exc in cleanup_errors:
                 _add_secondary_failure(
@@ -303,10 +333,8 @@ class _TapCaptureEngine:
         """Stop a running capture session."""
         if not session.started:
             return
-        try:
-            _stop_audio_device(session.aggregate_device_id, session.io_proc_id)
-        finally:
-            session.started = False
+        _stop_audio_device(session.aggregate_device_id, session.io_proc_id)
+        session.started = False
 
     def close(self, session: _TapCaptureSession) -> None:
         """Destroy the IOProc and aggregate device for a capture session."""
@@ -317,15 +345,22 @@ class _TapCaptureEngine:
         except OSError as exc:
             cleanup_errors.append(exc)
 
-        try:
-            _destroy_io_proc(session.aggregate_device_id, session.io_proc_id)
-        except OSError as exc:
-            cleanup_errors.append(exc)
+        if not session.io_proc_destroyed:
+            try:
+                _destroy_io_proc(session.aggregate_device_id, session.io_proc_id)
+            except OSError as exc:
+                cleanup_errors.append(exc)
+            else:
+                session.io_proc_destroyed = True
+                session.started = False
 
-        try:
-            _destroy_aggregate_device(session.aggregate_device_id)
-        except OSError as exc:
-            cleanup_errors.append(exc)
+        if not session.aggregate_device_destroyed:
+            try:
+                _destroy_aggregate_device(session.aggregate_device_id)
+            except OSError as exc:
+                cleanup_errors.append(exc)
+            else:
+                session.aggregate_device_destroyed = True
 
         if cleanup_errors:
             raise _combine_errors(

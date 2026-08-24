@@ -38,6 +38,15 @@ from catap.bindings._audiotoolbox import kAudioFormatLinearPCM
 _NATIVE_DRAIN_IDLE_INTERVAL_SECONDS = 0.001
 _NATIVE_SLOT_FRAME_CAPACITY = 16_384
 
+# Core Audio retains the IOProc and its client-data pointer until a matching
+# AudioDeviceDestroyIOProcID succeeds. If teardown cannot confirm that boundary,
+# retain both owners for process lifetime rather than letting ctypes free memory
+# that Core Audio may still access.
+_ABANDONED_NATIVE_CAPTURES: list[
+    tuple[_TapCaptureSession, NativeCoreAudioRecorder]
+] = []
+_ABANDONED_NATIVE_CAPTURES_LOCK = threading.Lock()
+
 
 class UnsupportedTapFormatError(ValueError):
     """Raised when a tap exposes an audio layout catap cannot safely record."""
@@ -375,6 +384,21 @@ class AudioRecorder:
 
         return errors
 
+    @staticmethod
+    def _release_native_recorder(
+        native_recorder: NativeCoreAudioRecorder,
+        capture_session: _TapCaptureSession | None,
+    ) -> bool:
+        """Release native state only after Core Audio drops its client pointer."""
+        if capture_session is None or capture_session.io_proc_destroyed:
+            native_recorder.close()
+            return True
+
+        native_recorder.abandon()
+        with _ABANDONED_NATIVE_CAPTURES_LOCK:
+            _ABANDONED_NATIVE_CAPTURES.append((capture_session, native_recorder))
+        return False
+
     def start(self) -> None:
         """Start recording audio.
 
@@ -408,7 +432,6 @@ class AudioRecorder:
             try:
                 native_recorder = self._create_native_recorder()
                 self._native_recorder = native_recorder
-                cleanup.append(native_recorder.close)
                 capture_session = self._capture_engine.open_tap_capture(
                     self.tap_id,
                     native_recorder.io_proc_pointer,
@@ -427,22 +450,40 @@ class AudioRecorder:
 
                 self._capture_engine.start(capture_session)
                 cleanup.append(lambda: self._capture_engine.stop(capture_session))
-            except Exception as exc:
+            except BaseException as exc:
+                failed_capture_session = getattr(
+                    self._capture_engine,
+                    "failed_capture_session",
+                    None,
+                )
+                if capture_session is None and isinstance(
+                    failed_capture_session,
+                    _TapCaptureSession,
+                ):
+                    capture_session = failed_capture_session
                 with self._lifecycle_lock:
                     self._is_recording = False
                 for step in reversed(cleanup):
                     try:
                         step()
-                    except Exception as cleanup_exc:
+                    except BaseException as cleanup_exc:
                         _add_secondary_failure(
                             exc,
                             "Cleanup failure during recorder startup",
                             cleanup_exc,
                         )
+                if native_recorder is not None and not self._release_native_recorder(
+                    native_recorder,
+                    capture_session,
+                ):
+                    exc.add_note(
+                        "Retained native recorder state because Core Audio did not "
+                        "confirm IOProc destruction during startup cleanup."
+                    )
                 self._capture_session = None
                 self._native_recorder = None
                 raise
-        except Exception:
+        except BaseException:
             with self._lifecycle_lock:
                 self._lifecycle_state = "idle"
             raise
@@ -473,9 +514,11 @@ class AudioRecorder:
 
         if capture_session is not None:
             try:
-                self._capture_engine.stop(capture_session)
+                self._capture_engine.close(capture_session)
             except OSError as exc:
                 cleanup_errors.append(exc)
+                if capture_session.started:
+                    publish_worker_output = False
 
         if native_recorder is not None:
             try:
@@ -494,12 +537,6 @@ class AudioRecorder:
                     cleanup_errors.extend(native_errors)
                     publish_worker_output = False
 
-        if capture_session is not None:
-            try:
-                self._capture_engine.close(capture_session)
-            except OSError as exc:
-                cleanup_errors.append(exc)
-
         try:
             self._worker.stop(publish=publish_worker_output)
         except (OSError, RuntimeError) as exc:
@@ -507,7 +544,13 @@ class AudioRecorder:
 
         self._capture_session = None
         if native_recorder is not None:
-            native_recorder.close()
+            if not self._release_native_recorder(native_recorder, capture_session):
+                cleanup_errors.append(
+                    RuntimeError(
+                        "Retained native recorder state because Core Audio did not "
+                        "confirm IOProc destruction."
+                    )
+                )
             self._native_recorder = None
 
         with self._lifecycle_lock:

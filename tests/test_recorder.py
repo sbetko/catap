@@ -139,6 +139,26 @@ class _FakeNativeChunk:
         self.input_sample_time = input_sample_time
 
 
+class _InspectableNativeRecorder:
+    def __init__(self) -> None:
+        self.closed = False
+        self.abandoned = False
+        self.io_proc_pointer = ctypes.c_void_p(456)
+        self.handle = ctypes.c_void_p(789)
+
+    def read(self) -> object | None:
+        return None
+
+    def stats(self) -> _FakeNativeRecorderStats:
+        return _FakeNativeRecorderStats()
+
+    def close(self) -> None:
+        self.closed = True
+
+    def abandon(self) -> None:
+        self.abandoned = True
+
+
 @pytest.fixture(autouse=True)
 def _fake_native_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeNativeRecorder:
@@ -420,6 +440,7 @@ def test_stop_reports_core_audio_cleanup_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
+    abandoned_captures: list[tuple[capture_module._TapCaptureSession, object]] = []
 
     def stop_device(device_id: int, io_proc_id: ctypes.c_void_p) -> int:
         calls.append(f"stop:{device_id}:{io_proc_id.value}")
@@ -438,15 +459,23 @@ def test_stop_reports_core_audio_cleanup_failures(
     monkeypatch.setattr(
         capture_module, "_destroy_aggregate_device", destroy_aggregate_device
     )
+    monkeypatch.setattr(
+        recorder_module,
+        "_ABANDONED_NATIVE_CAPTURES",
+        abandoned_captures,
+    )
 
     recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
-    recorder._is_recording = True
-    recorder._lifecycle_state = "recording"
-    recorder._capture_session = capture_module._TapCaptureSession(
+    native_recorder = _InspectableNativeRecorder()
+    capture_session = capture_module._TapCaptureSession(
         aggregate_device_id=55,
         io_proc_id=ctypes.c_void_p(77),
         started=True,
     )
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+    recorder._native_recorder = cast(Any, native_recorder)
+    recorder._capture_session = capture_session
 
     with pytest.raises(
         OSError,
@@ -459,6 +488,9 @@ def test_stop_reports_core_audio_cleanup_failures(
     assert recorder._io_proc_id is None
     assert recorder.is_recording is False
     assert recorder._lifecycle_state == "idle"
+    assert native_recorder.closed is False
+    assert native_recorder.abandoned is True
+    assert abandoned_captures == [(capture_session, native_recorder)]
     assert any(
         "Failed to stop recording cleanly" in note for note in exc_info.value.__notes__
     )
@@ -467,6 +499,55 @@ def test_stop_reports_core_audio_cleanup_failures(
         for note in exc_info.value.__notes__
     )
     assert any("aggregate cleanup failed" in note for note in exc_info.value.__notes__)
+
+
+def test_stop_releases_native_recorder_after_io_proc_destruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    abandoned_captures: list[tuple[capture_module._TapCaptureSession, object]] = []
+    monkeypatch.setattr(
+        capture_module,
+        "_AudioDeviceStop",
+        lambda device_id, io_proc_id: 10,
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_io_proc",
+        lambda device_id, io_proc_id: None,
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_destroy_aggregate_device",
+        lambda device_id: (_ for _ in ()).throw(
+            OSError("aggregate cleanup failed")
+        ),
+    )
+    monkeypatch.setattr(
+        recorder_module,
+        "_ABANDONED_NATIVE_CAPTURES",
+        abandoned_captures,
+    )
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    native_recorder = _InspectableNativeRecorder()
+    capture_session = capture_module._TapCaptureSession(
+        aggregate_device_id=55,
+        io_proc_id=ctypes.c_void_p(77),
+        started=True,
+    )
+    recorder._is_recording = True
+    recorder._lifecycle_state = "recording"
+    recorder._native_recorder = cast(Any, native_recorder)
+    recorder._capture_session = capture_session
+
+    with pytest.raises(OSError, match="Failed to stop audio device"):
+        recorder.stop()
+
+    assert capture_session.io_proc_destroyed is True
+    assert capture_session.aggregate_device_destroyed is False
+    assert native_recorder.closed is True
+    assert native_recorder.abandoned is False
+    assert abandoned_captures == []
 
 
 def test_failed_start_does_not_clobber_existing_output_file(
@@ -527,7 +608,8 @@ def test_failed_device_start_does_not_clobber_existing_output_file(tmp_path) -> 
             raise OSError("device start failed")
 
         def close(self, session: capture_module._TapCaptureSession) -> None:
-            del session
+            session.io_proc_destroyed = True
+            session.aggregate_device_destroyed = True
 
     recorder = AudioRecorder(123, output_path)
     recorder._capture_engine = cast(Any, _StartFailingCaptureEngine())
@@ -538,6 +620,73 @@ def test_failed_device_start_does_not_clobber_existing_output_file(tmp_path) -> 
     assert output_path.read_bytes() == original_bytes
     assert list(tmp_path.glob(".existing.wav.*.tmp")) == []
     assert recorder._lifecycle_state == "idle"
+
+
+def test_failed_start_abandons_native_state_when_io_proc_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    abandoned_captures: list[tuple[capture_module._TapCaptureSession, object]] = []
+    native_recorder = _InspectableNativeRecorder()
+    capture_session = capture_module._TapCaptureSession(55, ctypes.c_void_p(77))
+
+    class _CaptureEngine:
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                16,
+                False,
+                bytes_per_frame=4,
+            )
+
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> capture_module._TapCaptureSession:
+            del tap_id, callback, client_data
+            return capture_session
+
+        def close(self, session: capture_module._TapCaptureSession) -> None:
+            del session
+            raise OSError("IOProc cleanup failed")
+
+    monkeypatch.setattr(
+        recorder_module,
+        "NativeCoreAudioRecorder",
+        lambda **kwargs: native_recorder,
+    )
+    monkeypatch.setattr(
+        recorder_module,
+        "_ABANDONED_NATIVE_CAPTURES",
+        abandoned_captures,
+    )
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, _CaptureEngine())
+    monkeypatch.setattr(
+        recorder._worker,
+        "start",
+        lambda config: (_ for _ in ()).throw(
+            KeyboardInterrupt("worker start interrupted")
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="worker start interrupted") as exc_info:
+        recorder.start()
+
+    assert native_recorder.closed is False
+    assert native_recorder.abandoned is True
+    assert abandoned_captures == [(capture_session, native_recorder)]
+    assert any(
+        "Retained native recorder state" in note
+        for note in exc_info.value.__notes__
+    )
 
 
 def test_start_uses_native_io_proc_when_dylib_is_available(
@@ -605,7 +754,8 @@ def test_start_uses_native_io_proc_when_dylib_is_available(
             session.started = False
 
         def close(self, session: capture_module._TapCaptureSession) -> None:
-            del session
+            session.io_proc_destroyed = True
+            session.aggregate_device_destroyed = True
 
     monkeypatch.setattr(recorder_module, "NativeCoreAudioRecorder", _FakeNativeRecorder)
 

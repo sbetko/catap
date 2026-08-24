@@ -109,6 +109,29 @@ def test_loads_native_library(native_library_path: Path) -> None:
     assert library.status_name(CATAP_STATUS_OK) == "OK"
 
 
+def test_abandoned_recorder_handle_is_not_destroyed() -> None:
+    destroyed_handles: list[int] = []
+
+    class _FakeCdll:
+        @staticmethod
+        def catap_recorder_destroy(handle: ctypes.c_void_p) -> None:
+            assert handle.value is not None
+            destroyed_handles.append(handle.value)
+
+    class _FakeLibrary:
+        cdll = _FakeCdll()
+
+    recorder = NativeCoreAudioRecorder.__new__(NativeCoreAudioRecorder)
+    recorder._library = _FakeLibrary()
+    recorder._handle = ctypes.c_void_p(123)
+
+    recorder.abandon()
+    recorder.close()
+
+    assert recorder.handle.value is None
+    assert destroyed_handles == []
+
+
 def test_env_path_can_select_native_library(
     monkeypatch: pytest.MonkeyPatch,
     native_library_path: Path,
