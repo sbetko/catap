@@ -2489,6 +2489,97 @@ def test_start_rejects_padded_tap_frames() -> None:
     assert recorder._lifecycle_state == "idle"
 
 
+class _FormatOnlyCaptureEngine:
+    """Capture engine stub that reports one format and refuses to open."""
+
+    def __init__(self, stream_format: capture_module._TapStreamFormat) -> None:
+        self._stream_format = stream_format
+
+    def describe_tap_stream(self, tap_id: int) -> capture_module._TapStreamFormat:
+        del tap_id
+        return self._stream_format
+
+    def open_tap_capture(
+        self,
+        tap_id: int,
+        callback: object,
+        client_data: object | None = None,
+    ) -> object:
+        del tap_id, callback, client_data
+        raise AssertionError("capture should not open for unsupported formats")
+
+
+@pytest.mark.parametrize("sample_rate", [float("nan"), float("inf"), float("-inf")])
+def test_start_rejects_non_finite_tap_sample_rate(sample_rate: float) -> None:
+    recorder = AudioRecorder(123, "recording.wav")
+    recorder._capture_engine = cast(
+        Any,
+        _FormatOnlyCaptureEngine(
+            capture_module._TapStreamFormat(
+                sample_rate,
+                2,
+                32,
+                True,
+                bytes_per_frame=8,
+                is_signed_integer=False,
+            )
+        ),
+    )
+
+    with pytest.raises(UnsupportedTapFormatError, match="Unsupported tap sample rate"):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_streaming_start_rejects_non_finite_tap_sample_rate() -> None:
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(
+        Any,
+        _FormatOnlyCaptureEngine(
+            capture_module._TapStreamFormat(
+                float("nan"),
+                2,
+                32,
+                True,
+                bytes_per_frame=8,
+                is_signed_integer=False,
+            )
+        ),
+    )
+
+    with pytest.raises(UnsupportedTapFormatError, match="Unsupported tap sample rate"):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
+
+
+@pytest.mark.parametrize("bits_per_sample", [8, 40, 48, 64])
+def test_start_rejects_unwritable_integer_bit_depths(bits_per_sample: int) -> None:
+    recorder = AudioRecorder(123, "recording.wav")
+    recorder._capture_engine = cast(
+        Any,
+        _FormatOnlyCaptureEngine(
+            capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                bits_per_sample,
+                False,
+                bytes_per_frame=2 * (bits_per_sample // 8),
+                is_signed_integer=True,
+            )
+        ),
+    )
+
+    with pytest.raises(
+        UnsupportedTapFormatError,
+        match="only 16-, 24-, and 32-bit signed integer PCM",
+    ):
+        recorder.start()
+
+    assert recorder._lifecycle_state == "idle"
+
+
 def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:
     recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     total_updates = 2_000

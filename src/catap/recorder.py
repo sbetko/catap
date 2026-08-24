@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -172,7 +173,10 @@ class AudioRecorder:
                 "Unsupported tap format: only linear PCM streams are currently "
                 f"supported, got format id {stream_format.format_id}"
             )
-        if stream_format.sample_rate <= 0:
+        if (
+            not math.isfinite(stream_format.sample_rate)
+            or stream_format.sample_rate <= 0
+        ):
             raise UnsupportedTapFormatError(
                 f"Unsupported tap sample rate: {stream_format.sample_rate!r}"
             )
@@ -201,6 +205,16 @@ class AudioRecorder:
             raise UnsupportedTapFormatError(
                 "Unsupported integer tap format: only signed integer PCM is "
                 "currently supported"
+            )
+        if not stream_format.is_float and stream_format.bits_per_sample not in {
+            16,
+            24,
+            32,
+        }:
+            raise UnsupportedTapFormatError(
+                "Unsupported integer tap bit depth: only 16-, 24-, and 32-bit "
+                "signed integer PCM is currently supported, got "
+                f"{stream_format.bits_per_sample}-bit"
             )
         if not stream_format.is_interleaved:
             raise UnsupportedTapFormatError(

@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Rejected non-finite tap sample rates and integer tap bit depths other than
+  16, 24, and 32 bits up front with `UnsupportedTapFormatError`, instead of
+  failing later in WAV setup or silently passing in streaming-only mode.
+
 ## [0.5.1] - 2026-08-24
 
 - Hardened Core Audio teardown so native callback state is never released until
