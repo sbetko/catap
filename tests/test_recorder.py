@@ -2641,6 +2641,96 @@ class _LifecycleCaptureEngine:
         session.aggregate_device_destroyed = True
 
 
+class _StopCheckCaptureEngine(_LifecycleCaptureEngine):
+    """Lifecycle engine that counts describe calls for stop-time re-checks."""
+
+    def __init__(self) -> None:
+        self.describe_calls = 0
+
+    def _stream_format(self, call_number: int) -> capture_module._TapStreamFormat:
+        del call_number
+        return capture_module._TapStreamFormat(
+            48_000.0,
+            2,
+            32,
+            True,
+            bytes_per_frame=8,
+            is_signed_integer=False,
+        )
+
+    def describe_tap_stream(self, tap_id: int) -> capture_module._TapStreamFormat:
+        del tap_id
+        self.describe_calls += 1
+        return self._stream_format(self.describe_calls)
+
+
+def test_stop_fails_when_tap_format_drifts(tmp_path) -> None:
+    class _DriftingCaptureEngine(_StopCheckCaptureEngine):
+        def _stream_format(
+            self,
+            call_number: int,
+        ) -> capture_module._TapStreamFormat:
+            return capture_module._TapStreamFormat(
+                48_000.0 if call_number == 1 else 44_100.0,
+                2,
+                32,
+                True,
+                bytes_per_frame=8,
+                is_signed_integer=False,
+            )
+
+    output_path = tmp_path / "recording.wav"
+    recorder = AudioRecorder(123, output_path)
+    recorder._capture_engine = cast(Any, _DriftingCaptureEngine())
+
+    recorder.start()
+    with pytest.raises(
+        RuntimeError,
+        match="Tap stream format changed during capture",
+    ):
+        recorder.stop()
+
+    assert not output_path.exists()
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_stop_fails_when_tap_disappears_mid_capture(tmp_path) -> None:
+    class _VanishingTapEngine(_StopCheckCaptureEngine):
+        def _stream_format(
+            self,
+            call_number: int,
+        ) -> capture_module._TapStreamFormat:
+            if call_number > 1:
+                raise AudioTapNotFoundError("Audio tap 123 is no longer available.")
+            return super()._stream_format(call_number)
+
+    output_path = tmp_path / "recording.wav"
+    recorder = AudioRecorder(123, output_path)
+    recorder._capture_engine = cast(Any, _VanishingTapEngine())
+
+    recorder.start()
+    with pytest.raises(OSError, match="disappeared during capture"):
+        recorder.stop()
+
+    assert not output_path.exists()
+    assert recorder.needs_cleanup is False
+    assert recorder._lifecycle_state == "idle"
+
+
+def test_stop_publishes_when_tap_format_is_unchanged(tmp_path) -> None:
+    output_path = tmp_path / "recording.wav"
+    recorder = AudioRecorder(123, output_path)
+    engine = _StopCheckCaptureEngine()
+    recorder._capture_engine = cast(Any, engine)
+
+    recorder.start()
+    recorder.stop()
+
+    assert engine.describe_calls == 2
+    assert output_path.exists()
+
+
 def test_needs_cleanup_is_false_while_recording() -> None:
     recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     recorder._capture_engine = cast(Any, _LifecycleCaptureEngine())

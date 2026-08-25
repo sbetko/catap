@@ -35,6 +35,7 @@ from catap.audio_buffer import (
     _format_id_to_fourcc,
 )
 from catap.bindings._audiotoolbox import kAudioFormatLinearPCM
+from catap.bindings.tap import AudioTapNotFoundError
 
 _NATIVE_DRAIN_IDLE_INTERVAL_SECONDS = 0.001
 _NATIVE_SLOT_FRAME_CAPACITY = 16_384
@@ -137,6 +138,7 @@ class AudioRecorder:
         self._dropped_buffers = 0
         self._dropped_frames = 0
         self._nonzero_audio_seen = False
+        self._start_tap_stream_format: _TapStreamFormat | None = None
 
         # Stream format (populated on start).
         self._sample_rate = 44100.0
@@ -151,6 +153,7 @@ class AudioRecorder:
     def _apply_stream_format(self, stream_format: _TapStreamFormat) -> None:
         """Apply tap stream metadata to recorder state."""
         self._validate_stream_format(stream_format)
+        self._start_tap_stream_format = stream_format
         self._sample_rate = stream_format.sample_rate
         self._num_channels = stream_format.num_channels
         self._bits_per_sample = stream_format.bits_per_sample
@@ -884,6 +887,54 @@ class AudioRecorder:
                                 lifecycle_error,
                             )
 
+    def _detect_tap_stream_drift(
+        self,
+        capture_session: _TapCaptureSession | None,
+    ) -> list[BaseException]:
+        """Fail loudly when the tap stream changed or vanished mid-capture.
+
+        The stream format is validated once at start; Core Audio does not
+        report later changes to this recorder. Re-reading the format at stop
+        turns the two silent-corruption cases — a route change that altered
+        the sample rate, and a shared tap destroyed by its owner — into
+        capture failures that discard the output instead of publishing it.
+        """
+        if capture_session is None or not capture_session.started:
+            return []
+        expected = self._start_tap_stream_format
+        if expected is None:
+            return []
+
+        try:
+            current = self._capture_engine.describe_tap_stream(self.tap_id)
+        except AudioTapNotFoundError as exc:
+            return [
+                _translate_exception(
+                    OSError,
+                    f"Tap {self.tap_id} disappeared during capture; "
+                    f"discarding output: {exc}",
+                    exc,
+                )
+            ]
+        except BaseException as exc:
+            return [
+                _translate_exception(
+                    OSError,
+                    "Could not verify the tap stream format at stop; "
+                    f"discarding output: {exc}",
+                    exc,
+                )
+            ]
+
+        if current != expected:
+            return [
+                RuntimeError(
+                    "Tap stream format changed during capture "
+                    f"(started as {expected}, now {current}); discarding output"
+                )
+            ]
+        return []
+
     def _finish_stop(self) -> None:
         """Finish teardown after the public lifecycle claim is recoverable."""
         capture_session = self._capture_session
@@ -900,6 +951,10 @@ class AudioRecorder:
 
         try:
             try:
+                for drift_error in self._detect_tap_stream_drift(capture_session):
+                    record_cleanup_error(drift_error)
+                    publish_worker_output = False
+
                 if capture_session is not None:
                     try:
                         self._capture_engine.close(capture_session)

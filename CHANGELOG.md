@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Re-checked the tap stream format at stop: if it changed mid-capture (for
+  example after a default-device change) or the tap was destroyed by its
+  owner, `stop()` now fails and discards the output instead of publishing a
+  corrupt or truncated WAV.
 - Changed `AudioRecorder.needs_cleanup` to report false during active
   recording, matching `RecordingSession.needs_cleanup` and its documented
   "failed teardown pending" meaning. Use `is_recording` for capture state.

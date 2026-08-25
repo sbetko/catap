@@ -66,7 +66,10 @@ non-interleaved, multi-buffer, compressed, padded, or otherwise unusual formats.
 The `--system` and `record_system_audio()` paths build a global Core Audio tap:
 they capture process output that Core Audio exposes to taps. Long-running
 captures across sleep/wake, route changes, source-process restarts, and default
-output-device changes are not covered yet. See
+output-device changes are not covered yet. If the tap's stream format changes
+mid-capture (for example after a default-device change), or a shared tap is
+destroyed by its owner, `stop()` fails and discards the output instead of
+publishing a corrupt or truncated file. See
 [`docs/core-audio-notes.md`](docs/core-audio-notes.md) for the short Core Audio
 notes.
 

@@ -563,7 +563,8 @@ def record_tap(
     Create a session for recording from an existing visible tap.
 
     The tap was created elsewhere, so the session will not destroy it when
-    recording stops.
+    recording stops. If the tap's owner destroys it mid-capture, ``stop()``
+    fails and discards the output instead of publishing a truncated file.
     """
     return RecordingSession.from_tap(
         tap,
