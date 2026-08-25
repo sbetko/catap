@@ -355,6 +355,7 @@ def test_get_property_objc_object_wraps_non_empty_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     objc_refs: list[int] = []
+    released_refs: list[int] = []
 
     def get_property_data(
         object_id: int,
@@ -384,9 +385,60 @@ def test_get_property_objc_object_wraps_non_empty_reference(
         get_property_data,
     )
     monkeypatch.setattr(coreaudio_module.objc, "objc_object", objc_object)
+    monkeypatch.setattr(
+        coreaudio_module,
+        "_CFRelease",
+        lambda ref: released_refs.append(ref.value),
+    )
 
     assert coreaudio_module.get_property_objc_object(7, 0x1234) == "objc-value"
     assert objc_refs == [24680]
+    assert released_refs == [24680]
+
+
+def test_get_property_objc_object_releases_reference_when_wrapping_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released_refs: list[int] = []
+
+    def get_property_data(
+        object_id: int,
+        address: object,
+        qualifier_size: int,
+        qualifier_data: object,
+        actual_size: Any,
+        value: Any,
+    ) -> int:
+        del object_id, address, qualifier_size, qualifier_data
+        _set_uint32(actual_size, ctypes.sizeof(ctypes.c_void_p))
+        _set_void_p(value, 13579)
+        return 0
+
+    monkeypatch.setattr(
+        coreaudio_module,
+        "_AudioObjectGetPropertyDataSize",
+        _get_data_size_returning(ctypes.sizeof(ctypes.c_void_p)),
+    )
+    monkeypatch.setattr(
+        coreaudio_module,
+        "_AudioObjectGetPropertyData",
+        get_property_data,
+    )
+    monkeypatch.setattr(
+        coreaudio_module.objc,
+        "objc_object",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("wrap failed")),
+    )
+    monkeypatch.setattr(
+        coreaudio_module,
+        "_CFRelease",
+        lambda ref: released_refs.append(ref.value),
+    )
+
+    with pytest.raises(RuntimeError, match="wrap failed"):
+        coreaudio_module.get_property_objc_object(7, 0x1234)
+
+    assert released_refs == [13579]
 
 
 def test_get_property_objc_object_rejects_zero_sized_property(

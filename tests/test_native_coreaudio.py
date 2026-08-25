@@ -18,6 +18,7 @@ from catap._capture_engine import (
 from catap._native_coreaudio import (
     CATAP_STATUS_BUFFER_TOO_LARGE,
     CATAP_STATUS_BUFFER_TOO_SMALL,
+    CATAP_STATUS_INVALID_AUDIO_BUFFER,
     CATAP_STATUS_OK,
     CATAP_STATUS_RING_FULL,
     CATAP_STATUS_UNSUPPORTED_AUDIO_LAYOUT,
@@ -107,7 +108,7 @@ def _call_io_proc(
 def test_loads_native_library(native_library_path: Path) -> None:
     library = load_native_coreaudio(native_library_path)
 
-    assert library.abi_version() == 1
+    assert library.abi_version() == 2
     assert library.status_name(CATAP_STATUS_OK) == "OK"
 
 
@@ -156,7 +157,7 @@ def test_editable_build_generates_bundled_native_library(tmp_path: Path) -> None
 
     assert build.returncode == 0, build.stdout + build.stderr
     assert bundled_library.is_file()
-    assert load_native_coreaudio(bundled_library).abi_version() == 1
+    assert load_native_coreaudio(bundled_library).abi_version() == 2
 
 
 def test_sdist_excludes_editable_native_build_output(tmp_path: Path) -> None:
@@ -259,6 +260,59 @@ def test_audio_ring_round_trips_bytes(native_library: NativeCoreAudioLibrary) ->
         assert ring.read() is None
 
 
+def test_audio_ring_round_trips_buffer_index(
+    native_library: NativeCoreAudioLibrary,
+) -> None:
+    with NativeAudioRing(2, 16, library=native_library) as ring:
+        status = ring.write(b"abcd", frame_count=1, buffer_index=3)
+
+        assert status == CATAP_STATUS_OK
+        chunk = ring.read()
+        assert chunk is not None
+        assert chunk.data == b"abcd"
+        assert chunk.buffer_index == 3
+
+
+def test_native_recorder_accepts_per_buffer_layout_sequences(
+    native_library: NativeCoreAudioLibrary,
+) -> None:
+    with NativeCoreAudioRecorder(
+        slot_count=2,
+        slot_capacity=32,
+        expected_channel_count=[2, 1],
+        bytes_per_frame=[8, 4],
+        library=native_library,
+    ) as recorder:
+        assert recorder.handle.value is not None
+        assert recorder.io_proc_pointer.value is not None
+
+
+def test_native_recorder_rejects_mismatched_layout_sequences(
+    native_library: NativeCoreAudioLibrary,
+) -> None:
+    with pytest.raises(ValueError, match="must describe the same buffers"):
+        NativeCoreAudioRecorder(
+            slot_count=2,
+            slot_capacity=32,
+            expected_channel_count=[2, 1],
+            bytes_per_frame=[8],
+            library=native_library,
+        )
+
+
+def test_native_recorder_rejects_too_many_buffers(
+    native_library: NativeCoreAudioLibrary,
+) -> None:
+    with pytest.raises(ValueError, match="1 to 16 buffers, got 17"):
+        NativeCoreAudioRecorder(
+            slot_count=2,
+            slot_capacity=32,
+            expected_channel_count=[2] * 17,
+            bytes_per_frame=[8] * 17,
+            library=native_library,
+        )
+
+
 def test_audio_ring_reports_full_without_consuming(
     native_library: NativeCoreAudioLibrary,
 ) -> None:
@@ -350,6 +404,98 @@ def test_native_recorder_io_proc_records_layout_failures(
         assert stats.callback_failures == 1
         assert stats.last_error_status == CATAP_STATUS_UNSUPPORTED_AUDIO_LAYOUT
         assert stats.last_error_name == "UNSUPPORTED_AUDIO_LAYOUT"
+        assert keepalive
+
+
+def test_native_recorder_io_proc_publishes_equal_frame_multibuffer_group(
+    native_library: NativeCoreAudioLibrary,
+) -> None:
+    with NativeCoreAudioRecorder(
+        slot_count=4,
+        slot_capacity=16,
+        expected_channel_count=[2, 1],
+        bytes_per_frame=[4, 2],
+        library=native_library,
+    ) as recorder:
+        input_data, keepalive = _audio_buffer_list_pointer(
+            (b"abcdefgh", 2),
+            (b"ijkl", 1),
+        )
+
+        assert _call_io_proc(native_library, recorder, input_data) == 0
+        chunks = [recorder.read(), recorder.read()]
+        assert [chunk.buffer_index for chunk in chunks if chunk is not None] == [
+            0,
+            1,
+        ]
+        assert [chunk.frame_count for chunk in chunks if chunk is not None] == [
+            2,
+            2,
+        ]
+        assert recorder.read() is None
+        stats = recorder.stats()
+        assert stats.captured_chunks == 2
+        assert stats.captured_frames == 4
+        assert stats.callback_failures == 0
+        assert keepalive
+
+
+@pytest.mark.parametrize(
+    ("first_data", "second_data"),
+    [
+        (b"abcdefgh", b"ijkl"),
+        (b"abcdefgh", b""),
+        (b"", b"ijklmnop"),
+    ],
+)
+def test_native_recorder_io_proc_rejects_unequal_frame_multibuffer_group(
+    native_library: NativeCoreAudioLibrary,
+    first_data: bytes,
+    second_data: bytes,
+) -> None:
+    with NativeCoreAudioRecorder(
+        slot_count=4,
+        slot_capacity=16,
+        expected_channel_count=[2, 1],
+        bytes_per_frame=[4, 4],
+        library=native_library,
+    ) as recorder:
+        input_data, keepalive = _audio_buffer_list_pointer(
+            (first_data, 2),
+            (second_data, 1),
+        )
+
+        assert _call_io_proc(native_library, recorder, input_data) == 0
+        assert recorder.read() is None
+        stats = recorder.stats()
+        assert stats.captured_chunks == 0
+        assert stats.captured_frames == 0
+        assert stats.callback_failures == 1
+        assert stats.last_error_status == CATAP_STATUS_INVALID_AUDIO_BUFFER
+        assert stats.last_error_name == "INVALID_AUDIO_BUFFER"
+        assert keepalive
+
+
+def test_native_recorder_io_proc_ignores_entirely_empty_multibuffer_group(
+    native_library: NativeCoreAudioLibrary,
+) -> None:
+    with NativeCoreAudioRecorder(
+        slot_count=4,
+        slot_capacity=16,
+        expected_channel_count=[2, 1],
+        bytes_per_frame=[4, 4],
+        library=native_library,
+    ) as recorder:
+        input_data, keepalive = _audio_buffer_list_pointer(
+            (b"", 99),
+            (b"", 0),
+        )
+
+        assert _call_io_proc(native_library, recorder, input_data) == 0
+        assert recorder.read() is None
+        stats = recorder.stats()
+        assert stats.captured_chunks == 0
+        assert stats.callback_failures == 0
         assert keepalive
 
 

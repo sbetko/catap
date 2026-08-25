@@ -19,12 +19,14 @@ _CFRelease.argtypes = [ctypes.c_void_p]
 _CFRelease.restype = None
 
 kAudioObjectSystemObject = 1
+kAudioObjectUnknown = 0
 kAudioObjectPropertyScopeGlobal = int.from_bytes(b"glob", "big")
 kAudioObjectPropertyScopeInput = int.from_bytes(b"inpt", "big")
 kAudioObjectPropertyScopeOutput = int.from_bytes(b"outp", "big")
 kAudioObjectPropertyElementMain = 0
 kAudioHardwareUnknownPropertyError = int.from_bytes(b"who?", "big")
 kAudioHardwareBadObjectError = int.from_bytes(b"!obj", "big")
+kAudioDevicePermissionsError = int.from_bytes(b"!hog", "big")
 
 _PropertyAddress = ctypes.c_uint32 * 3  # (selector, scope, element)
 
@@ -54,6 +56,48 @@ _AudioObjectGetPropertyData.argtypes = [
     ctypes.c_void_p,
 ]
 _AudioObjectGetPropertyData.restype = ctypes.c_int32
+
+# OSStatus AudioObjectSetPropertyData(
+#     AudioObjectID, const AudioObjectPropertyAddress*,
+#     UInt32, const void*, UInt32, const void*)
+_AudioObjectSetPropertyData = _CoreAudio.AudioObjectSetPropertyData
+_AudioObjectSetPropertyData.argtypes = [
+    ctypes.c_uint32,
+    ctypes.POINTER(_PropertyAddress),
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+]
+_AudioObjectSetPropertyData.restype = ctypes.c_int32
+
+# OSStatus (*AudioObjectPropertyListenerProc)(
+#     AudioObjectID, UInt32, const AudioObjectPropertyAddress*, void*)
+AudioObjectPropertyListenerProc = ctypes.CFUNCTYPE(
+    ctypes.c_int32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.POINTER(_PropertyAddress),
+    ctypes.c_void_p,
+)
+
+_AudioObjectAddPropertyListener = _CoreAudio.AudioObjectAddPropertyListener
+_AudioObjectAddPropertyListener.argtypes = [
+    ctypes.c_uint32,
+    ctypes.POINTER(_PropertyAddress),
+    AudioObjectPropertyListenerProc,
+    ctypes.c_void_p,
+]
+_AudioObjectAddPropertyListener.restype = ctypes.c_int32
+
+_AudioObjectRemovePropertyListener = _CoreAudio.AudioObjectRemovePropertyListener
+_AudioObjectRemovePropertyListener.argtypes = [
+    ctypes.c_uint32,
+    ctypes.POINTER(_PropertyAddress),
+    AudioObjectPropertyListenerProc,
+    ctypes.c_void_p,
+]
+_AudioObjectRemovePropertyListener.restype = ctypes.c_int32
 
 
 def _property_address(
@@ -215,6 +259,113 @@ def get_property_object_ids(
     ]
 
 
+def get_property_object_id_with_qualifier(
+    object_id: int,
+    selector: int,
+    qualifier: Any,
+    scope: int = kAudioObjectPropertyScopeGlobal,
+    element: int = kAudioObjectPropertyElementMain,
+) -> int:
+    """Translate a qualifier value into an AudioObjectID.
+
+    ``qualifier`` is a ctypes value passed by reference, matching Core Audio's
+    translation properties (for example a ``pid_t`` for
+    ``kAudioHardwarePropertyTranslatePIDToProcessObject`` or a boxed
+    ``CFStringRef`` for ``kAudioHardwarePropertyTranslateUIDToTap``). Returns
+    ``kAudioObjectUnknown`` (0) when the qualifier matches nothing.
+    """
+    address = _property_address(selector, scope, element)
+    value = ctypes.c_uint32(kAudioObjectUnknown)
+    size = ctypes.c_uint32(ctypes.sizeof(value))
+    status = _AudioObjectGetPropertyData(
+        object_id,
+        ctypes.byref(address),
+        ctypes.sizeof(qualifier),
+        ctypes.byref(qualifier),
+        ctypes.byref(size),
+        ctypes.byref(value),
+    )
+    if status != 0:
+        raise _status_error(
+            f"Failed to translate qualifier for selector {selector:08x}: "
+            f"status {status}",
+            status,
+        )
+    return value.value
+
+
+def set_property_objc_object(
+    object_id: int,
+    selector: int,
+    value: Any,
+    scope: int = kAudioObjectPropertyScopeGlobal,
+    element: int = kAudioObjectPropertyElementMain,
+) -> None:
+    """Set an Objective-C object property on a Core Audio object."""
+    address = _property_address(selector, scope, element)
+    objc_ref = ctypes.c_void_p(value.__c_void_p__().value)
+    status = _AudioObjectSetPropertyData(
+        object_id,
+        ctypes.byref(address),
+        0,
+        None,
+        ctypes.sizeof(objc_ref),
+        ctypes.byref(objc_ref),
+    )
+    if status != 0:
+        raise _status_error(
+            f"Failed to set Objective-C property for selector {selector:08x}: "
+            f"status {status}",
+            status,
+        )
+
+
+def add_property_listener(
+    object_id: int,
+    selector: int,
+    listener_proc: Any,
+    scope: int = kAudioObjectPropertyScopeGlobal,
+    element: int = kAudioObjectPropertyElementMain,
+) -> None:
+    """Register an ``AudioObjectPropertyListenerProc`` for one property.
+
+    The caller owns keeping ``listener_proc`` (a ctypes
+    ``AudioObjectPropertyListenerProc``) alive until the matching
+    ``remove_property_listener`` call succeeds; Core Audio holds the raw
+    function pointer.
+    """
+    address = _property_address(selector, scope, element)
+    status = _AudioObjectAddPropertyListener(
+        object_id, ctypes.byref(address), listener_proc, None
+    )
+    if status != 0:
+        raise _status_error(
+            f"Failed to add property listener for selector {selector:08x}: "
+            f"status {status}",
+            status,
+        )
+
+
+def remove_property_listener(
+    object_id: int,
+    selector: int,
+    listener_proc: Any,
+    scope: int = kAudioObjectPropertyScopeGlobal,
+    element: int = kAudioObjectPropertyElementMain,
+) -> None:
+    """Deregister a listener previously added with ``add_property_listener``."""
+    address = _property_address(selector, scope, element)
+    status = _AudioObjectRemovePropertyListener(
+        object_id, ctypes.byref(address), listener_proc, None
+    )
+    if status != 0:
+        raise _status_error(
+            f"Failed to remove property listener for selector {selector:08x}: "
+            f"status {status}",
+            status,
+        )
+
+
 def get_property_objc_object(
     object_id: int,
     selector: int,
@@ -245,4 +396,10 @@ def get_property_objc_object(
     if not objc_ref.value:
         raise OSError(f"Property {selector:08x} returned an empty object")
 
-    return objc.objc_object(c_void_p=objc_ref.value)  # ty: ignore[unresolved-attribute]
+    try:
+        # ``AudioObjectGetPropertyData`` hands the caller an owned reference.
+        # PyObjC retains the object again when it builds the Python proxy, so
+        # balance Core Audio's reference after the proxy has taken ownership.
+        return objc.objc_object(c_void_p=objc_ref.value)  # ty: ignore[unresolved-attribute]
+    finally:
+        _CFRelease(objc_ref)

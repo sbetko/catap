@@ -288,3 +288,57 @@ def test_device_stream_factory_rejects_input_stream(monkeypatch: Any) -> None:
         tap_description_module.TapDescription.of_processes_for_device_stream(
             [11], stream
         )
+
+
+def test_uuid_setter_round_trips_on_real_description() -> None:
+    tap_description = tap_description_module.TapDescription()
+    new_uuid = "1F0E42F6-93D5-4E29-BB65-9D4E5A9C2B01"
+
+    tap_description.uuid = new_uuid
+
+    assert tap_description.uuid == new_uuid
+
+
+def test_uuid_setter_rejects_invalid_uuid_string() -> None:
+    tap_description = tap_description_module.TapDescription()
+    original_uuid = tap_description.uuid
+
+    with pytest.raises(ValueError, match="Invalid UUID string"):
+        tap_description.uuid = "not-a-uuid"
+
+    assert tap_description.uuid == original_uuid
+
+
+def test_bundle_id_taps_supported_reports_a_bool() -> None:
+    assert isinstance(tap_description_module.bundle_id_taps_supported(), bool)
+
+
+def test_bundle_ids_round_trip_when_supported() -> None:
+    tap_description = tap_description_module.TapDescription()
+
+    assert tap_description.bundle_ids == []
+
+    if not tap_description_module.bundle_id_taps_supported():
+        with pytest.raises(RuntimeError, match="macOS 26 or later"):
+            tap_description.bundle_ids = ["com.apple.Music"]
+        return
+
+    tap_description.bundle_ids = ["com.apple.Music", "us.zoom.xos"]
+
+    assert tap_description.bundle_ids == ["com.apple.Music", "us.zoom.xos"]
+
+
+def test_process_restore_enabled_round_trips_when_supported() -> None:
+    tap_description = tap_description_module.TapDescription()
+
+    if not tap_description_module.bundle_id_taps_supported():
+        assert tap_description.process_restore_enabled is False
+        with pytest.raises(RuntimeError, match="macOS 26 or later"):
+            tap_description.process_restore_enabled = True
+        return
+
+    tap_description.process_restore_enabled = True
+    assert tap_description.process_restore_enabled is True
+
+    tap_description.process_restore_enabled = False
+    assert tap_description.process_restore_enabled is False

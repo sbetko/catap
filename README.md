@@ -15,10 +15,9 @@ without installing or selecting a third-party loopback driver.
 pip install catap
 ```
 
-`catap` is macOS-only; importing it on other platforms raises `ImportError`.
-It targets macOS 14.2 and newer. CI covers CPython 3.11 through 3.14 plus
-free-threaded CPython 3.13t and 3.14t on macOS. Current development is on
-Apple Silicon and macOS 26.2.
+`catap` is macOS-only and requires macOS 14.2 or later. Importing it on other
+platforms raises `ImportError`. CI covers CPython 3.11 through 3.14, including
+free-threaded 3.13t and 3.14t, on macOS 15 and 26.
 
 Recording requires the bundled native Core Audio dylib. Wheels include a
 universal2 build; source builds require the macOS command-line developer tools.
@@ -30,6 +29,7 @@ CLI:
 ```bash
 catap record Safari -d 10 -o safari.wav    # record an app for 10 seconds
 catap record --system -d 10 -o mix.wav     # record a global process-output mix
+catap record-multitrack Safari Music -o session/   # one synced WAV per app
 catap list-apps                            # see what's producing audio
 ```
 
@@ -46,32 +46,42 @@ print(f"Recorded {session.duration_seconds:.2f} seconds")
 
 ## What it does
 
-- Record a single app, a global process-output mix, or an existing visible tap.
-- Exclude selected apps from a global recording.
-- Mute an app while recording it, so it's captured but not played aloud.
-- Target a specific output device stream when building a tap.
+- Record one app, several apps mixed through one tap, a global
+  process-output mix, one output device's stream, or an existing visible tap.
+- Record each app as its own sample-synchronized track (multitrack), with one
+  optional input-device track per input stream.
+- Record apps by bundle ID on macOS 26+, surviving app restarts.
+- Exclude selected apps from a global or device recording.
+- Mute tapped apps always or only while the tap is read.
+- Mix captures down to stereo or mono, and create private or visible taps.
+- Retarget a live tap mid-capture: change its process set or mute behavior
+  without interrupting the recording.
+- Watch Core Audio changes (process list, tap list, devices, default output)
+  through a property-listener event layer.
 - Write WAV files, or stream PCM buffers to your own callback.
-- Use a bounded audio queue: if the worker falls behind, buffers are dropped
-  and the count is reported on stop, instead of growing memory without bound.
+- Use bounded queues. Overflow fails the capture and reports dropped buffers
+  and frames instead of growing memory without bound.
 
 ## Scope
 
-`catap` is a process-output capture library. It is not a microphone/input-device
-recorder, an AudioServerPlugIn implementation, or a virtual audio driver.
+`catap` is a process-output capture library built on the Core Audio tap API.
+It is not a general microphone recorder, an AudioServerPlugIn implementation,
+or a virtual audio driver. Its one input-device path is experimental
+synchronized microphone capture in multitrack sessions.
 
-The current recorder path reads one tap through one private HAL aggregate
-device. It accepts packed, interleaved linear PCM tap formats and rejects
-non-interleaved, multi-buffer, compressed, padded, or otherwise unusual formats.
+The single-tap recorder path reads one tap through one private HAL aggregate
+device and accepts packed, interleaved linear PCM formats. The multitrack
+path reads several taps (and optionally one input device) through one
+aggregate, one stream per track. Non-interleaved, compressed, padded, and
+other unsupported stream formats fail at startup.
 
-The `--system` and `record_system_audio()` paths build a global Core Audio tap:
-they capture process output that Core Audio exposes to taps. Long-running
-captures across sleep/wake, route changes, source-process restarts, and default
-output-device changes are not covered yet. If the tap's stream format changes
-mid-capture (for example after a default-device change), or a shared tap is
-destroyed by its owner, `stop()` fails and discards the output instead of
-publishing a corrupt or truncated file. See
-[`docs/core-audio-notes.md`](docs/core-audio-notes.md) for the short Core Audio
-notes.
+A format change or destruction of an externally owned tap fails capture and
+discards file output. Equal-format output switches can continue without
+recorder intervention. Seamless recovery after sleep/wake, format-changing
+transitions, or loss of the aggregate or IOProc is not implemented. Known
+background failures set `capture_failed` and wake
+`wait_for_capture_failure()`. `stop()` performs final validation and cleanup.
+See [`docs/core-audio-notes.md`](docs/core-audio-notes.md).
 
 ## Usage
 
@@ -82,12 +92,23 @@ Common commands:
 ```bash
 catap list-apps
 catap list-apps --all
+catap list-taps
+catap list-devices
 catap record Safari -d 30 -o safari.wav
+catap record Safari Music -d 30 -o both.wav        # two apps, one mixed tap
 catap record Spotify --mute -d 60 -o spotify.wav
+catap record Spotify --mute-when-tapped -o spotify.wav
 catap record --system -e Music -e Zoom -d 30 -o system.wav
+catap record --device "MacBook Pro Speakers" -d 30 -o speakers.wav
+catap record --tap <uid> -o shared.wav             # an existing visible tap
+catap record --bundle-id com.apple.Music -o music.wav   # macOS 26+
+catap record-multitrack Safari Music -o session/   # one synced WAV per app
+catap record-multitrack Safari --with-mic -o call/ # app + microphone tracks
+catap watch                                        # stream Core Audio changes
 ```
 
-Run `catap record --help` for the full set of recording options.
+Run `catap record --help` and `catap record-multitrack --help` for the full
+option set.
 
 ### Python API
 
@@ -173,11 +194,124 @@ slow writer or callback as a capture failure. Tune this with
 A name query that matches multiple processes raises with the candidates in
 the error rather than picking one arbitrarily.
 
+### Capture variants
+
+Process, system-audio, and bundle-ID session builders accept `mute=` (a bool
+or `TapMuteBehavior`), `mono=True`, and `visible=True` (create a tap other
+audio clients can see). Device capture follows the device's native format, so
+it accepts `mute=` and `visible=` but not `mono=`. Multitrack capture accepts
+`mute=` and `mono=` and creates private taps; a session for an existing tap
+uses that tap's already-configured options. The CLI exposes the applicable
+creation options and intentionally limits `--mute` to app, bundle-ID, and
+device targets:
+
+```python
+from catap import (
+    TapMuteBehavior,
+    record_bundle_ids,
+    record_device,
+    record_processes,
+    record_system_audio,
+)
+
+record_processes(["Safari", "Music"], "both.wav")       # one mixed tap
+record_system_audio("mix.wav", exclude=["Zoom"], mono=True)
+record_device("MacBook Pro Speakers", "speakers.wav")   # one device stream
+record_processes(["Safari"], "s.wav", mute=TapMuteBehavior.MUTED_WHEN_TAPPED)
+
+# macOS 26+: tap by bundle ID; the tap re-attaches if the app restarts.
+record_bundle_ids(["com.apple.Music"], "music.wav", restore=True)
+```
+
+Recorder and session paths accept `drift_compensation_quality=`. `None`
+preserves Core Audio's default. Other values must be a
+`DriftCompensationQuality` member:
+
+```python
+from catap import DriftCompensationQuality, record_system_audio
+
+record_system_audio(
+    "mix.wav",
+    drift_compensation_quality=DriftCompensationQuality.HIGH,
+)
+```
+
+The levels are `MINIMUM`, `LOW`, `MEDIUM`, `HIGH`, and `MAXIMUM`. Raw integers
+and booleans are rejected.
+
+### Multitrack capture
+
+`record_multitrack` records each app as its own sample-synchronized track
+through one aggregate device. Each app gets one WAV and shares one clock.
+`microphone=True` adds one track per input-device stream (experimental;
+requires microphone permission):
+
+```python
+from catap import record_multitrack
+
+session = record_multitrack(["Safari", "Music"], "session/", microphone=True)
+session.record_for(30)
+print(session.track_labels, session.track_captured_only_silence)
+```
+
+The output directory is created automatically, including missing parents.
+Explicit `output_paths=` entries must name distinct destinations; path aliases,
+including relative-component, case-only, and canonically equivalent Unicode
+spellings, are rejected before capture starts.
+
+A dropped buffer group, vanished tap, format change, or other track failure
+discards every track instead of publishing a desynchronized session.
+Publication is transactional across errors and interruptions handled by the
+running Python process. An abrupt process kill or power loss during the final
+multi-file commit is not journal-recovered.
+
+### Live tap retargeting
+
+A running session's tap can be modified without interrupting the capture:
+
+```python
+session = record_processes(["Safari"], "out.wav")
+session.start()
+session.set_processes(["Safari", "Music"])   # add Music mid-capture
+session.set_mute_behavior(True)              # mute the apps mid-capture
+session.stop()
+```
+
+`set_processes` is for inclusive process-list taps. Global/exclusive taps use
+their process list as exclusions, and bundle-ID taps have a separate target
+list, so `set_processes` rejects both rather than silently reversing or mixing
+their semantics.
+
+Lower level, `get_tap_description(tap_id)` / `set_tap_description(tap_id,
+description)` expose the same Core Audio property directly. Changing fields
+that alter the tap's stream format (mono, mixdown, device) mid-capture makes
+the recorder fail the capture rather than publish mixed-format output.
+
+### Watching Core Audio changes
+
+`catap.events` delivers property-change notifications on a catap-owned
+dispatcher thread (never the HAL thread):
+
+```python
+from catap import events
+
+def on_change(event: events.AudioPropertyEvent) -> None:
+    print("audio processes changed", event.selector_fourcc)
+
+with events.watch_audio_processes(on_change):
+    ...  # also: watch_audio_taps, watch_audio_devices,
+         # watch_default_output_device, watch_tap, watch_property
+```
+
+The CLI equivalent is `catap watch`.
+
 ### Mute Behavior
 
 With `record_process(..., mute=True)`, the app stays muted for the lifetime
-of the recording session. The lower-level mute modes behave differently if the
-tap outlives the recorder; see [`docs/mute-behavior.md`](docs/mute-behavior.md).
+of the recording session. Pass `mute=TapMuteBehavior.MUTED_WHEN_TAPPED` to
+mute only while the tap is actually being read. The lower-level mute modes
+behave differently if the tap outlives the recorder; see
+[`docs/mute-behavior.md`](docs/mute-behavior.md).
 
 ### Low-level API
 
@@ -270,6 +404,15 @@ Check `session.captured_only_silence` after recording; the CLI prints a
 warning automatically. Permission changes take effect after the host app
 restarts.
 
+Modifying a live tap's description (`set_tap_description`,
+`session.set_processes`) requires the same permission and raises
+`PermissionError` without it.
+
+Multitrack microphone tracks use the separate Microphone permission. Granting
+one permission does not grant the other. If microphone tracks have audio while
+every tap track reports silence, system-audio permission is missing. Check
+`session.track_captured_only_silence`.
+
 App bundles using Core Audio taps should include
 `NSAudioCaptureUsageDescription` in their `Info.plist`. Sandboxed apps still
 need their normal sandbox configuration; Core Audio taps do not add a separate
@@ -286,9 +429,9 @@ system-audio-capture entitlement.
    aggregate when recording stops.
 4. Audio capture: registers the bundled native dylib's `AudioDeviceIOProc`
    and copies tap audio into a preallocated native ring.
-5. Worker output: a Python drain thread feeds the background worker, which
-   writes WAV data and invokes optional `on_buffer` callbacks outside the
-   Core Audio real-time path.
+5. Worker output: a Python drain thread feeds one background worker per track.
+   Workers write WAV data and invoke optional `on_buffer` callbacks outside
+   the Core Audio real-time path.
 
 The Core Audio notes live in [`docs/core-audio-notes.md`](docs/core-audio-notes.md).
 Recorder callback and queueing design is in
@@ -322,19 +465,16 @@ CATAP_RUN_INTEGRATION=1 uv run --python 3.14t --group dev pytest \
   tests/test_integration.py::test_record_system_audio_smoke
 ```
 
-### Integration smoke test
+### Integration tests
 
 ```bash
 CATAP_RUN_INTEGRATION=1 uv run --group dev pytest -m integration
 ```
 
-Opt-in. Exercises the real macOS Core Audio bridge: process enumeration and
-a short recording that covers tap startup, shutdown, and WAV finalization.
-Additionally setting `CATAP_RUN_TONE_INTEGRATION=1` plays a short tone aloud
-and requires the capture to contain it; see
-[`RELEASE.md`](RELEASE.md) for the release gate.
-
-See [`RELEASE.md`](RELEASE.md) for the release checklist.
+`CATAP_RUN_INTEGRATION=1` runs the structural Core Audio cases. Also set
+`CATAP_RUN_TONE_INTEGRATION=1` for permissioned tone, live mutation,
+microphone, and bundle-relaunch checks. See [`RELEASE.md`](RELEASE.md) for
+host requirements and the release gate.
 
 ## License
 

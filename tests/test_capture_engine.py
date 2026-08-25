@@ -17,10 +17,137 @@ from catap.bindings._audiotoolbox import (
 )
 from catap.bindings._coreaudio import kAudioHardwareBadObjectError
 from catap.bindings.tap import AudioTapNotFoundError
+from catap.drift import DriftCompensationQuality
 
 
 def _set_void_p(pointer: Any, value: int) -> None:
     ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p)).contents.value = value
+
+
+def _capture_aggregate_description(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    quality: DriftCompensationQuality | None,
+) -> dict[str, Any]:
+    dictionaries: list[dict[str, Any]] = []
+
+    class _FakeCFDictionary(dict[str, Any]):
+        def __c_void_p__(self) -> ctypes.c_void_p:
+            return ctypes.c_void_p(1)
+
+    class _FakeNSDictionary:
+        @staticmethod
+        def dictionaryWithDictionary_(entries: dict[str, Any]) -> _FakeCFDictionary:
+            result = _FakeCFDictionary(entries)
+            dictionaries.append(result)
+            return result
+
+    class _FakeNSArray:
+        @staticmethod
+        def arrayWithArray_(entries: list[Any]) -> list[Any]:
+            return entries
+
+    class _FakeNSNumber:
+        @staticmethod
+        def numberWithBool_(value: bool) -> bool:
+            return value
+
+        @staticmethod
+        def numberWithUnsignedInt_(value: int) -> int:
+            return value
+
+    def create_aggregate_device(
+        description: ctypes.c_void_p,
+        device_id: Any,
+    ) -> int:
+        del description
+        ctypes.cast(device_id, ctypes.POINTER(ctypes.c_uint32)).contents.value = 55
+        return 0
+
+    monkeypatch.setattr(capture_module, "NSDictionary", _FakeNSDictionary)
+    monkeypatch.setattr(capture_module, "NSArray", _FakeNSArray)
+    monkeypatch.setattr(capture_module, "NSNumber", _FakeNSNumber)
+    monkeypatch.setattr(
+        capture_module,
+        "_AudioHardwareCreateAggregateDevice",
+        create_aggregate_device,
+    )
+
+    device_id = capture_module._create_aggregate_device(
+        ["tap-one", "tap-two"],
+        "test aggregate",
+        drift_compensation_quality=quality,
+    )
+
+    assert device_id == 55
+    return dictionaries[-1]
+
+
+def test_aggregate_omits_drift_quality_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    description = _capture_aggregate_description(monkeypatch, quality=None)
+
+    assert [tap["uid"] for tap in description["taps"]] == [
+        "tap-one",
+        "tap-two",
+    ]
+    assert all(tap["drift"] is True for tap in description["taps"])
+    assert all("drift quality" not in tap for tap in description["taps"])
+
+
+@pytest.mark.parametrize(
+    "quality",
+    list(DriftCompensationQuality),
+    ids=lambda quality: quality.name.lower(),
+)
+def test_aggregate_applies_drift_quality_to_every_tap(
+    monkeypatch: pytest.MonkeyPatch,
+    quality: DriftCompensationQuality,
+) -> None:
+    description = _capture_aggregate_description(
+        monkeypatch,
+        quality=quality,
+    )
+
+    assert [tap["drift quality"] for tap in description["taps"]] == [
+        quality.value,
+        quality.value,
+    ]
+
+
+@pytest.mark.parametrize("quality", [True, 0, 96, 127])
+def test_aggregate_rejects_non_enum_drift_quality(quality: object) -> None:
+    with pytest.raises(TypeError, match="DriftCompensationQuality"):
+        capture_module._create_aggregate_device(
+            ["tap-one"],
+            "test aggregate",
+            drift_compensation_quality=quality,  # type: ignore[arg-type]
+        )
+
+
+def test_destroy_aggregate_device_accepts_already_destroyed_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        capture_module,
+        "_AudioHardwareDestroyAggregateDevice",
+        lambda device_id: kAudioHardwareBadObjectError,
+    )
+
+    capture_module._destroy_aggregate_device(55)
+
+
+def test_destroy_io_proc_accepts_already_destroyed_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        capture_module,
+        "_AudioDeviceDestroyIOProcID",
+        lambda device_id, io_proc_id: kAudioHardwareBadObjectError,
+    )
+
+    capture_module._destroy_io_proc(55, ctypes.c_void_p(77))
 
 
 def test_describe_tap_stream_uses_tap_format(
@@ -527,9 +654,7 @@ def test_close_finishes_cleanup_after_keyboard_interrupt(
     monkeypatch.setattr(
         capture_module,
         "_destroy_aggregate_device",
-        lambda device_id: (_ for _ in ()).throw(
-            OSError("destroy aggregate failed")
-        ),
+        lambda device_id: (_ for _ in ()).throw(OSError("destroy aggregate failed")),
     )
 
     with pytest.raises(KeyboardInterrupt, match="stop interrupted") as exc_info:
@@ -540,9 +665,7 @@ def test_close_finishes_cleanup_after_keyboard_interrupt(
     assert session.started is False
     assert session.io_proc_destroyed is True
     assert session.aggregate_device_destroyed is False
-    assert any(
-        "destroy aggregate failed" in note for note in exc_info.value.__notes__
-    )
+    assert any("destroy aggregate failed" in note for note in exc_info.value.__notes__)
 
 
 def test_close_tracks_aggregate_success_without_assuming_io_proc_stopped(

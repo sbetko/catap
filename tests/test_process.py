@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -35,6 +36,8 @@ def test_list_audio_processes_decodes_bundle_ids(
 ) -> None:
     pid = struct.pack("<I", 9001)
     is_outputting = struct.pack("<I", 1)
+    is_running = struct.pack("<I", 1)
+    is_inputting = struct.pack("<I", 0)
 
     def get_object_ids(object_id: int, selector: int) -> list[int]:
         assert object_id == process_module.kAudioObjectSystemObject
@@ -55,6 +58,16 @@ def test_list_audio_processes_decodes_bundle_ids(
             and selector == process_module.kAudioProcessPropertyIsRunningOutput
         ):
             return is_outputting
+        if (
+            object_id == 41
+            and selector == process_module.kAudioProcessPropertyIsRunning
+        ):
+            return is_running
+        if (
+            object_id == 41
+            and selector == process_module.kAudioProcessPropertyIsRunningInput
+        ):
+            return is_inputting
         raise AssertionError(f"unexpected property lookup: {(object_id, selector)}")
 
     monkeypatch.setattr(process_module, "_get_audio_object_ids", get_object_ids)
@@ -93,6 +106,8 @@ def test_list_audio_processes_decodes_bundle_ids(
             bundle_id="com.apple.Music",
             name="Music",
             is_outputting=True,
+            is_running=True,
+            is_inputting=False,
         )
     ]
 
@@ -192,3 +207,118 @@ def test_find_process_by_name_prefers_exact_bundle_id_match(
     )
 
     assert process_module.find_process_by_name("com.apple.music") is target
+
+
+def test_find_process_by_pid_returns_none_for_unknown_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _translate(object_id: int, selector: int, qualifier: object) -> int:
+        assert object_id == process_module.kAudioObjectSystemObject
+        assert (
+            selector
+            == process_module.kAudioHardwarePropertyTranslatePIDToProcessObject
+        )
+        assert qualifier.value == 4242  # type: ignore[attr-defined]
+        return process_module.kAudioObjectUnknown
+
+    monkeypatch.setattr(process_module, "_translate_qualifier", _translate)
+
+    assert process_module.find_process_by_pid(4242) is None
+
+
+@pytest.mark.parametrize(
+    "pid",
+    [True, 1.5, "42", None],
+    ids=["bool", "float", "string", "none"],
+)
+def test_find_process_by_pid_rejects_non_integer_pid(pid: object) -> None:
+    with pytest.raises(TypeError, match="pid must be an int"):
+        process_module.find_process_by_pid(cast(int, pid))
+
+
+@pytest.mark.parametrize(
+    "pid",
+    [-1, 0, 2**31],
+    ids=["negative", "zero", "above-pid-t-range"],
+)
+def test_find_process_by_pid_rejects_out_of_range_pid(pid: int) -> None:
+    with pytest.raises(ValueError, match="pid must be between"):
+        process_module.find_process_by_pid(pid)
+
+
+def test_find_process_by_pid_propagates_translation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = OSError("translation failed")
+    error.status = -50  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        process_module,
+        "_translate_qualifier",
+        lambda object_id, selector, qualifier: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(OSError, match="translation failed") as exc_info:
+        process_module.find_process_by_pid(4242)
+
+    assert exc_info.value is error
+
+
+def test_find_process_by_pid_builds_process_from_translated_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _translate(object_id: int, selector: int, qualifier: object) -> int:
+        assert object_id == process_module.kAudioObjectSystemObject
+        assert (
+            selector
+            == process_module.kAudioHardwarePropertyTranslatePIDToProcessObject
+        )
+        assert qualifier.value == 9001  # type: ignore[attr-defined]
+        return 41
+
+    def get_property(
+        object_id: int,
+        selector: int,
+        scope: int = 0,
+        element: int = 0,
+    ) -> bytes:
+        del scope, element
+        assert object_id == 41
+        if selector == process_module.kAudioProcessPropertyPID:
+            return struct.pack("<I", 9001)
+        if selector == process_module.kAudioProcessPropertyIsRunningOutput:
+            return struct.pack("<I", 1)
+        if selector == process_module.kAudioProcessPropertyIsRunning:
+            return struct.pack("<I", 1)
+        if selector == process_module.kAudioProcessPropertyIsRunningInput:
+            return struct.pack("<I", 0)
+        raise AssertionError(f"unexpected property lookup: {selector}")
+
+    monkeypatch.setattr(process_module, "_translate_qualifier", _translate)
+    monkeypatch.setattr(process_module, "_get_audio_object_property", get_property)
+    monkeypatch.setattr(
+        process_module,
+        "_get_optional_audio_object_cfstring_property",
+        lambda object_id, selector, scope=0, element=0: (
+            "com.apple.Music"
+            if (object_id, selector)
+            == (41, process_module.kAudioProcessPropertyBundleID)
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        process_module,
+        "_running_applications_by_bundle_id",
+        lambda: {"com.apple.Music": _FakeApp("com.apple.Music", "Music")},
+    )
+
+    process = process_module.find_process_by_pid(9001)
+
+    assert process == process_module.AudioProcess(
+        audio_object_id=41,
+        pid=9001,
+        bundle_id="com.apple.Music",
+        name="Music",
+        is_outputting=True,
+        is_running=True,
+        is_inputting=False,
+    )

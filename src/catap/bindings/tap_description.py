@@ -7,7 +7,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
 import objc
-from Foundation import NSArray, NSNumber  # ty: ignore[unresolved-import]
+from Foundation import NSUUID, NSArray, NSNumber  # ty: ignore[unresolved-import]
 
 if TYPE_CHECKING:
     from catap.bindings.device import AudioDeviceStream
@@ -27,6 +27,19 @@ def _process_id_array(processes: Sequence[int]) -> Any:
     return NSArray.arrayWithArray_(
         [NSNumber.numberWithUnsignedInt_(pid) for pid in processes]
     )
+
+
+def bundle_id_taps_supported() -> bool:
+    """True when this macOS supports bundle-ID taps (macOS 26 and later)."""
+    return bool(CATapDescription.instancesRespondToSelector_(b"bundleIDs"))
+
+
+def _supports_selector(objc_description: Any, selector: bytes) -> bool:
+    """Best-effort check that an Objective-C description handles a selector."""
+    responds = getattr(objc_description, "respondsToSelector_", None)
+    if responds is None:
+        return False
+    return bool(responds(selector))
 
 
 class TapMuteBehavior(IntEnum):
@@ -161,6 +174,13 @@ class TapDescription:
         """UUID of the tap as a string."""
         return str(self._desc.UUID().UUIDString())
 
+    @uuid.setter
+    def uuid(self, value: str) -> None:
+        ns_uuid = NSUUID.alloc().initWithUUIDString_(value)
+        if ns_uuid is None:
+            raise ValueError(f"Invalid UUID string: {value!r}")
+        self._desc.setUUID_(ns_uuid)
+
     @property
     def processes(self) -> list[int]:
         """List of process AudioObjectIDs to tap or exclude."""
@@ -170,6 +190,46 @@ class TapDescription:
     @processes.setter
     def processes(self, value: Sequence[int]) -> None:
         self._desc.setProcesses_(_process_id_array(value))
+
+    @property
+    def bundle_ids(self) -> list[str]:
+        """Bundle IDs of processes to tap or exclude (macOS 26 and later).
+
+        Returns an empty list on earlier macOS versions, where the property
+        does not exist.
+        """
+        if not _supports_selector(self._desc, b"bundleIDs"):
+            return []
+        ns_array = self._desc.bundleIDs()
+        return [str(bundle_id) for bundle_id in ns_array] if ns_array else []
+
+    @bundle_ids.setter
+    def bundle_ids(self, value: Sequence[str]) -> None:
+        if not _supports_selector(self._desc, b"setBundleIDs:"):
+            raise RuntimeError(
+                "Tapping processes by bundle ID requires macOS 26 or later"
+            )
+        self._desc.setBundleIDs_(NSArray.arrayWithArray_([str(b) for b in value]))
+
+    @property
+    def process_restore_enabled(self) -> bool:
+        """True when exited processes rejoin the tap on restart (macOS 26+).
+
+        When enabled, the tap remembers tapped processes by bundle ID as they
+        exit and restores them to the tap when they start again. Always False
+        on earlier macOS versions, where the property does not exist.
+        """
+        if not _supports_selector(self._desc, b"isProcessRestoreEnabled"):
+            return False
+        return bool(self._desc.isProcessRestoreEnabled())
+
+    @process_restore_enabled.setter
+    def process_restore_enabled(self, value: bool) -> None:
+        if not _supports_selector(self._desc, b"setProcessRestoreEnabled:"):
+            raise RuntimeError(
+                "Tap process restore requires macOS 26 or later"
+            )
+        self._desc.setProcessRestoreEnabled_(value)
 
     @property
     def is_exclusive(self) -> bool:

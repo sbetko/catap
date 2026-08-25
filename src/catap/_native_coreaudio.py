@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import ctypes
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
 _LIBRARY_NAME: Final = "libcatap_coreaudio.dylib"
 _ENV_LIBRARY_PATH: Final = "CATAP_NATIVE_COREAUDIO_PATH"
-_ABI_VERSION: Final = 1
+_ABI_VERSION: Final = 2
+
+CATAP_MAX_BUFFERS: Final = 16
 
 CATAP_STATUS_OK: Final = 0
 CATAP_STATUS_RING_FULL: Final = 1
@@ -41,6 +44,7 @@ class _AudioChunkInfo(ctypes.Structure):
     _fields_ = [
         ("byte_count", ctypes.c_uint32),
         ("frame_count", ctypes.c_uint32),
+        ("buffer_index", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
         ("input_sample_time", ctypes.c_double),
     ]
@@ -61,8 +65,9 @@ class _RecorderConfig(ctypes.Structure):
     _fields_ = [
         ("slot_count", ctypes.c_uint32),
         ("slot_capacity", ctypes.c_uint32),
-        ("expected_channel_count", ctypes.c_uint32),
-        ("bytes_per_frame", ctypes.c_uint32),
+        ("buffer_count", ctypes.c_uint32),
+        ("expected_channel_count", ctypes.c_uint32 * CATAP_MAX_BUFFERS),
+        ("bytes_per_frame", ctypes.c_uint32 * CATAP_MAX_BUFFERS),
     ]
 
 
@@ -83,6 +88,7 @@ class NativeAudioChunk:
     data: bytes
     frame_count: int
     input_sample_time: float | None
+    buffer_index: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +159,7 @@ class NativeCoreAudioLibrary:
         lib.catap_audio_ring_try_write.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p,
+            ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.c_double,
@@ -275,6 +282,7 @@ class NativeAudioRing:
         data: Any,
         *,
         frame_count: int,
+        buffer_index: int = 0,
         input_sample_time: float | None = None,
     ) -> int:
         raw_data = bytes(data)
@@ -296,6 +304,7 @@ class NativeAudioRing:
                 source,
                 byte_count,
                 frame_count,
+                buffer_index,
                 0.0 if input_sample_time is None else input_sample_time,
                 flags,
             )
@@ -326,6 +335,7 @@ class NativeAudioRing:
             data=bytes(memoryview(destination)[: info.byte_count]),
             frame_count=info.frame_count,
             input_sample_time=sample_time,
+            buffer_index=info.buffer_index,
         )
 
     def stats(self) -> NativeAudioRingStats:
@@ -346,19 +356,62 @@ class NativeCoreAudioRecorder:
         *,
         slot_count: int,
         slot_capacity: int,
-        expected_channel_count: int,
-        bytes_per_frame: int,
+        expected_channel_count: int | Sequence[int],
+        bytes_per_frame: int | Sequence[int],
         library: NativeCoreAudioLibrary | None = None,
     ) -> None:
+        """Create the native recorder.
+
+        ``expected_channel_count`` and ``bytes_per_frame`` accept either one
+        value for the classic single-buffer capture, or equal-length
+        sequences describing every buffer of the aggregate device's input
+        AudioBufferList in buffer order.
+        """
+        channel_counts = (
+            [expected_channel_count]
+            if isinstance(expected_channel_count, int)
+            else list(expected_channel_count)
+        )
+        frame_sizes = (
+            [bytes_per_frame]
+            if isinstance(bytes_per_frame, int)
+            else list(bytes_per_frame)
+        )
+        if len(channel_counts) != len(frame_sizes):
+            raise ValueError(
+                "expected_channel_count and bytes_per_frame must describe "
+                f"the same buffers; got {len(channel_counts)} and "
+                f"{len(frame_sizes)}"
+            )
+        if not 1 <= len(channel_counts) <= CATAP_MAX_BUFFERS:
+            raise ValueError(
+                "Native recorder supports 1 to "
+                f"{CATAP_MAX_BUFFERS} buffers, got {len(channel_counts)}"
+            )
+        # The config crosses the ABI as UInt32 fields; ctypes would silently
+        # truncate larger values into a tiny (or invalid) ring.
+        for name, value in (
+            ("slot_count", slot_count),
+            ("slot_capacity", slot_capacity),
+        ):
+            if not 0 < value < 2**32:
+                raise ValueError(
+                    f"{name} must fit an unsigned 32-bit integer, got {value}"
+                )
+
         self._library = load_native_coreaudio() if library is None else library
         self._handle = ctypes.c_void_p()
         self._slot_capacity = slot_capacity
         config = _RecorderConfig(
             slot_count=slot_count,
             slot_capacity=slot_capacity,
-            expected_channel_count=expected_channel_count,
-            bytes_per_frame=bytes_per_frame,
+            buffer_count=len(channel_counts),
         )
+        for index, (channels, frame_size) in enumerate(
+            zip(channel_counts, frame_sizes, strict=True)
+        ):
+            config.expected_channel_count[index] = channels
+            config.bytes_per_frame[index] = frame_size
         status = self._library.cdll.catap_recorder_create(
             ctypes.byref(config),
             ctypes.byref(self._handle),
@@ -431,6 +484,7 @@ class NativeCoreAudioRecorder:
             data=bytes(memoryview(destination)[: info.byte_count]),
             frame_count=info.frame_count,
             input_sample_time=sample_time,
+            buffer_index=info.buffer_index,
         )
 
     def stats(self) -> NativeCoreAudioRecorderStats:

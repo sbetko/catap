@@ -26,8 +26,9 @@ struct catap_audio_ring {
 
 struct catap_recorder {
     catap_audio_ring_t *ring;
-    uint32_t expected_channel_count;
-    uint32_t bytes_per_frame;
+    uint32_t buffer_count;
+    uint32_t expected_channel_count[CATAP_MAX_BUFFERS];
+    uint32_t bytes_per_frame[CATAP_MAX_BUFFERS];
     atomic_ullong captured_chunks;
     atomic_ullong captured_frames;
     atomic_ullong callback_failures;
@@ -52,6 +53,35 @@ static uint32_t catap_audio_ring_queued_count(const catap_audio_ring_t *ring) {
         return write_index - read_index;
     }
     return ring->physical_slot_count - read_index + write_index;
+}
+
+static uint32_t catap_audio_ring_free_count(const catap_audio_ring_t *ring) {
+    return ring->slot_count - catap_audio_ring_queued_count(ring);
+}
+
+/* Writer-side slot fill; the caller has already checked capacity. */
+static void catap_audio_ring_fill_slot(
+    catap_audio_ring_t *ring,
+    uint32_t write_index,
+    const void *data,
+    uint32_t byte_count,
+    uint32_t frame_count,
+    uint32_t buffer_index,
+    double input_sample_time,
+    uint32_t flags
+) {
+    catap_audio_slot_t *slot = &ring->slots[write_index];
+    if (byte_count > 0) {
+        memcpy(slot->data, data, byte_count);
+    }
+    slot->info.byte_count = byte_count;
+    slot->info.frame_count = frame_count;
+    slot->info.buffer_index = buffer_index;
+    slot->info.flags = flags & CATAP_CHUNK_HAS_INPUT_SAMPLE_TIME;
+    slot->info.input_sample_time =
+        (slot->info.flags & CATAP_CHUNK_HAS_INPUT_SAMPLE_TIME)
+            ? input_sample_time
+            : 0.0;
 }
 
 static void catap_record_drop(catap_audio_ring_t *ring, uint32_t frame_count) {
@@ -180,6 +210,7 @@ int32_t catap_audio_ring_try_write(
     const void *data,
     uint32_t byte_count,
     uint32_t frame_count,
+    uint32_t buffer_index,
     double input_sample_time,
     uint32_t flags
 ) {
@@ -203,17 +234,16 @@ int32_t catap_audio_ring_try_write(
         return CATAP_STATUS_RING_FULL;
     }
 
-    catap_audio_slot_t *slot = &ring->slots[write_index];
-    if (byte_count > 0) {
-        memcpy(slot->data, data, byte_count);
-    }
-    slot->info.byte_count = byte_count;
-    slot->info.frame_count = frame_count;
-    slot->info.flags = flags & CATAP_CHUNK_HAS_INPUT_SAMPLE_TIME;
-    slot->info.input_sample_time =
-        (slot->info.flags & CATAP_CHUNK_HAS_INPUT_SAMPLE_TIME)
-            ? input_sample_time
-            : 0.0;
+    catap_audio_ring_fill_slot(
+        ring,
+        write_index,
+        data,
+        byte_count,
+        frame_count,
+        buffer_index,
+        input_sample_time,
+        flags
+    );
 
     atomic_store_explicit(&ring->write_index, next_write_index, memory_order_release);
     return CATAP_STATUS_OK;
@@ -286,10 +316,23 @@ int32_t catap_recorder_create(
         out_recorder == NULL ||
         config->slot_count == 0 ||
         config->slot_capacity == 0 ||
-        config->expected_channel_count == 0 ||
-        config->bytes_per_frame == 0
+        config->buffer_count == 0 ||
+        config->buffer_count > CATAP_MAX_BUFFERS
     ) {
         return CATAP_STATUS_INVALID_ARGUMENT;
+    }
+    /* Every callback consumes buffer_count slots as one atomic group, so a
+     * ring smaller than one group could never accept a single callback. */
+    if (config->slot_count < config->buffer_count) {
+        return CATAP_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint32_t index = 0; index < config->buffer_count; ++index) {
+        if (
+            config->expected_channel_count[index] == 0 ||
+            config->bytes_per_frame[index] == 0
+        ) {
+            return CATAP_STATUS_INVALID_ARGUMENT;
+        }
     }
 
     catap_recorder_t *recorder = calloc(1, sizeof(*recorder));
@@ -305,8 +348,12 @@ int32_t catap_recorder_create(
         return status;
     }
 
-    recorder->expected_channel_count = config->expected_channel_count;
-    recorder->bytes_per_frame = config->bytes_per_frame;
+    recorder->buffer_count = config->buffer_count;
+    for (uint32_t index = 0; index < config->buffer_count; ++index) {
+        recorder->expected_channel_count[index] =
+            config->expected_channel_count[index];
+        recorder->bytes_per_frame[index] = config->bytes_per_frame[index];
+    }
     atomic_init(&recorder->captured_chunks, 0u);
     atomic_init(&recorder->captured_frames, 0u);
     atomic_init(&recorder->callback_failures, 0u);
@@ -389,38 +436,97 @@ OSStatus catap_recorder_io_proc(
         return noErr;
     }
 
-    if (input_data->mNumberBuffers == 0) {
+    const uint32_t buffer_count = input_data->mNumberBuffers;
+    if (buffer_count == 0) {
         return noErr;
     }
-    if (input_data->mNumberBuffers != 1) {
+    if (buffer_count != recorder->buffer_count) {
         catap_recorder_record_failure(
             recorder, CATAP_STATUS_UNSUPPORTED_AUDIO_LAYOUT
         );
         return noErr;
     }
 
-    const AudioBuffer *buffer = &input_data->mBuffers[0];
-    const uint32_t byte_count = buffer->mDataByteSize;
-    if (byte_count == 0) {
+    /* Validate every buffer before writing anything, so one malformed
+     * buffer never leaves the ring holding a torn callback group. */
+    uint32_t frame_counts[CATAP_MAX_BUFFERS];
+    uint32_t oversized_count = 0;
+    uint32_t group_frame_count = 0;
+    for (uint32_t index = 0; index < buffer_count; ++index) {
+        const AudioBuffer *buffer = &input_data->mBuffers[index];
+        const uint32_t byte_count = buffer->mDataByteSize;
+        /* Core Audio can deliver an entirely empty AudioBufferList during a
+         * transition. Its channel metadata is not reliable, so defer the
+         * decision until every buffer has been inspected. A partly-empty
+         * group is rejected below because publishing it would shorten only
+         * some tracks and permanently shift their timelines. */
+        if (byte_count == 0) {
+            frame_counts[index] = 0;
+            continue;
+        }
+        if (buffer->mData == NULL) {
+            catap_recorder_record_failure(
+                recorder, CATAP_STATUS_INVALID_AUDIO_BUFFER
+            );
+            return noErr;
+        }
+        if (buffer->mNumberChannels != recorder->expected_channel_count[index]) {
+            catap_recorder_record_failure(
+                recorder, CATAP_STATUS_UNSUPPORTED_AUDIO_LAYOUT
+            );
+            return noErr;
+        }
+        if (byte_count % recorder->bytes_per_frame[index] != 0) {
+            catap_recorder_record_failure(
+                recorder, CATAP_STATUS_INVALID_AUDIO_BUFFER
+            );
+            return noErr;
+        }
+        if (byte_count > recorder->ring->slot_capacity) {
+            ++oversized_count;
+        }
+        frame_counts[index] = byte_count / recorder->bytes_per_frame[index];
+    }
+    group_frame_count = frame_counts[0];
+    if (group_frame_count == 0) {
+        for (uint32_t index = 1; index < buffer_count; ++index) {
+            if (frame_counts[index] != 0) {
+                catap_recorder_record_failure(
+                    recorder, CATAP_STATUS_INVALID_AUDIO_BUFFER
+                );
+                return noErr;
+            }
+        }
         return noErr;
     }
-    if (buffer->mData == NULL) {
-        catap_recorder_record_failure(recorder, CATAP_STATUS_INVALID_AUDIO_BUFFER);
-        return noErr;
+    for (uint32_t index = 1; index < buffer_count; ++index) {
+        if (frame_counts[index] != group_frame_count) {
+            catap_recorder_record_failure(
+                recorder, CATAP_STATUS_INVALID_AUDIO_BUFFER
+            );
+            return noErr;
+        }
     }
-    if (buffer->mNumberChannels != recorder->expected_channel_count) {
-        catap_recorder_record_failure(
-            recorder, CATAP_STATUS_UNSUPPORTED_AUDIO_LAYOUT
+    if (oversized_count > 0) {
+        for (uint32_t index = 0; index < buffer_count; ++index) {
+            catap_record_drop(recorder->ring, frame_counts[index]);
+        }
+        atomic_fetch_add_explicit(
+            &recorder->ring->oversized_chunks,
+            (unsigned long long)oversized_count,
+            memory_order_relaxed
         );
         return noErr;
     }
-    if (byte_count % recorder->bytes_per_frame != 0) {
-        catap_recorder_record_failure(recorder, CATAP_STATUS_INVALID_AUDIO_BUFFER);
-        return noErr;
-    }
 
-    const uint32_t frame_count = byte_count / recorder->bytes_per_frame;
-    if (frame_count == 0) {
+    /* All-or-nothing group write: either every buffer of this callback is
+     * queued or the whole callback is dropped, so per-track streams never
+     * fall out of step with each other. Only the IOProc writes, so the free
+     * count cannot shrink underneath it. */
+    if (catap_audio_ring_free_count(recorder->ring) < buffer_count) {
+        for (uint32_t index = 0; index < buffer_count; ++index) {
+            catap_record_drop(recorder->ring, frame_counts[index]);
+        }
         return noErr;
     }
 
@@ -429,24 +535,40 @@ OSStatus catap_recorder_io_proc(
         (input_time->mFlags & kAudioTimeStampSampleTimeValid) != 0;
     const double input_sample_time =
         has_sample_time ? input_time->mSampleTime : 0.0;
-    const int32_t status = catap_audio_ring_try_write(
-        recorder->ring,
-        buffer->mData,
-        byte_count,
-        frame_count,
-        input_sample_time,
-        has_sample_time ? CATAP_CHUNK_HAS_INPUT_SAMPLE_TIME : 0u
+    const uint32_t flags =
+        has_sample_time ? CATAP_CHUNK_HAS_INPUT_SAMPLE_TIME : 0u;
+
+    uint32_t write_index =
+        atomic_load_explicit(&recorder->ring->write_index, memory_order_relaxed);
+    for (uint32_t index = 0; index < buffer_count; ++index) {
+        const AudioBuffer *buffer = &input_data->mBuffers[index];
+        catap_audio_ring_fill_slot(
+            recorder->ring,
+            write_index,
+            buffer->mData,
+            buffer->mDataByteSize,
+            frame_counts[index],
+            index,
+            input_sample_time,
+            flags
+        );
+        write_index = catap_next_index(recorder->ring, write_index);
+    }
+    atomic_store_explicit(
+        &recorder->ring->write_index, write_index, memory_order_release
     );
 
-    if (status == CATAP_STATUS_OK) {
-        atomic_fetch_add_explicit(
-            &recorder->captured_chunks, 1u, memory_order_relaxed
-        );
-        atomic_fetch_add_explicit(
-            &recorder->captured_frames,
-            (unsigned long long)frame_count,
-            memory_order_relaxed
-        );
-    }
+    /* Both frame counters sum across every buffer of the group, so captured
+     * and dropped totals stay comparable for multi-buffer captures. */
+    atomic_fetch_add_explicit(
+        &recorder->captured_chunks,
+        (unsigned long long)buffer_count,
+        memory_order_relaxed
+    );
+    atomic_fetch_add_explicit(
+        &recorder->captured_frames,
+        (unsigned long long)group_frame_count * (unsigned long long)buffer_count,
+        memory_order_relaxed
+    );
     return noErr;
 }

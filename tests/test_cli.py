@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 import catap.cli as cli
+from catap.bindings.device import AudioDevice, AudioDeviceStream
 from catap.bindings.process import AmbiguousAudioProcessError, AudioProcess
 from catap.cli import main
 
@@ -32,8 +35,10 @@ class _SuccessfulSession:
         self.tap_id = 42
         self.duration_seconds = 0.01
         self.captured_only_silence = False
+        self._capture_failure_event = threading.Event()
 
     def start(self) -> None:
+        self._capture_failure_event.clear()
         return None
 
     def stop(self) -> None:
@@ -41,6 +46,46 @@ class _SuccessfulSession:
 
     def close(self) -> None:
         return None
+
+    def wait_for_capture_failure(self, timeout: float | None = None) -> bool:
+        return self._capture_failure_event.wait(timeout)
+
+
+def test_capture_wait_skips_waiter_when_stop_was_already_requested() -> None:
+    class _UnexpectedWaiter:
+        def wait_for_capture_failure(self, timeout: float | None = None) -> bool:
+            del timeout
+            raise AssertionError("failure waiter should not be called")
+
+    stop_event = threading.Event()
+    stop_event.set()
+
+    cli._wait_for_stop_or_capture_failure(_UnexpectedWaiter(), stop_event, None)
+
+
+def test_capture_wait_preserves_monotonic_duration_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = 0.0
+    timeouts: list[float] = []
+
+    class _AdvancingWaiter:
+        def wait_for_capture_failure(self, timeout: float | None = None) -> bool:
+            nonlocal clock
+            assert timeout is not None
+            timeouts.append(timeout)
+            clock += timeout
+            return False
+
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock)
+
+    cli._wait_for_stop_or_capture_failure(
+        _AdvancingWaiter(),
+        threading.Event(),
+        0.25,
+    )
+
+    assert timeouts == pytest.approx([0.1, 0.1, 0.05])
 
 
 def test_list_apps_filters_idle_processes_by_default(
@@ -140,17 +185,15 @@ def test_record_output_path_must_not_be_empty(
     assert "Traceback" not in captured.err
 
 
-def test_record_requires_app_name_when_not_recording_system_audio(
+def test_record_requires_a_target(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     exit_code = main(["record"])
     captured = capsys.readouterr()
 
     assert exit_code == 2
-    assert (
-        "APP_NAME, --pid, or --audio-object-id is required unless --system is set"
-        in captured.err
-    )
+    assert "a target is required" in captured.err
+    assert "--bundle-id" in captured.err
 
 
 def test_record_does_not_report_output_error_as_permissions_issue(
@@ -173,7 +216,8 @@ def test_record_does_not_report_output_error_as_permissions_issue(
 
     _set_cli_symbols(
         monkeypatch,
-        _build_app_tap=lambda app_name, mute: fake_tap,
+        _resolve_record_processes=lambda names, pids, audio_ids: [object()],
+        _build_processes_tap=lambda processes, **kwargs: fake_tap,
         RecordingSession=_FakeSession,
     )
 
@@ -204,7 +248,8 @@ def test_record_reports_core_audio_oserror_with_permission_hint(
 
     _set_cli_symbols(
         monkeypatch,
-        _build_app_tap=lambda app_name, mute: fake_tap,
+        _resolve_record_processes=lambda names, pids, audio_ids: [object()],
+        _build_processes_tap=lambda processes, **kwargs: fake_tap,
         RecordingSession=_FakeSession,
     )
 
@@ -236,7 +281,8 @@ def test_record_reports_runtime_error_during_start_without_hint_or_traceback(
 
     _set_cli_symbols(
         monkeypatch,
-        _build_app_tap=lambda app_name, mute: fake_tap,
+        _resolve_record_processes=lambda names, pids, audio_ids: [object()],
+        _build_processes_tap=lambda processes, **kwargs: fake_tap,
         RecordingSession=_FakeSession,
     )
 
@@ -248,6 +294,31 @@ def test_record_reports_runtime_error_during_start_without_hint_or_traceback(
     assert "cleanup also failed" not in captured.err
     assert "Screen & System Audio Recording" not in captured.err
     assert "output file problem" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_record_reports_unsupported_format_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _UnsupportedFormatSession(_SuccessfulSession):
+        def start(self) -> None:
+            raise cli.UnsupportedTapFormatError(
+                "Unsupported tap layout: non-interleaved audio"
+            )
+
+    _set_cli_symbols(
+        monkeypatch,
+        _resolve_record_processes=lambda names, pids, audio_ids: [object()],
+        _build_processes_tap=lambda processes, **kwargs: object(),
+        RecordingSession=_UnsupportedFormatSession,
+    )
+
+    exit_code = main(["record", "Music"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Error starting recording: Unsupported tap layout" in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -266,7 +337,8 @@ def test_record_reports_runtime_error_during_stop_without_traceback(
 
     _set_cli_symbols(
         monkeypatch,
-        _build_app_tap=lambda app_name, mute: fake_tap,
+        _resolve_record_processes=lambda names, pids, audio_ids: [object()],
+        _build_processes_tap=lambda processes, **kwargs: fake_tap,
         RecordingSession=_FakeSession,
     )
 
@@ -276,6 +348,33 @@ def test_record_reports_runtime_error_during_stop_without_traceback(
     assert exit_code == 1
     assert "Recording error: dropped native audio buffers" in captured.err
     assert "cleanup also failed" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_record_live_failure_wakes_indefinite_wait_and_uses_stop_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _FailedSession(_SuccessfulSession):
+        def wait_for_capture_failure(self, timeout: float | None = None) -> bool:
+            del timeout
+            return True
+
+        def stop(self) -> None:
+            raise RuntimeError("tap disappeared")
+
+    _set_cli_symbols(
+        monkeypatch,
+        _resolve_record_processes=lambda names, pids, audio_ids: [object()],
+        _build_processes_tap=lambda processes, **kwargs: object(),
+        RecordingSession=_FailedSession,
+    )
+
+    exit_code = main(["record", "Music"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Recording error: tap disappeared" in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -291,7 +390,8 @@ def test_record_suppresses_runtime_error_from_final_close(
 
     _set_cli_symbols(
         monkeypatch,
-        _build_app_tap=lambda app_name, mute: fake_tap,
+        _resolve_record_processes=lambda names, pids, audio_ids: [object()],
+        _build_processes_tap=lambda processes, **kwargs: fake_tap,
         RecordingSession=_FakeSession,
     )
 
@@ -335,15 +435,21 @@ def test_record_can_target_process_by_pid(
     process = AudioProcess(11, 111, "com.example.tone", "Tone", True)
     seen: dict[str, object] = {}
 
-    def _build_tap(process_arg: AudioProcess, *, mute: bool = False) -> object:
-        seen["process"] = process_arg
+    def _build_tap(
+        processes_arg: list[AudioProcess],
+        *,
+        mute: object = False,
+        mono: bool = False,
+        visible: bool = False,
+    ) -> object:
+        seen["processes"] = tuple(processes_arg)
         seen["mute"] = mute
         return fake_tap
 
     _set_cli_symbols(
         monkeypatch,
         list_audio_processes=lambda: [process],
-        build_process_tap_description=_build_tap,
+        build_processes_tap_description=_build_tap,
         RecordingSession=_SuccessfulSession,
     )
 
@@ -353,7 +459,7 @@ def test_record_can_target_process_by_pid(
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert seen == {"process": process, "mute": True}
+    assert seen == {"processes": (process,), "mute": cli.TapMuteBehavior.MUTED}
     assert "Recording from: Tone (PID: 111, Audio ID: 11)" in captured.out
 
 
@@ -365,15 +471,21 @@ def test_record_can_target_process_by_audio_object_id(
     process = AudioProcess(11, 111, "com.example.tone", "Tone", True)
     seen: dict[str, object] = {}
 
-    def _build_tap(process_arg: AudioProcess, *, mute: bool = False) -> object:
-        seen["process"] = process_arg
+    def _build_tap(
+        processes_arg: list[AudioProcess],
+        *,
+        mute: object = False,
+        mono: bool = False,
+        visible: bool = False,
+    ) -> object:
+        seen["processes"] = tuple(processes_arg)
         seen["mute"] = mute
         return fake_tap
 
     _set_cli_symbols(
         monkeypatch,
         list_audio_processes=lambda: [process],
-        build_process_tap_description=_build_tap,
+        build_processes_tap_description=_build_tap,
         RecordingSession=_SuccessfulSession,
     )
 
@@ -391,7 +503,10 @@ def test_record_can_target_process_by_audio_object_id(
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert seen == {"process": process, "mute": False}
+    assert seen == {
+        "processes": (process,),
+        "mute": cli.TapMuteBehavior.UNMUTED,
+    }
     assert "Recording from: Tone (PID: 111, Audio ID: 11)" in captured.out
 
 
@@ -409,7 +524,7 @@ def test_record_warns_when_capture_contains_only_silence(
     _set_cli_symbols(
         monkeypatch,
         list_audio_processes=lambda: [process],
-        build_process_tap_description=lambda process_arg, mute=False: object(),
+        build_processes_tap_description=lambda processes_arg, **kwargs: object(),
         RecordingSession=_SilentSession,
     )
 
@@ -430,7 +545,7 @@ def test_record_does_not_warn_when_capture_has_audio(
     _set_cli_symbols(
         monkeypatch,
         list_audio_processes=lambda: [process],
-        build_process_tap_description=lambda process_arg, mute=False: object(),
+        build_processes_tap_description=lambda processes_arg, **kwargs: object(),
         RecordingSession=_SuccessfulSession,
     )
 
@@ -450,7 +565,12 @@ def test_system_record_can_exclude_by_pid_and_audio_object_id(
     tone = AudioProcess(12, 222, None, "Unknown", True)
     seen: dict[str, object] = {}
 
-    def _build_system_tap(excluded: list[AudioProcess]) -> object:
+    def _build_system_tap(
+        excluded: list[AudioProcess],
+        *,
+        mono: bool = False,
+        visible: bool = False,
+    ) -> object:
         seen["excluded"] = tuple(excluded)
         return fake_tap
 
@@ -483,14 +603,42 @@ def test_system_record_can_exclude_by_pid_and_audio_object_id(
     assert "Excluding: Unknown (PID: 222, Audio ID: 12)" in captured.out
 
 
-def test_record_rejects_multiple_process_selectors(
+def test_record_combines_process_selectors_into_one_tap(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    exit_code = main(["record", "Music", "--pid", "111"])
+    fake_tap = object()
+    music = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    tone = AudioProcess(12, 222, "com.example.tone", "Tone", True)
+    seen: dict[str, object] = {}
+
+    def _build_tap(
+        processes_arg: list[AudioProcess],
+        *,
+        mute: object = False,
+        mono: bool = False,
+        visible: bool = False,
+    ) -> object:
+        seen["processes"] = tuple(processes_arg)
+        return fake_tap
+
+    _set_cli_symbols(
+        monkeypatch,
+        find_process_by_name=lambda name: music if name == "Music" else None,
+        list_audio_processes=lambda: [music, tone],
+        build_processes_tap_description=_build_tap,
+        RecordingSession=_SuccessfulSession,
+    )
+
+    exit_code = main(
+        ["record", "Music", "--pid", "222", "-d", "0.001", "-o", "mix.wav"]
+    )
     captured = capsys.readouterr()
 
-    assert exit_code == 2
-    assert "choose only one of APP_NAME, --pid, or --audio-object-id" in captured.err
+    assert exit_code == 0
+    assert seen == {"processes": (music, tone)}
+    assert "Recording from: Music (PID: 111, Audio ID: 11)" in captured.out
+    assert "Recording from: Tone (PID: 222, Audio ID: 12)" in captured.out
 
 
 def test_record_rejects_process_selectors_with_system(
@@ -500,4 +648,273 @@ def test_record_rejects_process_selectors_with_system(
     captured = capsys.readouterr()
 
     assert exit_code == 2
-    assert "--pid and --audio-object-id cannot be used with --system" in captured.err
+    assert "choose one target kind" in captured.err
+
+
+def test_record_rejects_both_mute_modes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record", "Music", "--mute", "--mute-when-tapped"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "--mute and --mute-when-tapped are mutually exclusive" in captured.err
+
+
+def test_record_rejects_tap_creation_options_with_tap(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record", "--tap", "some-uid", "--mute"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "records an existing tap" in captured.err
+
+
+def test_record_rejects_mono_with_device(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record", "--device", "Speakers", "--mono"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "--mono cannot be used with --device" in captured.err
+
+
+def test_record_rejects_no_restore_without_bundle_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record", "Music", "--no-restore"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "--no-restore requires --bundle-id" in captured.err
+
+
+def test_record_rejects_stream_without_device(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record", "Music", "--stream", "0"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "--stream requires --device" in captured.err
+
+
+def test_record_multitrack_requires_a_target(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record-multitrack"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "APP_NAME, --pid, or --audio-object-id is required" in captured.err
+
+
+def test_record_multitrack_rejects_both_mute_modes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        ["record-multitrack", "Music", "Zoom", "--mute", "--mute-when-tapped"]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "--mute and --mute-when-tapped are mutually exclusive" in captured.err
+
+
+def test_record_multitrack_rejects_single_app_without_mic(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    process = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    _set_cli_symbols(
+        monkeypatch,
+        _resolve_record_processes=lambda names, pids, audio_ids: [process],
+    )
+
+    exit_code = main(["record-multitrack", "Music"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "needs at least two tracks" in captured.err
+    assert "'catap record'" in captured.err
+
+
+def test_record_multitrack_output_directory_must_not_be_empty(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["record-multitrack", "Music", "Zoom", "--output-dir", ""])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "output path must not be empty" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_record_multitrack_reports_unsupported_format_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    music = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    zoom = AudioProcess(12, 222, "us.zoom.xos", "Zoom", True)
+
+    class _UnsupportedFormatSession:
+        track_labels = ("Music", "Zoom")
+        output_paths = ("Music.wav", "Zoom.wav")
+
+        def start(self) -> None:
+            raise cli.UnsupportedTapFormatError("Unsupported tap channel count: 0")
+
+        def close(self) -> None:
+            return None
+
+    _set_cli_symbols(
+        monkeypatch,
+        _resolve_record_processes=lambda names, pids, audio_ids: [music, zoom],
+        record_multitrack=lambda *args, **kwargs: _UnsupportedFormatSession(),
+    )
+
+    exit_code = main(["record-multitrack", "Music", "Zoom"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Error starting recording: Unsupported tap channel count" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_record_multitrack_live_failure_wakes_indefinite_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    music = AudioProcess(11, 111, "com.apple.Music", "Music", True)
+    zoom = AudioProcess(12, 222, "us.zoom.xos", "Zoom", True)
+
+    class _FailedSession:
+        track_labels = ("Music", "Zoom")
+        output_paths = ("Music.wav", "Zoom.wav")
+
+        def start(self) -> None:
+            return None
+
+        def wait_for_capture_failure(self, timeout: float | None = None) -> bool:
+            del timeout
+            return True
+
+        def stop(self) -> None:
+            raise RuntimeError("track worker failed")
+
+        def close(self) -> None:
+            return None
+
+    _set_cli_symbols(
+        monkeypatch,
+        _resolve_record_processes=lambda names, pids, audio_ids: [music, zoom],
+        record_multitrack=lambda *args, **kwargs: _FailedSession(),
+    )
+
+    exit_code = main(["record-multitrack", "Music", "Zoom"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Recording error: track worker failed" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_list_taps_reports_when_no_taps_are_visible(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_cli_symbols(monkeypatch, list_audio_taps=lambda: [])
+
+    exit_code = main(["list-taps"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "No visible audio taps." in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("exclusive", "expected"),
+    [(False, "1 bundle ID"), (True, "global -1 bundle ID")],
+    ids=["inclusive", "exclusive"],
+)
+def test_list_taps_reports_bundle_id_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exclusive: bool,
+    expected: str,
+) -> None:
+    description = SimpleNamespace(
+        bundle_ids=["com.apple.Music"],
+        is_exclusive=exclusive,
+        processes=[],
+        mute_behavior=cli.TapMuteBehavior.UNMUTED,
+    )
+    tap = SimpleNamespace(
+        description=description,
+        device_uid=None,
+        stream=None,
+        name="Music bundle tap",
+        uid="tap-uid",
+        is_private=False,
+    )
+    _set_cli_symbols(monkeypatch, list_audio_taps=lambda: [tap])
+
+    exit_code = main(["list-taps"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert expected in captured.out
+    assert "0 process(es)" not in captured.out
+
+
+def test_list_devices_prints_device_and_stream_details(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = AudioDeviceStream(
+        audio_object_id=71,
+        device_uid="BuiltInSpeakerDevice",
+        device_name="MacBook Pro Speakers",
+        stream_index=0,
+        direction="output",
+        name="Speaker Stream",
+        num_channels=2,
+        sample_rate=48_000.0,
+        bits_per_channel=32,
+        is_float=True,
+        format_id=0,
+    )
+    device = AudioDevice(
+        audio_object_id=70,
+        uid="BuiltInSpeakerDevice",
+        name="MacBook Pro Speakers",
+        manufacturer="Apple",
+        streams=(stream,),
+        is_default_input=False,
+        is_default_output=True,
+        is_default_system_output=False,
+    )
+    _set_cli_symbols(monkeypatch, list_audio_devices=lambda: [device])
+
+    exit_code = main(["list-devices"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "MacBook Pro Speakers (default output)" in captured.out
+    assert "UID: BuiltInSpeakerDevice" in captured.out
+    assert "[output 0] 2ch 48000 Hz float32" in captured.out
+
+
+def test_record_rejects_bundle_id_with_device(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        ["record", "--device", "Speakers", "--bundle-id", "com.apple.Music"]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "--bundle-id cannot be used with --device" in captured.err

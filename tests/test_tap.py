@@ -7,6 +7,14 @@ from typing import Any
 import pytest
 
 import catap.bindings.tap as tap_module
+from catap.bindings._audiotoolbox import (
+    AudioStreamBasicDescription,
+    kAudioFormatFlagIsFloat,
+    kAudioFormatFlagIsNonInterleaved,
+    kAudioFormatFlagIsPacked,
+    kAudioFormatFlagIsSignedInteger,
+    kAudioFormatLinearPCM,
+)
 from catap.bindings.tap_description import TapMuteBehavior
 
 
@@ -198,6 +206,200 @@ def test_get_tap_description_raises_audio_tap_not_found_for_bad_object(
         match="Audio tap 77 is no longer available",
     ):
         tap_module.get_tap_description(77)
+
+
+def test_get_tap_format_maps_interleaved_float_stream_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asbd = AudioStreamBasicDescription()
+    asbd.mSampleRate = 48_000.0
+    asbd.mFormatID = kAudioFormatLinearPCM
+    asbd.mChannelsPerFrame = 2
+    asbd.mBitsPerChannel = 32
+    asbd.mBytesPerFrame = 8
+    asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+
+    def _get_struct(object_id: int, selector: int, struct_type: type) -> Any:
+        assert object_id == 321
+        assert selector == tap_module.kAudioTapPropertyFormat
+        assert struct_type is AudioStreamBasicDescription
+        return asbd
+
+    monkeypatch.setattr(
+        tap_module, "_get_audio_object_struct_property", _get_struct
+    )
+
+    stream_format = tap_module.get_tap_format(321)
+
+    assert stream_format == tap_module.TapStreamFormat(
+        sample_rate=48_000.0,
+        num_channels=2,
+        bits_per_sample=32,
+        bytes_per_frame=8,
+        is_float=True,
+        is_signed_integer=False,
+        is_interleaved=True,
+        is_packed=True,
+        is_big_endian=False,
+        format_id="lpcm",
+    )
+
+
+def test_get_tap_format_reports_non_interleaved_integer_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asbd = AudioStreamBasicDescription()
+    asbd.mSampleRate = 44_100.0
+    asbd.mFormatID = kAudioFormatLinearPCM
+    asbd.mChannelsPerFrame = 1
+    asbd.mBitsPerChannel = 16
+    asbd.mBytesPerFrame = 2
+    asbd.mFormatFlags = (
+        kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsNonInterleaved
+    )
+
+    monkeypatch.setattr(
+        tap_module,
+        "_get_audio_object_struct_property",
+        lambda object_id, selector, struct_type: asbd,
+    )
+
+    stream_format = tap_module.get_tap_format(321)
+
+    assert stream_format.is_float is False
+    assert stream_format.is_signed_integer is True
+    assert stream_format.is_interleaved is False
+    assert stream_format.is_packed is False
+    assert stream_format.format_id == "lpcm"
+
+
+def test_get_tap_format_raises_audio_tap_not_found_for_bad_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_error = OSError("bad object")
+    stale_error.status = tap_module.kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        tap_module,
+        "_get_audio_object_struct_property",
+        lambda object_id, selector, struct_type: (_ for _ in ()).throw(
+            stale_error
+        ),
+    )
+
+    with pytest.raises(
+        tap_module.AudioTapNotFoundError,
+        match="Audio tap 77 is no longer available",
+    ):
+        tap_module.get_tap_format(77)
+
+
+def test_set_tap_description_translates_permissions_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    denied_error = OSError("set refused")
+    denied_error.status = tap_module.kAudioDevicePermissionsError  # type: ignore[attr-defined]
+    seen: list[tuple[int, int, Any]] = []
+
+    def _set_objc_property(object_id: int, selector: int, value: Any) -> None:
+        seen.append((object_id, selector, value))
+        raise denied_error
+
+    monkeypatch.setattr(
+        tap_module, "_set_audio_object_objc_property", _set_objc_property
+    )
+    description = tap_module.TapDescription._from_objc_description(
+        _FakeTapDescriptionObjC("retargeted")
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="System Audio Recording permission",
+    ):
+        tap_module.set_tap_description(88, description)
+
+    assert seen == [
+        (88, tap_module.kAudioTapPropertyDescription, description.objc_object)
+    ]
+
+
+def test_set_tap_description_raises_audio_tap_not_found_for_bad_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_error = OSError("bad object")
+    stale_error.status = tap_module.kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        tap_module,
+        "_set_audio_object_objc_property",
+        lambda object_id, selector, value: (_ for _ in ()).throw(stale_error),
+    )
+    description = tap_module.TapDescription._from_objc_description(
+        _FakeTapDescriptionObjC("retargeted")
+    )
+
+    with pytest.raises(
+        tap_module.AudioTapNotFoundError,
+        match="Audio tap 88 is no longer available",
+    ):
+        tap_module.set_tap_description(88, description)
+
+
+def test_find_tap_by_uid_uses_translation_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    description = _FakeTapDescriptionObjC("Fast tap")
+
+    def _translate(object_id: int, selector: int, qualifier: Any) -> int:
+        assert object_id == tap_module.kAudioObjectSystemObject
+        assert selector == tap_module.kAudioHardwarePropertyTranslateUIDToTap
+        assert qualifier.value
+        return 314
+
+    def _unexpected_listing() -> list[tap_module.AudioTap]:
+        raise AssertionError("translation fast path should not list every tap")
+
+    monkeypatch.setattr(tap_module, "_translate_qualifier", _translate)
+    monkeypatch.setattr(
+        tap_module,
+        "_get_audio_object_cfstring_property",
+        lambda object_id, selector: "tap-fast" if object_id == 314 else None,
+    )
+    monkeypatch.setattr(
+        tap_module,
+        "_get_audio_object_objc_property",
+        lambda object_id, selector: description,
+    )
+    monkeypatch.setattr(tap_module, "list_audio_taps", _unexpected_listing)
+
+    tap = tap_module.find_tap_by_uid("tap-fast")
+
+    assert tap is not None
+    assert tap.audio_object_id == 314
+    assert tap.uid == "tap-fast"
+    assert tap.name == "Fast tap"
+
+
+def test_find_tap_by_uid_falls_back_to_listing_when_translation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_tap = tap_module.AudioTap(
+        200,
+        "tap-fallback",
+        tap_module.TapDescription._from_objc_description(
+            _FakeTapDescriptionObjC("Fallback tap")
+        ),
+    )
+    translate_error = OSError("translation unsupported")
+
+    monkeypatch.setattr(
+        tap_module,
+        "_translate_qualifier",
+        lambda object_id, selector, qualifier: (_ for _ in ()).throw(
+            translate_error
+        ),
+    )
+    monkeypatch.setattr(tap_module, "list_audio_taps", lambda: [fallback_tap])
+
+    assert tap_module.find_tap_by_uid("tap-fallback") is fallback_tap
 
 
 def test_get_tap_description_raises_audio_tap_not_found_for_unknown_property(

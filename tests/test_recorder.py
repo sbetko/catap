@@ -29,6 +29,8 @@ from catap.bindings._audiotoolbox import (
     kAudioFormatLinearPCM,
 )
 from catap.bindings.tap import AudioTapNotFoundError
+from catap.drift import DriftCompensationQuality
+from catap.events import AudioPropertyEvent, kAudioTapPropertyFormat
 from catap.recorder import AudioRecorder, UnsupportedTapFormatError
 
 
@@ -49,6 +51,7 @@ def _make_worker(
     record_accepted_frames: Callable[[int], None] | None = None,
     record_dropped_frames: Callable[[int], None] | None = None,
     consume_dropped_stats: Callable[[], tuple[int, int]] | None = None,
+    capture_failure_event: threading.Event | None = None,
 ) -> worker_module._AudioWorker:
     return worker_module._AudioWorker(
         record_accepted_frames=(
@@ -64,6 +67,7 @@ def _make_worker(
         consume_dropped_stats=(
             (lambda: (0, 0)) if consume_dropped_stats is None else consume_dropped_stats
         ),
+        capture_failure_event=capture_failure_event,
     )
 
 
@@ -283,6 +287,53 @@ def test_recorder_rejects_non_positive_max_pending_buffers() -> None:
 def test_recorder_rejects_non_integer_max_pending_buffers(value: object) -> None:
     with pytest.raises(TypeError, match="max_pending_buffers must be an integer"):
         AudioRecorder(123, "recording.wav", max_pending_buffers=cast(Any, value))
+
+
+def test_recorder_threads_drift_quality_to_capture_engine() -> None:
+    class _QualityCaptureEngine:
+        failed_capture_session = None
+
+        def __init__(self) -> None:
+            self.quality: DriftCompensationQuality | None = None
+
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+        ) -> capture_module._TapStreamFormat:
+            del tap_id
+            return capture_module._TapStreamFormat(
+                48_000.0,
+                2,
+                32,
+                True,
+                bytes_per_frame=8,
+                is_signed_integer=False,
+            )
+
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+            *,
+            drift_compensation_quality: DriftCompensationQuality | None = None,
+        ) -> capture_module._TapCaptureSession:
+            del tap_id, callback, client_data
+            self.quality = drift_compensation_quality
+            raise OSError("stop after observing quality")
+
+    engine = _QualityCaptureEngine()
+    recorder = AudioRecorder(
+        123,
+        on_buffer=lambda buffer: None,
+        drift_compensation_quality=DriftCompensationQuality.MEDIUM,
+    )
+    recorder._capture_engine = cast(Any, engine)
+
+    with pytest.raises(OSError, match="stop after observing quality"):
+        recorder.start()
+
+    assert engine.quality is DriftCompensationQuality.MEDIUM
 
 
 def test_format_id_to_fourcc_decodes_core_audio_format_ids() -> None:
@@ -640,9 +691,69 @@ def test_worker_stop_retains_state_until_interrupted_discard_succeeds(
     assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
 
 
+def test_worker_cleanup_rejection_cannot_publish_on_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "recording.wav"
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=output_path))
+    assert worker.enqueue_audio_bytes(b"\x00\x01", 1)
+    real_discard = worker._discard_temporary_output
+    monkeypatch.setattr(
+        worker,
+        "_discard_temporary_output",
+        lambda state: OSError("temporary unlink failed"),
+    )
+
+    with pytest.raises(OSError, match="temporary unlink failed"):
+        worker.stop(publish=False)
+
+    assert worker.capture_is_invalid
+    assert worker.needs_cleanup
+    assert not output_path.exists()
+
+    monkeypatch.setattr(worker, "_discard_temporary_output", real_discard)
+    worker.stop()
+
+    assert not output_path.exists()
+    assert worker.needs_cleanup is False
+
+
+def test_worker_drop_rejection_cannot_publish_on_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "recording.wav"
+    dropped_stats = [(1, 2), (0, 0)]
+    worker = _make_worker(consume_dropped_stats=lambda: dropped_stats.pop(0))
+    worker.start(_make_worker_config(output_path=output_path))
+    assert worker.enqueue_audio_bytes(b"\x00\x01", 1)
+    real_discard = worker._discard_temporary_output
+    monkeypatch.setattr(
+        worker,
+        "_discard_temporary_output",
+        lambda state: OSError("temporary unlink failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="Dropped 1 audio buffer"):
+        worker.stop()
+
+    assert worker.capture_is_invalid
+    assert worker.needs_cleanup
+    assert not output_path.exists()
+
+    monkeypatch.setattr(worker, "_discard_temporary_output", real_discard)
+    worker.stop()
+
+    assert not output_path.exists()
+    assert worker.needs_cleanup is False
+
+
 def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
     callback_started = threading.Event()
     allow_callback_to_finish = threading.Event()
+    capture_failure = threading.Event()
     dropped_frames: list[int] = []
 
     def on_buffer(buffer: PublicAudioBuffer) -> None:
@@ -653,6 +764,7 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
     worker = _make_worker(
         record_dropped_frames=dropped_frames.append,
         consume_dropped_stats=lambda: (len(dropped_frames), sum(dropped_frames)),
+        capture_failure_event=capture_failure,
     )
     config = _make_worker_config(on_buffer=on_buffer, max_pending_buffers=1)
     worker.start(config)
@@ -660,6 +772,7 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
     assert worker.enqueue_audio_bytes(b"\x00\x01", 1)
     assert callback_started.wait(timeout=1)
     assert not worker.enqueue_audio_bytes(b"\x02\x03", 2)
+    assert capture_failure.is_set()
 
     allow_callback_to_finish.set()
 
@@ -668,6 +781,79 @@ def test_stop_reports_dropped_audio_when_worker_queue_overflows() -> None:
 
     assert "2 frame(s)" in str(exc_info.value)
     assert config.max_pending_buffers == 1
+
+
+def test_drain_and_finalize_publish_writes_wav(tmp_path) -> None:
+    output_path = tmp_path / "recording.wav"
+    worker = _make_worker()
+    worker.start(
+        _make_worker_config(
+            output_path=output_path,
+            sample_rate=44_100,
+            num_channels=1,
+            bits_per_sample=16,
+        )
+    )
+    data = struct.pack("<3h", 100, -200, 300)
+    assert worker.enqueue_audio_bytes(data, 3) is True
+
+    assert worker.drain_and_collect() == []
+    assert worker.thread is None
+    assert worker.needs_cleanup is True
+
+    worker.finalize(publish=True)
+
+    assert worker.needs_cleanup is False
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+    with wave.open(str(output_path), "rb") as wav_file:
+        samples = struct.unpack("<3h", wav_file.readframes(3))
+    assert samples == (100, -200, 300)
+
+
+def test_finalize_discard_removes_temporary_output(tmp_path) -> None:
+    output_path = tmp_path / "recording.wav"
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=output_path))
+    assert worker.enqueue_audio_bytes(b"\x00\x01\x02\x03", 1) is True
+
+    assert worker.drain_and_collect() == []
+    worker.finalize(publish=False)
+
+    assert worker.needs_cleanup is False
+    assert not output_path.exists()
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_drain_and_collect_reports_dropped_buffers(tmp_path) -> None:
+    worker = _make_worker(consume_dropped_stats=lambda: (2, 5))
+    worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    errors = worker.drain_and_collect()
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "Dropped 2 audio buffer(s)" in str(errors[0])
+    assert "5 frame(s)" in str(errors[0])
+
+    worker.finalize(publish=False)
+    assert worker.needs_cleanup is False
+    assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
+
+
+def test_finalize_before_drain_rejects_live_worker(tmp_path) -> None:
+    worker = _make_worker()
+    worker.start(_make_worker_config(output_path=tmp_path / "recording.wav"))
+
+    with pytest.raises(
+        RuntimeError,
+        match="must be drained before finalizing",
+    ):
+        worker.finalize(publish=True)
+
+    assert worker.needs_cleanup is True
+    assert worker.drain_and_collect() == []
+    worker.finalize(publish=False)
+    assert worker.needs_cleanup is False
 
 
 def test_stop_reports_core_audio_cleanup_failures(
@@ -719,6 +905,7 @@ def test_stop_reports_core_audio_cleanup_failures(
 
     assert calls == [
         "stop:55:77",
+        "stop:55:77",
         "destroy-io:55:77",
         "destroy-device:55",
         "stop:55:77",
@@ -760,9 +947,7 @@ def test_stop_releases_native_recorder_after_io_proc_destruction(
     monkeypatch.setattr(
         capture_module,
         "_destroy_aggregate_device",
-        lambda device_id: (_ for _ in ()).throw(
-            OSError("aggregate cleanup failed")
-        ),
+        lambda device_id: (_ for _ in ()).throw(OSError("aggregate cleanup failed")),
     )
     monkeypatch.setattr(
         recorder_module,
@@ -796,6 +981,9 @@ def test_stop_finishes_cleanup_after_capture_interrupt() -> None:
     interrupt = KeyboardInterrupt("capture cleanup interrupted")
 
     class _InterruptingCaptureEngine:
+        def stop(self, session: capture_module._TapCaptureSession) -> None:
+            session.started = False
+
         def close(self, session: capture_module._TapCaptureSession) -> None:
             session.started = False
             session.io_proc_destroyed = True
@@ -965,6 +1153,10 @@ def test_stop_retries_interrupted_native_retention_publication(
 
     class _InterruptingCaptureEngine:
         @staticmethod
+        def stop(session: capture_module._TapCaptureSession) -> None:
+            session.started = False
+
+        @staticmethod
         def close(session: capture_module._TapCaptureSession) -> None:
             session.started = False
 
@@ -1017,6 +1209,10 @@ def test_stop_finishes_lifetime_boundary_after_drain_check_interrupt(
     drain_stop_calls = 0
 
     class _ClosingCaptureEngine:
+        @staticmethod
+        def stop(session: capture_module._TapCaptureSession) -> None:
+            session.started = False
+
         @staticmethod
         def close(session: capture_module._TapCaptureSession) -> None:
             session.started = False
@@ -1141,8 +1337,24 @@ def test_native_drain_records_base_exception_and_signals_completion() -> None:
     )
 
     assert done_event.is_set()
+    assert recorder.capture_failed is True
     assert len(recorder._native_drain_failures) == 1
     assert isinstance(recorder._native_drain_failures[0].__cause__, SystemExit)
+
+
+def test_native_failure_counters_wake_capture_owner() -> None:
+    class _DroppedNativeRecorder(_InspectableNativeRecorder):
+        def stats(self) -> _FakeNativeRecorderStats:
+            return _FakeNativeRecorderStats(
+                ring=_FakeNativeRingStats(dropped_chunks=1, dropped_frames=32)
+            )
+
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+
+    recorder._poll_native_capture_failure(cast(Any, _DroppedNativeRecorder()))
+
+    assert recorder.capture_failed is True
+    assert recorder.wait_for_capture_failure(timeout=0) is True
 
 
 def test_native_drain_abort_skips_remaining_native_reads() -> None:
@@ -1176,6 +1388,7 @@ def test_failed_start_does_not_clobber_existing_output_file(
 
     monkeypatch.setattr(capture_module, "_get_tap_uid", lambda tap_id: "tap-uid")
     monkeypatch.setattr(capture_module, "_get_tap_format", _stub_tap_format)
+
     def _fail_create_aggregate(tap_uid: str, name: str, out: object = None) -> int:
         raise OSError("aggregate failed")
 
@@ -1304,8 +1517,7 @@ def test_failed_start_abandons_native_state_when_io_proc_cleanup_fails(
     assert native_recorder.abandoned is True
     assert abandoned_captures == [(capture_session, native_recorder)]
     assert any(
-        "Retained native recorder state" in note
-        for note in exc_info.value.__notes__
+        "Retained native recorder state" in note for note in exc_info.value.__notes__
     )
 
 
@@ -1402,8 +1614,15 @@ def test_start_cleans_capture_after_return_handoff_interrupt(
             tap_id: int,
             callback: object,
             client_data: object | None = None,
+            *,
+            drift_compensation_quality: DriftCompensationQuality | None = None,
         ) -> capture_module._TapCaptureSession:
-            super().open_tap_capture(tap_id, callback, client_data)
+            super().open_tap_capture(
+                tap_id,
+                callback,
+                client_data,
+                drift_compensation_quality=drift_compensation_quality,
+            )
             raise interrupt
 
     def _create_io_proc(
@@ -1547,8 +1766,7 @@ def test_start_uses_native_io_proc_when_dylib_is_available(
     native_recorder = created_recorders[0]
     assert native_recorder.slot_count == recorder.max_pending_buffers
     assert (
-        native_recorder.slot_capacity
-        == 8 * recorder_module._NATIVE_SLOT_FRAME_CAPACITY
+        native_recorder.slot_capacity == 8 * recorder_module._NATIVE_SLOT_FRAME_CAPACITY
     )
     assert native_recorder.expected_channel_count == 2
     assert native_recorder.bytes_per_frame == 8
@@ -1702,8 +1920,7 @@ def test_start_preserves_primary_when_lifecycle_publication_is_interrupted() -> 
     assert exc_info.value is primary
     assert lifecycle_lock.enter_calls == 3
     assert any(
-        "lifecycle publication interrupted" in note
-        for note in exc_info.value.__notes__
+        "lifecycle publication interrupted" in note for note in exc_info.value.__notes__
     )
     assert recorder.needs_cleanup is False
     assert recorder._lifecycle_state == "idle"
@@ -2037,8 +2254,7 @@ def test_worker_start_retries_interrupted_cleanup_sentinel(
     assert len(created_threads) == 1
     assert created_threads[0].is_alive() is False
     assert any(
-        "cleanup sentinel interrupted" in note
-        for note in exc_info.value.__notes__
+        "cleanup sentinel interrupted" in note for note in exc_info.value.__notes__
     )
     assert worker.thread is None
     assert list(tmp_path.glob(".recording.wav.*.tmp")) == []
@@ -2151,18 +2367,20 @@ def test_worker_records_keyboard_interrupt_from_converter_and_discards_output(
 
 def test_stop_preserves_callback_failure_cause() -> None:
     callback_seen = threading.Event()
+    capture_failure = threading.Event()
 
     def on_buffer(buffer: PublicAudioBuffer) -> None:
         del buffer
         callback_seen.set()
         raise ValueError("boom")
 
-    worker = _make_worker()
+    worker = _make_worker(capture_failure_event=capture_failure)
     config = _make_worker_config(on_buffer=on_buffer)
     worker.start(config)
 
     assert worker.enqueue_audio_bytes(b"\x01\x02", 1) is True
     assert callback_seen.wait(timeout=1)
+    assert capture_failure.is_set()
 
     with pytest.raises(
         RuntimeError,
@@ -2176,12 +2394,35 @@ def test_stop_preserves_callback_failure_cause() -> None:
     )
 
 
+def test_unexpected_worker_failure_wakes_owner_and_is_retained() -> None:
+    capture_failure = threading.Event()
+
+    def fail_accepted_frames(num_frames: int) -> None:
+        del num_frames
+        raise SystemExit("accepted-frame bookkeeping failed")
+
+    worker = _make_worker(
+        record_accepted_frames=fail_accepted_frames,
+        capture_failure_event=capture_failure,
+    )
+    worker.start(_make_worker_config(on_buffer=lambda buffer: None))
+
+    assert worker.enqueue_audio_bytes(b"\x01\x02", 1) is True
+    assert capture_failure.wait(timeout=1)
+
+    with pytest.raises(RuntimeError, match="Audio worker failed") as exc_info:
+        worker.stop()
+
+    assert isinstance(exc_info.value.__cause__, SystemExit)
+
+
 def test_stop_preserves_write_failure_cause(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output_path = tmp_path / "recording.wav"
-    worker = _make_worker()
+    capture_failure = threading.Event()
+    worker = _make_worker(capture_failure_event=capture_failure)
     config = _make_worker_config(
         output_path=output_path,
         sample_rate=48_000,
@@ -2201,6 +2442,7 @@ def test_stop_preserves_write_failure_cause(
 
     data = struct.pack("<4f", 0.5, -0.5, 1.0, -1.0)
     assert worker.enqueue_audio_bytes(data, 2) is True
+    assert capture_failure.wait(timeout=1)
 
     with pytest.raises(
         OSError,
@@ -2664,6 +2906,93 @@ class _StopCheckCaptureEngine(_LifecycleCaptureEngine):
         return self._stream_format(self.describe_calls)
 
 
+def test_live_tap_disappearance_wakes_owner_without_tearing_down() -> None:
+    class _VanishingCaptureEngine(_LifecycleCaptureEngine):
+        def __init__(self) -> None:
+            self.vanished = False
+
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+        ) -> capture_module._TapStreamFormat:
+            if self.vanished:
+                raise AudioTapNotFoundError(
+                    f"Audio tap {tap_id} is no longer available."
+                )
+            return super().describe_tap_stream(tap_id)
+
+    engine = _VanishingCaptureEngine()
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, engine)
+    recorder.start()
+
+    engine.vanished = True
+    recorder._on_drift_event(
+        AudioPropertyEvent(object_id=123, selector=kAudioTapPropertyFormat)
+    )
+
+    assert recorder.wait_for_capture_failure(timeout=0) is True
+    assert recorder.is_recording is True
+
+    with pytest.raises(RuntimeError, match="disappeared during capture"):
+        recorder.stop()
+    assert recorder.capture_failed is True
+
+
+def test_capture_failure_signal_resets_only_after_new_start_claim() -> None:
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, _LifecycleCaptureEngine())
+    recorder._capture_failure_event.set()
+    recorder._lifecycle_state = "starting"
+
+    with pytest.raises(RuntimeError, match="already starting or stopping"):
+        recorder.start()
+    assert recorder.capture_failed is True
+
+    recorder._lifecycle_state = "idle"
+    recorder.start()
+    assert recorder.capture_failed is False
+    assert recorder.wait_for_capture_failure(timeout=0) is False
+    recorder.stop()
+    assert recorder.capture_failed is False
+
+
+def test_composite_drift_watch_retains_only_children_needing_retry() -> None:
+    class _ChildWatch:
+        def __init__(self, failure: BaseException | None = None) -> None:
+            self.failure = failure
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.failure is not None:
+                failure = self.failure
+                self.failure = None
+                raise failure
+
+    already_closes = _ChildWatch()
+    interrupted = _ChildWatch(KeyboardInterrupt("listener close interrupted"))
+    later_closes = _ChildWatch()
+    composite = object.__new__(recorder_module._CompositeDriftWatch)
+    composite._watches = cast(
+        Any,
+        [already_closes, interrupted, later_closes],
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="listener close interrupted"):
+        composite.close()
+
+    assert already_closes.close_calls == 1
+    assert interrupted.close_calls == 1
+    assert later_closes.close_calls == 1
+    assert composite._watches == [interrupted]
+
+    composite.close()
+
+    assert interrupted.close_calls == 2
+    assert composite._watches == []
+
+
 def test_stop_fails_when_tap_format_drifts(tmp_path) -> None:
     class _DriftingCaptureEngine(_StopCheckCaptureEngine):
         def _stream_format(
@@ -2729,6 +3058,83 @@ def test_stop_publishes_when_tap_format_is_unchanged(tmp_path) -> None:
 
     assert engine.describe_calls == 2
     assert output_path.exists()
+
+
+def test_stop_quiesces_capture_before_final_drift_check(tmp_path) -> None:
+    class _StopBeforeCheckEngine(_StopCheckCaptureEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.capture_session: capture_module._TapCaptureSession | None = None
+
+        def open_tap_capture(
+            self,
+            tap_id: int,
+            callback: object,
+            client_data: object | None = None,
+        ) -> capture_module._TapCaptureSession:
+            session = super().open_tap_capture(tap_id, callback, client_data)
+            self.capture_session = session
+            return session
+
+        def describe_tap_stream(
+            self,
+            tap_id: int,
+        ) -> capture_module._TapStreamFormat:
+            if self.describe_calls:
+                assert self.capture_session is not None
+                assert self.capture_session.started is False
+            return super().describe_tap_stream(tap_id)
+
+    output_path = tmp_path / "recording.wav"
+    recorder = AudioRecorder(123, output_path)
+    engine = _StopBeforeCheckEngine()
+    recorder._capture_engine = cast(Any, engine)
+
+    recorder.start()
+    recorder.stop()
+
+    assert engine.describe_calls == 2
+    assert output_path.exists()
+
+
+def test_stop_retries_transient_drift_watch_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _RetryingDriftWatch:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise OSError("listener removal failed")
+
+    watch = _RetryingDriftWatch()
+    monkeypatch.setattr(
+        recorder_module,
+        "_CompositeDriftWatch",
+        lambda tap_ids, callback: watch,
+    )
+    output_path = tmp_path / "recording.wav"
+    recorder = AudioRecorder(123, output_path)
+    recorder._capture_engine = cast(Any, _LifecycleCaptureEngine())
+    recorder.start()
+
+    with pytest.raises(OSError, match="listener removal failed"):
+        recorder.stop()
+
+    assert watch.close_calls == 1
+    assert recorder._drift_watch is watch
+    assert recorder.needs_cleanup is True
+    assert output_path.exists() is False
+
+    recorder.stop()
+
+    assert watch.close_calls == 2
+    assert recorder._drift_watch is None
+    assert recorder.needs_cleanup is False
+    assert output_path.exists() is False
 
 
 def test_needs_cleanup_is_false_while_recording() -> None:

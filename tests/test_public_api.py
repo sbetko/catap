@@ -27,6 +27,7 @@ def test_module_has_expected_exports() -> None:
     assert "AudioTap" in module.__all__
     assert "AudioTapNotFoundError" in module.__all__
     assert "AudioRecorder" in module.__all__
+    assert "DriftCompensationQuality" in module.__all__
     assert "UnsupportedTapFormatError" in module.__all__
     assert "RecordingSession" in module.__all__
     assert "list_audio_devices" in module.__all__
@@ -45,6 +46,7 @@ def test_public_exports_reference_expected_symbols() -> None:
     device_module = importlib.import_module("catap.bindings.device")
     recorder_module = importlib.import_module("catap.recorder")
     audio_buffer_module = importlib.import_module("catap.audio_buffer")
+    drift_module = importlib.import_module("catap.drift")
     tap_module = importlib.import_module("catap.bindings.tap_description")
     visible_tap_module = importlib.import_module("catap.bindings.tap")
     process_module = importlib.import_module("catap.bindings.process")
@@ -57,6 +59,7 @@ def test_public_exports_reference_expected_symbols() -> None:
     assert module.AudioBuffer is audio_buffer_module.AudioBuffer
     assert module.AudioStreamFormat is audio_buffer_module.AudioStreamFormat
     assert module.AudioRecorder is recorder_module.AudioRecorder
+    assert module.DriftCompensationQuality is drift_module.DriftCompensationQuality
     assert module.UnsupportedTapFormatError is recorder_module.UnsupportedTapFormatError
     assert module.TapDescription is tap_module.TapDescription
     assert module.TapMuteBehavior is tap_module.TapMuteBehavior

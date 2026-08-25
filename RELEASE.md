@@ -1,17 +1,9 @@
 # Release Checklist
 
-## One-time setup
-
-1. Make the repository public, or update the project URLs in [`pyproject.toml`](./pyproject.toml) so PyPI will not point users at a private repo.
-2. Register Trusted Publishers for `catap`:
-   - On [PyPI](https://pypi.org/manage/account/publishing/): workflow `publish.yml`, environment `pypi`, owner `sbetko`, repo `catap`.
-   - On [TestPyPI](https://test.pypi.org/manage/account/publishing/): workflow `publish-test.yml`, environment `testpypi`, owner `sbetko`, repo `catap`.
-3. In GitHub, create the `pypi` and `testpypi` environments and grant approval rules as needed.
-4. Ensure both workflows (`.github/workflows/publish.yml` and `.github/workflows/publish-test.yml`) are enabled.
-
 ## For each release
 
-1. Update version in [`pyproject.toml`](./pyproject.toml).
+1. Update `project.version` in [`pyproject.toml`](./pyproject.toml), then run
+   `uv lock`.
 2. Add release notes in [`CHANGELOG.md`](./CHANGELOG.md).
 3. Run quality gates locally:
 
@@ -24,28 +16,28 @@ uv run --group dev python -m build
 uv run --group dev twine check dist/*
 ```
 
-If the current Mac has already granted system-audio permission to your
-terminal app, also run the opt-in integration smoke tests, including the
-audible known-tone gate. The tone test plays a short 1 kHz tone through the
-default output device and fails unless the capture actually contains it, so
-run it with output audible (not muted):
+Run the permissioned integration tests on macOS 26. Grant System Audio
+Recording, Microphone, and Automation access to the test runner. Close
+QuickTime Player, keep the default output audible, and pause other audio.
 
 ```bash
 CATAP_RUN_INTEGRATION=1 CATAP_RUN_TONE_INTEGRATION=1 \
   uv run --group dev pytest -m integration
 ```
 
-The tone gate is required before every release; hosted CI cannot run it
-because macOS system-audio permission cannot be granted headlessly.
+Require no skips. The suite plays audible tones, controls QuickTime Player,
+and records the default microphone. Hosted CI cannot run this gate.
 
 4. Commit and tag:
 
 ```bash
+git add pyproject.toml uv.lock CHANGELOG.md
+git commit -m "chore: release X.Y.Z"
 git tag vX.Y.Z
-git push origin main --tags
+git push origin main vX.Y.Z
 ```
 
-5. Dry-run on TestPyPI (manual dispatch):
+5. Publish to TestPyPI:
 
 ```bash
 gh workflow run publish-test.yml --ref vX.Y.Z
@@ -60,7 +52,7 @@ source /tmp/catap-testpypi/bin/activate
 pip install \
   --index-url https://test.pypi.org/simple/ \
   --extra-index-url https://pypi.org/simple/ \
-  catap
+  catap==X.Y.Z
 catap --help
 catap list-apps
 ```
@@ -68,14 +60,14 @@ catap list-apps
 (The `--extra-index-url` is required because TestPyPI does not mirror
 the `pyobjc-*` runtime dependencies.)
 
-7. Create a GitHub Release from tag `vX.Y.Z` to trigger `publish.yml` → PyPI.
-8. Confirm the `Publish` workflow completes and the package appears on PyPI.
+7. Create the GitHub Release for `vX.Y.Z`. This runs `publish.yml`.
+8. Confirm the workflow succeeds and `catap==X.Y.Z` is on PyPI.
 
 ## Optional smoke checks after publish
 
 ```bash
 uv venv --seed --python 3.12 /tmp/catap-smoke
 source /tmp/catap-smoke/bin/activate
-pip install catap
+pip install catap==X.Y.Z
 catap --help
 ```

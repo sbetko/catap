@@ -2,7 +2,10 @@
 
 `record_process(..., mute=True)` uses `TapMuteBehavior.MUTED`. The app is
 muted while the recording session is active because the session creates the tap
-on `start()` and destroys it on `stop()`.
+on `start()` and destroys it on `stop()`. Every session builder also accepts a
+`TapMuteBehavior` directly (`mute=TapMuteBehavior.MUTED_WHEN_TAPPED`; CLI
+`--mute-when-tapped`), and `session.set_mute_behavior(...)` changes a live
+tap's mute mode mid-capture.
 
 If you use the lower-level tap API directly, the tap can outlive the recorder.
 The two mute modes behave differently in that case:

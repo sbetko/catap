@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 import catap.bindings.hardware as hardware_module
+from catap.bindings._coreaudio import kAudioHardwareBadObjectError
 from catap.bindings.tap_description import TapDescription
 
 
@@ -58,6 +59,30 @@ def test_create_process_tap_zeroes_out_on_status_failure(
         OSError,
         match="AudioHardwareCreateProcessTap failed with status 9",
     ):
+        hardware_module.create_process_tap(
+            cast(TapDescription, _FakeTapDescription()),
+            out=out,
+        )
+
+    assert out.value == 0
+
+
+def test_create_process_tap_rejects_success_status_without_tap_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def create_tap_without_id(description_ptr: object, tap_id_ref: object) -> int:
+        del description_ptr
+        _set_uint32(tap_id_ref, 0)
+        return 0
+
+    monkeypatch.setattr(
+        hardware_module,
+        "_AudioHardwareCreateProcessTap",
+        create_tap_without_id,
+    )
+
+    out = ctypes.c_uint32(999)
+    with pytest.raises(OSError, match="returned no tap for this description"):
         hardware_module.create_process_tap(
             cast(TapDescription, _FakeTapDescription()),
             out=out,
@@ -123,3 +148,18 @@ def test_interrupted_create_process_tap_leaves_recovery_to_out_owner(
 
     assert destroyed == []
     assert out.value == 501
+
+
+def test_destroy_process_tap_exposes_core_audio_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hardware_module,
+        "_AudioHardwareDestroyProcessTap",
+        lambda tap_id: kAudioHardwareBadObjectError,
+    )
+
+    with pytest.raises(OSError, match="AudioHardwareDestroyProcessTap") as exc_info:
+        hardware_module.destroy_process_tap(501)
+
+    assert getattr(exc_info.value, "status", None) == kAudioHardwareBadObjectError

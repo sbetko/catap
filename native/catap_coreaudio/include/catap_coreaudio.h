@@ -15,8 +15,9 @@ extern "C" {
 #define CATAP_EXPORT
 #endif
 
-#define CATAP_ABI_VERSION 1u
+#define CATAP_ABI_VERSION 2u
 #define CATAP_CHUNK_HAS_INPUT_SAMPLE_TIME 1u
+#define CATAP_MAX_BUFFERS 16u
 
 typedef struct catap_audio_ring catap_audio_ring_t;
 typedef struct catap_recorder catap_recorder_t;
@@ -36,6 +37,7 @@ typedef enum catap_status {
 typedef struct catap_audio_chunk_info {
     uint32_t byte_count;
     uint32_t frame_count;
+    uint32_t buffer_index;
     uint32_t flags;
     double input_sample_time;
 } catap_audio_chunk_info_t;
@@ -49,11 +51,18 @@ typedef struct catap_audio_ring_stats {
     uint64_t oversized_chunks;
 } catap_audio_ring_stats_t;
 
+/*
+ * One recorder captures every buffer of the aggregate device's input
+ * AudioBufferList. buffer_count is the exact number of buffers the IOProc
+ * must receive per callback (one per aggregate input stream), and the
+ * per-buffer arrays describe each stream's expected layout in buffer order.
+ */
 typedef struct catap_recorder_config {
     uint32_t slot_count;
     uint32_t slot_capacity;
-    uint32_t expected_channel_count;
-    uint32_t bytes_per_frame;
+    uint32_t buffer_count;
+    uint32_t expected_channel_count[CATAP_MAX_BUFFERS];
+    uint32_t bytes_per_frame[CATAP_MAX_BUFFERS];
 } catap_recorder_config_t;
 
 typedef struct catap_recorder_stats {
@@ -80,6 +89,7 @@ CATAP_EXPORT int32_t catap_audio_ring_try_write(
     const void *data,
     uint32_t byte_count,
     uint32_t frame_count,
+    uint32_t buffer_index,
     double input_sample_time,
     uint32_t flags
 );

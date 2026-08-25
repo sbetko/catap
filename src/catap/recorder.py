@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import math
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from catap._capture_engine import (
@@ -36,8 +38,20 @@ from catap.audio_buffer import (
 )
 from catap.bindings._audiotoolbox import kAudioFormatLinearPCM
 from catap.bindings.tap import AudioTapNotFoundError
+from catap.drift import (
+    DriftCompensationQuality,
+    _validate_drift_compensation_quality,
+)
+from catap.events import (
+    AudioPropertyEvent,
+    AudioPropertyWatch,
+    kAudioHardwarePropertyTapList,
+    kAudioObjectSystemObject,
+    kAudioTapPropertyFormat,
+)
 
 _NATIVE_DRAIN_IDLE_INTERVAL_SECONDS = 0.001
+_NATIVE_FAILURE_POLL_INTERVAL_SECONDS = 0.1
 _NATIVE_SLOT_FRAME_CAPACITY = 16_384
 
 # Core Audio retains the IOProc and its client-data pointer until a matching
@@ -52,6 +66,164 @@ _ABANDONED_NATIVE_CAPTURES_LOCK = threading.Lock()
 
 class UnsupportedTapFormatError(ValueError):
     """Raised when a tap exposes an audio layout catap cannot safely record."""
+
+
+def _packed_bytes_per_frame(num_channels: int, bits_per_sample: int) -> int:
+    return num_channels * (bits_per_sample // 8)
+
+
+def _native_recorder_stat_errors(
+    stats: NativeCoreAudioRecorderStats,
+    *,
+    rejected_unit: str,
+    drop_destination: str,
+) -> list[RuntimeError]:
+    """Turn native recorder counters into capture-failure errors."""
+    errors: list[RuntimeError] = []
+    if stats.callback_failures:
+        errors.append(
+            RuntimeError(
+                "Native CoreAudio callback rejected "
+                f"{stats.callback_failures} {rejected_unit}; last error "
+                f"{stats.last_error_name} ({stats.last_error_status})."
+            )
+        )
+
+    if stats.ring.dropped_chunks:
+        message = (
+            "Dropped "
+            f"{stats.ring.dropped_chunks} native audio buffer(s) "
+            f"({stats.ring.dropped_frames} frame(s)) before they reached "
+            f"{drop_destination}."
+        )
+        if stats.ring.oversized_chunks:
+            message += (
+                " "
+                f"{stats.ring.oversized_chunks} buffer(s) exceeded the "
+                "native ring slot capacity."
+            )
+        errors.append(RuntimeError(message))
+
+    return errors
+
+
+def _validate_tap_stream_format(stream_format: _TapStreamFormat) -> None:
+    """Reject stream formats that would otherwise produce corrupt output."""
+    if stream_format.format_id != kAudioFormatLinearPCM:
+        raise UnsupportedTapFormatError(
+            "Unsupported tap format: only linear PCM streams are currently "
+            f"supported, got format id {stream_format.format_id}"
+        )
+    if not math.isfinite(stream_format.sample_rate) or stream_format.sample_rate <= 0:
+        raise UnsupportedTapFormatError(
+            f"Unsupported tap sample rate: {stream_format.sample_rate!r}"
+        )
+    if stream_format.num_channels <= 0:
+        raise UnsupportedTapFormatError(
+            f"Unsupported tap channel count: {stream_format.num_channels}"
+        )
+    if stream_format.bits_per_sample <= 0 or stream_format.bits_per_sample % 8:
+        raise UnsupportedTapFormatError(
+            f"Unsupported tap bit depth: {stream_format.bits_per_sample}"
+        )
+    if stream_format.is_big_endian:
+        raise UnsupportedTapFormatError(
+            "Unsupported tap byte order: big-endian PCM is not currently supported"
+        )
+    if not stream_format.is_packed:
+        raise UnsupportedTapFormatError(
+            "Unsupported tap format: non-packed PCM is not currently supported"
+        )
+    if stream_format.is_float and stream_format.bits_per_sample != 32:
+        raise UnsupportedTapFormatError(
+            "Unsupported floating-point tap format: only packed float32 is "
+            "currently supported"
+        )
+    if not stream_format.is_float and not stream_format.is_signed_integer:
+        raise UnsupportedTapFormatError(
+            "Unsupported integer tap format: only signed integer PCM is "
+            "currently supported"
+        )
+    if not stream_format.is_float and stream_format.bits_per_sample not in {
+        16,
+        24,
+        32,
+    }:
+        raise UnsupportedTapFormatError(
+            "Unsupported integer tap bit depth: only 16-, 24-, and 32-bit "
+            "signed integer PCM is currently supported, got "
+            f"{stream_format.bits_per_sample}-bit"
+        )
+    if not stream_format.is_interleaved:
+        raise UnsupportedTapFormatError(
+            "Unsupported tap layout: non-interleaved audio buffers are not "
+            "currently supported"
+        )
+
+    bytes_per_frame = (
+        stream_format.bytes_per_frame
+        if stream_format.bytes_per_frame is not None
+        else _packed_bytes_per_frame(
+            stream_format.num_channels,
+            stream_format.bits_per_sample,
+        )
+    )
+    expected_bytes_per_frame = _packed_bytes_per_frame(
+        stream_format.num_channels,
+        stream_format.bits_per_sample,
+    )
+    if bytes_per_frame != expected_bytes_per_frame:
+        raise UnsupportedTapFormatError(
+            "Unsupported tap format: expected packed interleaved "
+            f"{expected_bytes_per_frame}-byte frames, got {bytes_per_frame}"
+        )
+
+
+class _CompositeDriftWatch:
+    """Pairs per-tap format watches and the tap-list watch for one capture."""
+
+    def __init__(
+        self,
+        tap_ids: int | Sequence[int],
+        callback: Callable[[AudioPropertyEvent], None],
+    ) -> None:
+        if isinstance(tap_ids, int):
+            tap_ids = [tap_ids]
+        self._watches: list[AudioPropertyWatch] = []
+        try:
+            for tap_id in tap_ids:
+                self._watches.append(
+                    AudioPropertyWatch(tap_id, [kAudioTapPropertyFormat], callback)
+                )
+            self._watches.append(
+                AudioPropertyWatch(
+                    kAudioObjectSystemObject,
+                    [kAudioHardwarePropertyTapList],
+                    callback,
+                )
+            )
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                self.close()
+            raise
+
+    def close(self) -> None:
+        errors: list[BaseException] = []
+        remaining = list(self._watches)
+        for watch in list(remaining):
+            try:
+                watch.close()
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                remaining.remove(watch)
+            finally:
+                # Retain only children whose close did not complete. Publish
+                # progress after every child so an interruption cannot make a
+                # later retry revisit already-closed watches.
+                self._watches = list(remaining)
+        if errors:
+            raise _combine_errors("Failed to close capture drift watches", errors)
 
 
 class AudioRecorder:
@@ -94,6 +266,7 @@ class AudioRecorder:
         on_buffer: Callable[[AudioBuffer], None] | None = None,
         *,
         max_pending_buffers: int = _DEFAULT_MAX_PENDING_BUFFERS,
+        drift_compensation_quality: DriftCompensationQuality | None = None,
     ) -> None:
         """Initialize the recorder.
 
@@ -108,21 +281,28 @@ class AudioRecorder:
                 the background worker before new buffers are dropped and the
                 capture fails on stop. Higher values trade memory for tolerance
                 of slow disk writes or ``on_buffer`` callbacks.
+            drift_compensation_quality: Optional aggregate-device resampling
+                quality. ``None`` preserves Core Audio's default.
         Raises:
             ValueError: If neither ``output_path`` nor ``on_buffer`` is provided
         """
         self.tap_id = tap_id
         self.output_path = _validate_recording_target(output_path, on_buffer)
         self._on_buffer = on_buffer
+        self.drift_compensation_quality = _validate_drift_compensation_quality(
+            drift_compensation_quality
+        )
 
         self._capture_engine = _TapCaptureEngine()
         self._capture_session: _TapCaptureSession | None = None
         self._is_recording = False
         self._max_pending_buffers = _validate_max_pending_buffers(max_pending_buffers)
+        self._capture_failure_event = threading.Event()
         self._worker = _AudioWorker(
             record_accepted_frames=self._record_accepted_frames,
             record_dropped_frames=self._record_dropped_frames,
             consume_dropped_stats=self._consume_dropped_stats,
+            capture_failure_event=self._capture_failure_event,
         )
         self._lifecycle_lock = threading.Lock()
         self._lifecycle_state = "idle"
@@ -139,6 +319,9 @@ class AudioRecorder:
         self._dropped_frames = 0
         self._nonzero_audio_seen = False
         self._start_tap_stream_format: _TapStreamFormat | None = None
+        self._drift_watch: _CompositeDriftWatch | None = None
+        self._mid_capture_drift_lock = threading.Lock()
+        self._mid_capture_drift: list[str] = []
 
         # Stream format (populated on start).
         self._sample_rate = 44100.0
@@ -176,81 +359,11 @@ class AudioRecorder:
 
     @staticmethod
     def _packed_bytes_per_frame(num_channels: int, bits_per_sample: int) -> int:
-        return num_channels * (bits_per_sample // 8)
+        return _packed_bytes_per_frame(num_channels, bits_per_sample)
 
     def _validate_stream_format(self, stream_format: _TapStreamFormat) -> None:
         """Reject tap formats that would otherwise produce corrupt output."""
-        if stream_format.format_id != kAudioFormatLinearPCM:
-            raise UnsupportedTapFormatError(
-                "Unsupported tap format: only linear PCM streams are currently "
-                f"supported, got format id {stream_format.format_id}"
-            )
-        if (
-            not math.isfinite(stream_format.sample_rate)
-            or stream_format.sample_rate <= 0
-        ):
-            raise UnsupportedTapFormatError(
-                f"Unsupported tap sample rate: {stream_format.sample_rate!r}"
-            )
-        if stream_format.num_channels <= 0:
-            raise UnsupportedTapFormatError(
-                f"Unsupported tap channel count: {stream_format.num_channels}"
-            )
-        if stream_format.bits_per_sample <= 0 or stream_format.bits_per_sample % 8:
-            raise UnsupportedTapFormatError(
-                f"Unsupported tap bit depth: {stream_format.bits_per_sample}"
-            )
-        if stream_format.is_big_endian:
-            raise UnsupportedTapFormatError(
-                "Unsupported tap byte order: big-endian PCM is not currently supported"
-            )
-        if not stream_format.is_packed:
-            raise UnsupportedTapFormatError(
-                "Unsupported tap format: non-packed PCM is not currently supported"
-            )
-        if stream_format.is_float and stream_format.bits_per_sample != 32:
-            raise UnsupportedTapFormatError(
-                "Unsupported floating-point tap format: only packed float32 is "
-                "currently supported"
-            )
-        if not stream_format.is_float and not stream_format.is_signed_integer:
-            raise UnsupportedTapFormatError(
-                "Unsupported integer tap format: only signed integer PCM is "
-                "currently supported"
-            )
-        if not stream_format.is_float and stream_format.bits_per_sample not in {
-            16,
-            24,
-            32,
-        }:
-            raise UnsupportedTapFormatError(
-                "Unsupported integer tap bit depth: only 16-, 24-, and 32-bit "
-                "signed integer PCM is currently supported, got "
-                f"{stream_format.bits_per_sample}-bit"
-            )
-        if not stream_format.is_interleaved:
-            raise UnsupportedTapFormatError(
-                "Unsupported tap layout: non-interleaved audio buffers are not "
-                "currently supported"
-            )
-
-        bytes_per_frame = (
-            stream_format.bytes_per_frame
-            if stream_format.bytes_per_frame is not None
-            else self._packed_bytes_per_frame(
-                stream_format.num_channels,
-                stream_format.bits_per_sample,
-            )
-        )
-        expected_bytes_per_frame = self._packed_bytes_per_frame(
-            stream_format.num_channels,
-            stream_format.bits_per_sample,
-        )
-        if bytes_per_frame != expected_bytes_per_frame:
-            raise UnsupportedTapFormatError(
-                "Unsupported tap format: expected packed interleaved "
-                f"{expected_bytes_per_frame}-byte frames, got {bytes_per_frame}"
-            )
+        _validate_tap_stream_format(stream_format)
 
     @property
     def _aggregate_device_id(self) -> int | None:
@@ -372,9 +485,8 @@ class AudioRecorder:
             thread_never_started = (
                 not thread_is_alive and getattr(thread, "ident", None) is None
             )
-            drain_is_done = (
-                thread_never_started
-                or (done_event is not None and done_event.is_set())
+            drain_is_done = thread_never_started or (
+                done_event is not None and done_event.is_set()
             )
             if not drain_is_done:
                 if not cleanup_errors:
@@ -435,6 +547,7 @@ class AudioRecorder:
         abort_event: threading.Event,
         done_event: threading.Event,
     ) -> None:
+        next_failure_poll = 0.0
         try:
             while True:
                 drained = self._drain_native_recorder(
@@ -445,6 +558,10 @@ class AudioRecorder:
                     return
                 if stop_event.is_set():
                     return
+                now = time.monotonic()
+                if now >= next_failure_poll:
+                    self._poll_native_capture_failure(native_recorder)
+                    next_failure_poll = now + _NATIVE_FAILURE_POLL_INTERVAL_SECONDS
                 if not drained:
                     stop_event.wait(_NATIVE_DRAIN_IDLE_INTERVAL_SECONDS)
         except BaseException as exc:
@@ -455,6 +572,7 @@ class AudioRecorder:
             )
             assert isinstance(failure, RuntimeError)
             self._native_drain_failures.append(failure)
+            self._capture_failure_event.set()
         finally:
             done_event.set()
 
@@ -479,36 +597,23 @@ class AudioRecorder:
                 chunk.input_sample_time,
             )
 
+    def _poll_native_capture_failure(
+        self,
+        native_recorder: NativeCoreAudioRecorder,
+    ) -> None:
+        """Wake the owner when native callback or ring counters turn nonzero."""
+        if self._native_recorder_errors(native_recorder.stats()):
+            self._capture_failure_event.set()
+
     def _native_recorder_errors(
         self,
         stats: NativeCoreAudioRecorderStats,
     ) -> list[RuntimeError]:
-        errors: list[RuntimeError] = []
-        if stats.callback_failures:
-            errors.append(
-                RuntimeError(
-                    "Native CoreAudio callback rejected "
-                    f"{stats.callback_failures} audio buffer(s); last error "
-                    f"{stats.last_error_name} ({stats.last_error_status})."
-                )
-            )
-
-        if stats.ring.dropped_chunks:
-            message = (
-                "Dropped "
-                f"{stats.ring.dropped_chunks} native audio buffer(s) "
-                f"({stats.ring.dropped_frames} frame(s)) before they reached "
-                "the background worker."
-            )
-            if stats.ring.oversized_chunks:
-                message += (
-                    " "
-                    f"{stats.ring.oversized_chunks} buffer(s) exceeded the "
-                    "native ring slot capacity."
-                )
-            errors.append(RuntimeError(message))
-
-        return errors
+        return _native_recorder_stat_errors(
+            stats,
+            rejected_unit="audio buffer(s)",
+            drop_destination="the background worker",
+        )
 
     @staticmethod
     def _release_native_recorder(
@@ -518,9 +623,7 @@ class AudioRecorder:
         drain_quiesced: bool,
     ) -> bool:
         """Release native state only after every raw-pointer reader has stopped."""
-        io_proc_destroyed = (
-            capture_session is None or capture_session.io_proc_destroyed
-        )
+        io_proc_destroyed = capture_session is None or capture_session.io_proc_destroyed
         if io_proc_destroyed and drain_quiesced:
             native_recorder.close()
             return True
@@ -620,6 +723,9 @@ class AudioRecorder:
                 lifecycle_claimed = True
                 self._lifecycle_state = "starting"
 
+            # The signal is sticky for the completed capture and resets only
+            # after this start has successfully claimed the idle lifecycle.
+            self._capture_failure_event.clear()
             stream_format = self._capture_engine.describe_tap_stream(self.tap_id)
             self._apply_stream_format(stream_format)
 
@@ -639,11 +745,19 @@ class AudioRecorder:
             try:
                 native_recorder = self._create_native_recorder()
                 self._native_recorder = native_recorder
-                capture_session = self._capture_engine.open_tap_capture(
-                    self.tap_id,
-                    native_recorder.io_proc_pointer,
-                    native_recorder.handle,
-                )
+                if self.drift_compensation_quality is None:
+                    capture_session = self._capture_engine.open_tap_capture(
+                        self.tap_id,
+                        native_recorder.io_proc_pointer,
+                        native_recorder.handle,
+                    )
+                else:
+                    capture_session = self._capture_engine.open_tap_capture(
+                        self.tap_id,
+                        native_recorder.io_proc_pointer,
+                        native_recorder.handle,
+                        drift_compensation_quality=self.drift_compensation_quality,
+                    )
                 self._capture_session = capture_session
                 acknowledge_capture_session = getattr(
                     self._capture_engine,
@@ -657,10 +771,11 @@ class AudioRecorder:
 
                 self._worker.start(self._make_worker_config())
                 cleanup.append(lambda: self._worker.stop(publish=False))
-                cleanup.append(
-                    lambda: self._stop_native_drain(drain_remaining=False)
-                )
+                cleanup.append(lambda: self._stop_native_drain(drain_remaining=False))
                 self._start_native_drain(native_recorder)
+
+                self._start_drift_watch()
+                cleanup.append(self._cleanup_drift_watch_step)
 
                 with self._lifecycle_lock:
                     self._is_recording = True
@@ -715,8 +830,7 @@ class AudioRecorder:
                                 drain_quiesced = False
                                 _add_secondary_failure(
                                     exc,
-                                    "Cleanup failure while checking the native "
-                                    "drain",
+                                    "Cleanup failure while checking the native drain",
                                     cleanup_exc,
                                 )
                             if (
@@ -882,14 +996,85 @@ class AudioRecorder:
                         for lifecycle_error in lifecycle_errors:
                             _add_secondary_failure(
                                 stop_error,
-                                "Cleanup failure while publishing recorder "
-                                "lifecycle",
+                                "Cleanup failure while publishing recorder lifecycle",
                                 lifecycle_error,
                             )
 
+    def _start_drift_watch(self) -> None:
+        """Watch for mid-capture tap format changes and tap destruction.
+
+        Registration is best-effort: the stop-time format re-read remains the
+        correctness backstop, so a capture must not fail just because the
+        notification hookup did.
+        """
+        with self._mid_capture_drift_lock:
+            self._mid_capture_drift = []
+        try:
+            self._drift_watch = _CompositeDriftWatch(self.tap_id, self._on_drift_event)
+        except (OSError, RuntimeError, ValueError):
+            self._drift_watch = None
+
+    def _on_drift_event(self, event: AudioPropertyEvent) -> None:
+        """Re-verify the tap after a format or tap-list change notification.
+
+        Runs on the watch dispatcher thread. Tap-list events fire for any
+        tap's creation or destruction, so the tap is re-checked rather than
+        trusting the notification alone; retargeting a mixdown tap changes
+        its description but not its format and stays a healthy capture.
+        """
+        del event
+        expected = self._start_tap_stream_format
+        if expected is None:
+            return
+        try:
+            current = self._capture_engine.describe_tap_stream(self.tap_id)
+        except AudioTapNotFoundError:
+            self._record_mid_capture_drift(
+                f"Tap {self.tap_id} disappeared during capture"
+            )
+            return
+        except BaseException:
+            # Leave transient read failures to the stop-time re-read.
+            return
+        if current != expected:
+            self._record_mid_capture_drift(
+                "Tap stream format changed during capture "
+                f"(started as {expected}, now {current})"
+            )
+
+    def _record_mid_capture_drift(self, message: str) -> None:
+        with self._mid_capture_drift_lock:
+            if message not in self._mid_capture_drift:
+                self._mid_capture_drift.append(message)
+        # Property-watch callbacks only wake the owner. They must never call
+        # stop(), which owns listener teardown and cannot run on this thread.
+        self._capture_failure_event.set()
+
+    def _close_drift_watch(self) -> list[BaseException]:
+        """Stop the drift watch, returning rather than raising failures."""
+        watch = self._drift_watch
+        if watch is None:
+            return []
+        try:
+            watch.close()
+        except BaseException as exc:
+            return [exc]
+        if self._drift_watch is watch:
+            self._drift_watch = None
+        return []
+
+    def _cleanup_drift_watch_step(self) -> None:
+        """Close the drift watch as one startup-unwind cleanup step."""
+        errors = self._close_drift_watch()
+        if errors:
+            raise _combine_errors(
+                "Failed to close capture drift watch during cleanup", errors
+            )
+
     def _detect_tap_stream_drift(
         self,
-        capture_session: _TapCaptureSession | None,
+        *,
+        capture_was_started: bool,
     ) -> list[BaseException]:
         """Fail loudly when the tap stream changed or vanished mid-capture.
 
@@ -899,46 +1084,59 @@ class AudioRecorder:
         the sample rate, and a shared tap destroyed by its owner — into
         capture failures that discard the output instead of publishing it.
         """
-        if capture_session is None or not capture_session.started:
+        if not capture_was_started:
             return []
         expected = self._start_tap_stream_format
         if expected is None:
             return []
 
+        with self._mid_capture_drift_lock:
+            drift_messages = list(self._mid_capture_drift)
+        drift_errors: list[BaseException] = [
+            RuntimeError(f"{message}; discarding output") for message in drift_messages
+        ]
+
         try:
             current = self._capture_engine.describe_tap_stream(self.tap_id)
         except AudioTapNotFoundError as exc:
+            self._capture_failure_event.set()
             return [
+                *drift_errors,
                 _translate_exception(
                     OSError,
                     f"Tap {self.tap_id} disappeared during capture; "
                     f"discarding output: {exc}",
                     exc,
-                )
+                ),
             ]
         except BaseException as exc:
+            self._capture_failure_event.set()
             return [
+                *drift_errors,
                 _translate_exception(
                     OSError,
                     "Could not verify the tap stream format at stop; "
                     f"discarding output: {exc}",
                     exc,
-                )
+                ),
             ]
 
         if current != expected:
+            self._capture_failure_event.set()
             return [
+                *drift_errors,
                 RuntimeError(
                     "Tap stream format changed during capture "
                     f"(started as {expected}, now {current}); discarding output"
-                )
+                ),
             ]
-        return []
+        return drift_errors
 
     def _finish_stop(self) -> None:
         """Finish teardown after the public lifecycle claim is recoverable."""
         capture_session = self._capture_session
         native_recorder = self._native_recorder
+        capture_was_started = capture_session is not None and capture_session.started
 
         cleanup_errors: list[BaseException] = []
         publish_worker_output = True
@@ -951,17 +1149,16 @@ class AudioRecorder:
 
         try:
             try:
-                for drift_error in self._detect_tap_stream_drift(capture_session):
-                    record_cleanup_error(drift_error)
-                    publish_worker_output = False
-
-                if capture_session is not None:
+                # Quiesce Core Audio before taking the final tap-format
+                # snapshot. Closing the listener and checking while IO is
+                # still active leaves a gap in which a late format change or
+                # tap destruction can corrupt data without being observed.
+                if capture_session is not None and capture_session.started:
                     try:
-                        self._capture_engine.close(capture_session)
+                        self._capture_engine.stop(capture_session)
                     except BaseException as exc:
                         record_cleanup_error(exc)
-                        if capture_session.started:
-                            publish_worker_output = False
+                        publish_worker_output = False
 
                 if self._native_drain_thread is not None:
                     try:
@@ -986,6 +1183,31 @@ class AudioRecorder:
                         if not drain_quiesced:
                             publish_worker_output = False
 
+                # With capture quiesced, stop notifications and take the
+                # correctness-backstop snapshot while the aggregate and tap
+                # are still available. If listener removal is not confirmed,
+                # a late event can race the snapshot, so the capture is no
+                # longer safe to publish.
+                watch_errors = self._close_drift_watch()
+                for watch_error in watch_errors:
+                    record_cleanup_error(watch_error)
+                if watch_errors:
+                    publish_worker_output = False
+
+                for drift_error in self._detect_tap_stream_drift(
+                    capture_was_started=capture_was_started
+                ):
+                    record_cleanup_error(drift_error)
+                    publish_worker_output = False
+
+                if capture_session is not None:
+                    try:
+                        self._capture_engine.close(capture_session)
+                    except BaseException as exc:
+                        record_cleanup_error(exc)
+                        if capture_session.started:
+                            publish_worker_output = False
+
                 if native_recorder is not None:
                     try:
                         native_errors = self._native_recorder_errors(
@@ -996,6 +1218,7 @@ class AudioRecorder:
                         publish_worker_output = False
                     else:
                         if native_errors:
+                            self._capture_failure_event.set()
                             cleanup_errors.extend(native_errors)
                             publish_worker_output = False
 
@@ -1024,10 +1247,7 @@ class AudioRecorder:
                             record_cleanup_error(exc)
                 finally:
                     try:
-                        if (
-                            self._native_drain_thread is not None
-                            and not drain_quiesced
-                        ):
+                        if self._native_drain_thread is not None and not drain_quiesced:
                             try:
                                 self._stop_native_drain(
                                     drain_remaining=(
@@ -1042,9 +1262,7 @@ class AudioRecorder:
                                 record_cleanup_error(exc)
                             finally:
                                 try:
-                                    drain_quiesced = (
-                                        self._native_drain_is_quiesced()
-                                    )
+                                    drain_quiesced = self._native_drain_is_quiesced()
                                 except BaseException as exc:
                                     record_cleanup_error(exc)
                                     drain_quiesced = False
@@ -1147,8 +1365,29 @@ class AudioRecorder:
             self._capture_session is not None
             or self._native_recorder is not None
             or self._native_drain_thread is not None
+            or self._drift_watch is not None
             or self._worker.needs_cleanup
         )
+
+    @property
+    def capture_failed(self) -> bool:
+        """True once a live or background capture failure was detected.
+
+        The signal is sticky through shutdown and resets when a new recording
+        start claims the idle recorder lifecycle. ``stop()`` remains the
+        authoritative final validation and detailed error report.
+        """
+        return self._capture_failure_event.is_set()
+
+    def wait_for_capture_failure(self, timeout: float | None = None) -> bool:
+        """Wait until an asynchronous capture failure is detected.
+
+        This method only waits for the passive failure signal. It never stops
+        or tears down the recorder; the owning thread must still call
+        :meth:`stop`, which reports the detailed failure and discards unsafe
+        output.
+        """
+        return self._capture_failure_event.wait(timeout)
 
     @property
     def captured_only_silence(self) -> bool:

@@ -6,7 +6,7 @@ import contextlib
 import ctypes
 from typing import TYPE_CHECKING
 
-from catap.bindings._coreaudio import _CoreAudio
+from catap.bindings._coreaudio import _CoreAudio, _status_error
 
 if TYPE_CHECKING:
     from catap.bindings.tap_description import TapDescription
@@ -48,6 +48,16 @@ def create_process_tap(
         if status != 0:
             tap_id.value = 0
             raise OSError(f"AudioHardwareCreateProcessTap failed with status {status}")
+        if tap_id.value == 0:
+            # Core Audio reports success but returns kAudioObjectUnknown for
+            # descriptions it cannot satisfy (for example a global tap with
+            # mixdown disabled). Surface that as a failure instead of handing
+            # back an unusable tap ID.
+            raise OSError(
+                "AudioHardwareCreateProcessTap returned no tap for this "
+                "description; the requested tap configuration is not "
+                "supported by Core Audio"
+            )
         return tap_id.value
     except OSError:
         raise
@@ -62,4 +72,7 @@ def destroy_process_tap(tap_id: int) -> None:
     """Destroy an existing audio tap."""
     status = _AudioHardwareDestroyProcessTap(tap_id)
     if status != 0:
-        raise OSError(f"AudioHardwareDestroyProcessTap failed with status {status}")
+        raise _status_error(
+            f"AudioHardwareDestroyProcessTap failed with status {status}",
+            status,
+        )
