@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Changed `AudioRecorder.needs_cleanup` to report false during active
+  recording, matching `RecordingSession.needs_cleanup` and its documented
+  "failed teardown pending" meaning. Use `is_recording` for capture state.
 - Added `captured_only_silence` to `AudioRecorder` and `RecordingSession`,
   and a CLI warning after all-zero recordings. macOS delivers zeroed tap
   audio when the hosting app lacks system-audio permission, so silent

@@ -2606,6 +2606,54 @@ def test_captured_only_silence_latches_on_nonzero_audio() -> None:
     assert recorder.captured_only_silence is True
 
 
+class _LifecycleCaptureEngine:
+    """Minimal working capture engine for full start/stop flows."""
+
+    def describe_tap_stream(self, tap_id: int) -> capture_module._TapStreamFormat:
+        del tap_id
+        return capture_module._TapStreamFormat(
+            48_000.0,
+            2,
+            32,
+            True,
+            bytes_per_frame=8,
+            is_signed_integer=False,
+        )
+
+    def open_tap_capture(
+        self,
+        tap_id: int,
+        callback: object,
+        client_data: object | None = None,
+    ) -> capture_module._TapCaptureSession:
+        del tap_id, callback, client_data
+        return capture_module._TapCaptureSession(55, ctypes.c_void_p(77))
+
+    def start(self, session: capture_module._TapCaptureSession) -> None:
+        session.started = True
+
+    def stop(self, session: capture_module._TapCaptureSession) -> None:
+        session.started = False
+
+    def close(self, session: capture_module._TapCaptureSession) -> None:
+        session.started = False
+        session.io_proc_destroyed = True
+        session.aggregate_device_destroyed = True
+
+
+def test_needs_cleanup_is_false_while_recording() -> None:
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    recorder._capture_engine = cast(Any, _LifecycleCaptureEngine())
+
+    recorder.start()
+    assert recorder.is_recording is True
+    assert recorder.needs_cleanup is False
+
+    recorder.stop()
+    assert recorder.is_recording is False
+    assert recorder.needs_cleanup is False
+
+
 def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:
     recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     total_updates = 2_000

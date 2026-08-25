@@ -1082,8 +1082,13 @@ class AudioRecorder:
 
     @property
     def needs_cleanup(self) -> bool:
-        """True when a failed teardown still owns retryable resources."""
-        return (
+        """True when a failed teardown still owns retryable resources.
+
+        False during active recording; use ``is_recording`` for capture
+        state. After a failed ``stop()``, stays true until a retried
+        ``stop()`` succeeds, matching ``RecordingSession.needs_cleanup``.
+        """
+        return not self._is_recording and (
             self._capture_session is not None
             or self._native_recorder is not None
             or self._native_drain_thread is not None
