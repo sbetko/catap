@@ -2583,6 +2583,29 @@ def test_start_rejects_unwritable_integer_bit_depths(bits_per_sample: int) -> No
     assert recorder._lifecycle_state == "idle"
 
 
+def test_captured_only_silence_latches_on_nonzero_audio() -> None:
+    recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
+    assert recorder.captured_only_silence is True
+
+    chunks = [
+        _FakeNativeChunk(b"\x00" * 16, 2),
+        _FakeNativeChunk(b"\x00\x00\x01\x00" * 4, 4),
+    ]
+
+    class _ChunkNativeRecorder:
+        def read(self) -> object | None:
+            return chunks.pop(0) if chunks else None
+
+    recorder._drain_native_recorder(
+        cast(Any, _ChunkNativeRecorder()),
+        threading.Event(),
+    )
+    assert recorder.captured_only_silence is False
+
+    recorder._reset_counters()
+    assert recorder.captured_only_silence is True
+
+
 def test_frames_recorded_is_monotonic_during_concurrent_updates() -> None:
     recorder = AudioRecorder(123, on_buffer=lambda buffer: None)
     total_updates = 2_000

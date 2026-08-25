@@ -20,6 +20,7 @@ class _RecorderLike(Protocol):
 
     is_recording: bool
     needs_cleanup: bool
+    captured_only_silence: bool
     frames_recorded: int
     duration_seconds: float
     stream_format: AudioStreamFormat | None

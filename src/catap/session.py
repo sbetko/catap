@@ -271,6 +271,18 @@ class RecordingSession:
         return self._recorder.frames_recorded
 
     @property
+    def captured_only_silence(self) -> bool:
+        """True while the current or most recent capture holds only zeros.
+
+        An all-zero capture while audio was playing usually means macOS never
+        granted system-audio recording permission to the app hosting this
+        process, so Core Audio delivered zeroed buffers.
+        """
+        if self._recorder is None:
+            return True
+        return self._recorder.captured_only_silence
+
+    @property
     def duration_seconds(self) -> float:
         """Recorded duration in seconds."""
         if self._recorder is None:

@@ -260,6 +260,13 @@ When you run from a terminal (for example `uv run catap record Spotify`),
 macOS attributes capture to the terminal app, so grant permission to
 Terminal, iTerm, or whichever host is launching `catap`.
 
+If permission is missing, macOS still delivers audio buffers — zeroed. A
+capture that "succeeds" but contains only silence usually means the hosting
+app was never granted access (or needs a restart after being granted).
+Check `session.captured_only_silence` after recording; the CLI prints a
+warning automatically. Permission changes take effect after the host app
+restarts.
+
 App bundles using Core Audio taps should include
 `NSAudioCaptureUsageDescription` in their `Info.plist`. Sandboxed apps still
 need their normal sandbox configuration; Core Audio taps do not add a separate

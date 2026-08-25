@@ -189,6 +189,10 @@ def test_record_known_tone_delivers_audio(tmp_path) -> None:
         "expected at least one second of audio"
     )
 
+    assert session.captured_only_silence is False, (
+        "session.captured_only_silence should be false after a real capture"
+    )
+
     samples, capture_rate = _read_mono_samples(output_path)
     peak = max((abs(sample) for sample in samples), default=0.0)
     assert peak > 0.0, (

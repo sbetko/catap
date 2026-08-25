@@ -31,6 +31,7 @@ class _SuccessfulSession:
         self.output = output
         self.tap_id = 42
         self.duration_seconds = 0.01
+        self.captured_only_silence = False
 
     def start(self) -> None:
         return None
@@ -392,6 +393,52 @@ def test_record_can_target_process_by_audio_object_id(
     assert exit_code == 0
     assert seen == {"process": process, "mute": False}
     assert "Recording from: Tone (PID: 111, Audio ID: 11)" in captured.out
+
+
+def test_record_warns_when_capture_contains_only_silence(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    process = AudioProcess(11, 111, "com.example.tone", "Tone", True)
+
+    class _SilentSession(_SuccessfulSession):
+        def __init__(self, tap_desc: object, output: str) -> None:
+            super().__init__(tap_desc, output)
+            self.captured_only_silence = True
+
+    _set_cli_symbols(
+        monkeypatch,
+        list_audio_processes=lambda: [process],
+        build_process_tap_description=lambda process_arg, mute=False: object(),
+        RecordingSession=_SilentSession,
+    )
+
+    exit_code = main(["record", "--pid", "111", "-d", "0.001", "-o", "tone.wav"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "contained only silence" in captured.err
+    assert "Screen & System Audio Recording" in captured.err
+
+
+def test_record_does_not_warn_when_capture_has_audio(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    process = AudioProcess(11, 111, "com.example.tone", "Tone", True)
+
+    _set_cli_symbols(
+        monkeypatch,
+        list_audio_processes=lambda: [process],
+        build_process_tap_description=lambda process_arg, mute=False: object(),
+        RecordingSession=_SuccessfulSession,
+    )
+
+    exit_code = main(["record", "--pid", "111", "-d", "0.001", "-o", "tone.wav"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "contained only silence" not in captured.err
 
 
 def test_system_record_can_exclude_by_pid_and_audio_object_id(

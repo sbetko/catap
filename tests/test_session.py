@@ -48,6 +48,7 @@ class _FakeRecorder:
         self.max_pending_buffers = max_pending_buffers
         self.is_recording = False
         self.needs_cleanup = False
+        self.captured_only_silence = True
         self.start_calls = 0
         self.stop_calls = 0
         self.frames_recorded = 24_000
@@ -473,6 +474,29 @@ def test_start_failure_retains_pending_recorder_cleanup_for_close(
     assert recorder.needs_cleanup is False
     assert session.tap_id is None
     assert backend.destroyed_tap_ids == [77]
+
+
+def test_session_forwards_captured_only_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _FakeSessionBackend()
+    _install_backend(monkeypatch, backend)
+    session = session_module.RecordingSession(
+        cast(TapDescription, _FakeTapDescription([42])),
+        output_path="recording.wav",
+    )
+
+    assert session.captured_only_silence is True
+
+    session.start()
+    recorder = backend.created_recorders[0]
+    assert session.captured_only_silence is True
+
+    recorder.captured_only_silence = False
+    assert session.captured_only_silence is False
+
+    session.close()
+    assert session.captured_only_silence is False
 
 
 def test_needs_cleanup_tracks_failed_stop_and_retry(

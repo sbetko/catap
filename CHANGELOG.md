@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added `captured_only_silence` to `AudioRecorder` and `RecordingSession`,
+  and a CLI warning after all-zero recordings. macOS delivers zeroed tap
+  audio when the hosting app lacks system-audio permission, so silent
+  "successful" captures are now diagnosable instead of indistinguishable
+  from success.
 - Required setuptools 83+ for sdist builds and the locked development
   environment, picking up the fix for CVE-2026-59890 (MANIFEST.in exclusions
   bypassed by Unicode normalization on macOS filesystems). catap's ASCII-only

@@ -136,6 +136,7 @@ class AudioRecorder:
         self._total_frames = 0
         self._dropped_buffers = 0
         self._dropped_frames = 0
+        self._nonzero_audio_seen = False
 
         # Stream format (populated on start).
         self._sample_rate = 44100.0
@@ -278,6 +279,7 @@ class AudioRecorder:
             self._total_frames = 0
             self._dropped_buffers = 0
             self._dropped_frames = 0
+        self._nonzero_audio_seen = False
 
     def _record_accepted_frames(self, num_frames: int) -> None:
         self._total_frames += num_frames
@@ -466,6 +468,8 @@ class AudioRecorder:
             if chunk is None:
                 return drained
             drained = True
+            if not self._nonzero_audio_seen and chunk.data.strip(b"\x00"):
+                self._nonzero_audio_seen = True
             self._worker.enqueue_audio_bytes(
                 chunk.data,
                 chunk.frame_count,
@@ -1085,6 +1089,17 @@ class AudioRecorder:
             or self._native_drain_thread is not None
             or self._worker.needs_cleanup
         )
+
+    @property
+    def captured_only_silence(self) -> bool:
+        """True while no nonzero audio sample has been captured.
+
+        macOS delivers zeroed tap audio when the recording process lacks
+        system-audio permission, so a completed capture that reports only
+        silence while audio was playing usually means the app hosting this
+        process was never granted System Audio Recording access.
+        """
+        return not self._nonzero_audio_seen
 
     @property
     def frames_recorded(self) -> int:

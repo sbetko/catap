@@ -32,6 +32,12 @@ _OUTPUT_HINT = [
     "  1. Ensure the destination directory exists",
     "  2. Ensure you can write to the output path",
 ]
+_SILENCE_HINT = [
+    "Warning: the capture contained only silence.",
+    "If audio was playing, macOS may have zeroed the capture because this",
+    "terminal lacks permission. Check System Settings > Privacy & Security >",
+    "Screen & System Audio Recording, then restart the terminal app.",
+]
 
 
 class _DisplayProcess(Protocol):
@@ -490,6 +496,9 @@ def _run_recording_session(
 
             session.stop()
             print(f"Recorded {session.duration_seconds:.2f} seconds", flush=True)
+            if session.captured_only_silence:
+                for line in _SILENCE_HINT:
+                    print(line, file=sys.stderr)
             print(f"Saved to: {output}", flush=True)
             return 0
         except (OSError, RuntimeError) as exc:
