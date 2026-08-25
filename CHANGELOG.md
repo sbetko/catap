@@ -4,6 +4,107 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-25
+
+Feature completeness against the Core Audio tap API surface from macOS 14.2
+through macOS 26.
+
+### Tap API surface
+
+- Added the macOS 26 `CATapDescription` fields: `TapDescription.bundle_ids`
+  (tap or exclude by bundle ID) and `process_restore_enabled` (tapped apps
+  rejoin the capture when they restart), plus `bundle_id_taps_supported()`
+  and a `TapDescription.uuid` setter. On earlier macOS the getters report
+  empty/false and the setters raise with a clear availability message.
+- Added `get_tap_format(tap_id)` returning a new public `TapStreamFormat`,
+  and `set_tap_description(tap_id, description)` for retargeting a live tap
+  (`kAudioTapPropertyDescription` is settable; requires System Audio
+  Recording permission, surfaced as `PermissionError` without it).
+- `find_tap_by_uid` now resolves through
+  `kAudioHardwarePropertyTranslateUIDToTap` with the listing as fallback,
+  and `find_process_by_pid` resolves through
+  `kAudioHardwarePropertyTranslatePIDToProcessObject`.
+- `AudioProcess` gained `is_running` and `is_inputting`.
+- `create_process_tap` now raises when Core Audio reports success but
+  returns tap ID 0 (its signal for an unsatisfiable description, for
+  example a global non-mixdown tap).
+
+### Event layer
+
+- Added `catap.events`: `AudioPropertyWatch` over
+  `AudioObjectAddPropertyListener`, with `watch_audio_processes`,
+  `watch_audio_taps`, `watch_audio_devices`,
+  `watch_default_output_device`, `watch_tap`, and `watch_property`.
+  Callbacks run on a catap-owned dispatcher thread, never the HAL thread.
+- Recorders now watch the tap's format and the tap list during capture, so a
+  format change or vanished tap, even if recreated identically, is caught as
+  it happens. The stop-time re-read remains as the backstop. Failures still
+  discard the output.
+
+### Capture variants
+
+- Sessions and the CLI can record several apps mixed through one tap
+  (`record_processes`, multiple CLI app names), one output device stream
+  (`record_device`, `--device`/`--stream`), and bundle IDs on macOS 26
+  (`record_bundle_ids`, `--bundle-id`, `--no-restore`).
+- Process, system-audio, and bundle-ID session builders accept the full mute
+  set (`mute=` takes a bool or `TapMuteBehavior`), `mono=True`, and
+  `visible=True`. Device taps keep their native format and therefore omit
+  `mono`; multitrack omits `visible`; existing-tap sessions reuse the tap's
+  configuration. The CLI exposes the applicable creation options and limits
+  mute options to app, bundle-ID, and device targets.
+- `RecordingSession.set_processes` retargets inclusive process-list taps and
+  rejects global/exclusive and bundle-ID taps, whose target lists have
+  different semantics. `set_mute_behavior` changes mute behavior on any live
+  tap without interrupting the recording.
+- CLI parity: `list-taps`, `list-devices`, `record --tap UID`, and
+  `catap watch` for streaming Core Audio change events.
+
+### Multitrack capture
+
+- Added `record_multitrack` / `MultitrackRecordingSession` /
+  `MultitrackAudioRecorder`: one tap per app captured through a single
+  aggregate device as sample-synchronized tracks, one WAV (or callback
+  feed) per track; CLI `record-multitrack App1 App2 -o dir/`.
+- Output-directory mode creates missing parent directories. Explicit and
+  derived track destinations are checked for relative, case-only, and Unicode
+  aliases before recording so two tracks cannot publish to the same path.
+- Track files publish as one retryable in-process transaction that restores
+  pre-existing destinations after an error or interruption. Abrupt process
+  termination during the final multi-file commit is not journal-recovered.
+- Optional experimental microphone track (`microphone=True` /
+  `--with-mic`): one hardware input device records alongside the taps in
+  the same aggregate, sample-locked to the app tracks. Requires the
+  separate Microphone permission.
+- Native ABI v2: the IOProc accepts one buffer per aggregate input stream
+  and queues each callback's buffers as an atomic all-or-nothing group
+  tagged with a buffer index, so per-track streams can never tear against
+  each other; any drop or failure discards every track on stop.
+- Per-track diagnostics: `track_captured_only_silence` distinguishes a
+  silent (permission-zeroed) tap track from a live microphone track.
+
+### Capture configuration
+
+- Added `DriftCompensationQuality` and an opt-in
+  `drift_compensation_quality=` argument across single-track, existing-tap,
+  bundle-ID, device, and multitrack recorder/session paths. Omitting it keeps
+  Core Audio's operating-system default; raw integers and booleans are
+  rejected instead of forwarding unchecked values.
+- Expanded the permissioned release gate with real microphone-plus-process
+  alignment, bundle-ID restoration across a QuickTime Player quit/relaunch,
+  and prompt fixed-duration wakeup after an external tap is destroyed.
+
+### Capture reliability
+
+- Added sticky `capture_failed` and `wait_for_capture_failure()` APIs to
+  recorders and sessions. Live tap drift/disappearance, native ring or
+  callback failures, worker failures, and multitrack group failures now wake
+  fixed-duration and indefinite capture owners early; the CLI then follows
+  its existing stop, discard, cleanup, and error-reporting path.
+- Failure notification is passive: producer and property-listener threads do
+  not tear down capture state. The signal remains set through shutdown and
+  resets on the next start.
+
 ## [0.5.2] - 2026-08-24
 
 - Re-checked the tap stream format at stop: if it changed mid-capture (for
