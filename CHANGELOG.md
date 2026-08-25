@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-24
+
 - Re-checked the tap stream format at stop: if it changed mid-capture (for
   example after a default-device change) or the tap was destroyed by its
   owner, `stop()` now fails and discards the output instead of publishing a
