@@ -16,8 +16,8 @@ pip install catap
 ```
 
 `catap` is macOS-only and requires macOS 14.2 or later. Importing it on other
-platforms raises `ImportError`. CI covers CPython 3.11 through 3.14, including
-free-threaded 3.13t and 3.14t, on macOS 15 and 26.
+platforms raises `ImportError`. CI covers CPython 3.11 through 3.15, including
+free-threaded 3.13t, 3.14t, and 3.15t, on macOS 15 and 26.
 
 Recording requires the bundled native Core Audio dylib. Wheels include a
 universal2 build; source builds require the macOS command-line developer tools.
