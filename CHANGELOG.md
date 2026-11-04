@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-04
+
+Maintenance release with no behavior changes.
+
+- Added support for Python 3.15. CI now covers CPython 3.15 and free-threaded
+  3.15t.
+- Verified macOS 27: the permissioned integration suite passed on macOS 27.0.1,
+  and the macOS 27 SDK adds no tap APIs.
+- Refreshed the locked development environment, including PyObjC 13, which is
+  already resolved for new installations. The update also addresses advisories
+  for certifi, urllib3, and setuptools, which are development and build tools
+  that are not installed with `catap`.
+- Fixed a race that caused `test_stop_preserves_callback_failure_cause` to fail
+  intermittently on free-threaded builds. Recorder tests now also clean up
+  worker threads that could previously cause pytest to hang at exit after a
+  failure.
+- Added CI job timeouts, a weekly scheduled run, and monthly Dependabot updates
+  for `uv` and GitHub Actions. Updated GitHub Actions to current versions.
+
 ## [0.6.0] - 2026-08-25
 
 Feature completeness against the Core Audio tap API surface from macOS 14.2
