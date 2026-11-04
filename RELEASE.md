@@ -16,9 +16,9 @@ uv run --group dev python -m build
 uv run --group dev twine check dist/*
 ```
 
-Run the permissioned integration tests on macOS 26. Grant System Audio
-Recording, Microphone, and Automation access to the test runner. Close
-QuickTime Player, keep the default output audible, and pause other audio.
+Run the permissioned integration tests on the latest macOS release. Grant the
+test runner access to System Audio Recording, Microphone, and Automation.
+Close QuickTime Player, keep the default output audible, and pause other audio.
 
 ```bash
 CATAP_RUN_INTEGRATION=1 CATAP_RUN_TONE_INTEGRATION=1 \
