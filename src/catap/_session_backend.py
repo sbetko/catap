@@ -27,13 +27,26 @@ from catap.recorder import AudioRecorder
 class _RecorderLike(Protocol):
     """Recorder methods used by the session layer."""
 
-    is_recording: bool
-    needs_cleanup: bool
-    capture_failed: bool
-    captured_only_silence: bool
-    frames_recorded: int
-    duration_seconds: float
-    stream_format: AudioStreamFormat | None
+    @property
+    def is_recording(self) -> bool: ...
+
+    @property
+    def needs_cleanup(self) -> bool: ...
+
+    @property
+    def capture_failed(self) -> bool: ...
+
+    @property
+    def captured_only_silence(self) -> bool: ...
+
+    @property
+    def frames_recorded(self) -> int: ...
+
+    @property
+    def duration_seconds(self) -> float: ...
+
+    @property
+    def stream_format(self) -> AudioStreamFormat | None: ...
 
     def start(self) -> None: ...
 
@@ -45,14 +58,29 @@ class _RecorderLike(Protocol):
 class _MultitrackRecorderLike(Protocol):
     """Multitrack recorder methods used by the session layer."""
 
-    is_recording: bool
-    needs_cleanup: bool
-    capture_failed: bool
-    captured_only_silence: bool
-    track_captured_only_silence: tuple[bool, ...]
-    frames_recorded: int
-    duration_seconds: float
-    stream_formats: list[AudioStreamFormat]
+    @property
+    def is_recording(self) -> bool: ...
+
+    @property
+    def needs_cleanup(self) -> bool: ...
+
+    @property
+    def capture_failed(self) -> bool: ...
+
+    @property
+    def captured_only_silence(self) -> bool: ...
+
+    @property
+    def track_captured_only_silence(self) -> tuple[bool, ...]: ...
+
+    @property
+    def frames_recorded(self) -> int: ...
+
+    @property
+    def duration_seconds(self) -> float: ...
+
+    @property
+    def stream_formats(self) -> list[AudioStreamFormat]: ...
 
     def start(self) -> None: ...
 

@@ -677,7 +677,7 @@ def test_close_accepts_bad_object_after_interrupted_tap_destroy(
         if destroy_calls == 1:
             raise KeyboardInterrupt("interrupted after native destroy")
         error = OSError("tap no longer exists")
-        error.status = kAudioHardwareBadObjectError
+        error.status = kAudioHardwareBadObjectError  # ty: ignore[unresolved-attribute]
         raise error
 
     monkeypatch.setattr(backend, "destroy_process_tap", _ambiguous_destroy)
@@ -1726,7 +1726,7 @@ def test_multitrack_destroy_taps_publishes_progress_before_interruption(
                 if self.interrupt_destroy:
                     raise KeyboardInterrupt
                 error = OSError("tap no longer exists")
-                error.status = (  # type: ignore[attr-defined]
+                error.status = (  # ty: ignore[unresolved-attribute]
                     kAudioHardwareBadObjectError
                 )
                 raise error

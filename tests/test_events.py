@@ -340,7 +340,7 @@ def test_close_treats_destroyed_object_listener_removal_as_success(
     listeners = _RecordingListeners()
     abandoned: list[object] = []
     stale_error = OSError("bad object")
-    stale_error.status = events_module.kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    stale_error.status = events_module.kAudioHardwareBadObjectError  # ty: ignore[unresolved-attribute]
 
     def _remove_destroyed(
         object_id: int,
@@ -386,7 +386,7 @@ def test_close_failure_keeps_watch_active_and_retryable(
         remove_calls += 1
         if remove_calls == 1:
             error = OSError("transient remove failure")
-            error.status = -50  # type: ignore[attr-defined]
+            error.status = -50  # ty: ignore[unresolved-attribute]
             raise error
         listeners.remove(object_id, selector, proc, scope, element)
 
@@ -532,7 +532,7 @@ def test_close_retries_if_active_root_release_is_interrupted(
     class _InterruptingActiveSet(set[AudioPropertyWatch]):
         discard_calls = 0
 
-        def discard(self, watch: AudioPropertyWatch) -> None:
+        def discard(self, watch: AudioPropertyWatch) -> None:  # ty: ignore[invalid-method-override]
             super().discard(watch)
             self.discard_calls += 1
             if self.discard_calls == 1:
@@ -592,7 +592,7 @@ def test_partial_registration_failure_removes_registered_listeners(
     ) -> None:
         if listeners.added:
             error = OSError("second add failed")
-            error.status = -50  # type: ignore[attr-defined]
+            error.status = -50  # ty: ignore[unresolved-attribute]
             raise error
         listeners.add(object_id, selector, proc, scope, element)
 
@@ -668,7 +668,7 @@ def test_failed_constructor_parks_listener_and_drops_callback_events(
     ) -> None:
         del object_id, selector, proc, scope, element
         error = OSError("remove failed")
-        error.status = -50  # type: ignore[attr-defined]
+        error.status = -50  # ty: ignore[unresolved-attribute]
         raise error
 
     monkeypatch.setattr(
@@ -685,9 +685,9 @@ def test_failed_constructor_parks_listener_and_drops_callback_events(
         AudioPropertyWatch(12, [_TFMT], lambda event: None)
 
     proc = captured_procs[0]
-    watch = proc.__self__  # type: ignore[attr-defined]
+    watch = proc.__self__  # ty: ignore[unresolved-attribute]
     queued_before_callback = watch._events.qsize()
-    assert proc(12, 1, [_address(_TFMT)], None) == 0  # type: ignore[operator]
+    assert proc(12, 1, [_address(_TFMT)], None) == 0  # ty: ignore[call-non-callable]
 
     assert active_watches == {watch}
     assert abandoned == [proc]

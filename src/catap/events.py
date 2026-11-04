@@ -193,7 +193,7 @@ class AudioPropertyWatch:
                     return 0
                 registered_selectors = tuple(self._registered_selectors)
                 for index in range(number_of_addresses):
-                    address = addresses[index]  # type: ignore[index]
+                    address = addresses[index]  # ty: ignore[not-subscriptable]
                     selector = int(address[0])
                     scope = int(address[1])
                     element = int(address[2])

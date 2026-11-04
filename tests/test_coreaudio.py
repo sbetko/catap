@@ -77,7 +77,7 @@ def test_get_property_data_size_raises_status_error(
     with pytest.raises(OSError, match="status -50") as exc_info:
         coreaudio_module.get_property_data_size(7, address)
 
-    assert exc_info.value.status == -50  # type: ignore[attr-defined]
+    assert exc_info.value.status == -50  # ty: ignore[unresolved-attribute]
 
 
 def test_get_property_bytes_returns_empty_for_zero_sized_property(
@@ -164,7 +164,7 @@ def test_get_property_bytes_raises_status_error(
     with pytest.raises(OSError, match="status 12") as exc_info:
         coreaudio_module.get_property_bytes(7, 0x1234)
 
-    assert exc_info.value.status == 12  # type: ignore[attr-defined]
+    assert exc_info.value.status == 12  # ty: ignore[unresolved-attribute]
 
 
 def test_get_property_struct_fetches_ctypes_structure(
@@ -212,7 +212,7 @@ def test_get_property_struct_raises_status_error(
     with pytest.raises(OSError, match="status 42") as exc_info:
         coreaudio_module.get_property_struct(7, 0x1234, _TinyStruct)
 
-    assert exc_info.value.status == 42  # type: ignore[attr-defined]
+    assert exc_info.value.status == 42  # ty: ignore[unresolved-attribute]
 
 
 def test_get_property_cfstring_returns_none_for_zero_sized_property(
@@ -292,7 +292,7 @@ def test_get_property_cfstring_raises_status_error(
     with pytest.raises(OSError, match="status 42") as exc_info:
         coreaudio_module.get_property_cfstring(7, 0x1234)
 
-    assert exc_info.value.status == 42  # type: ignore[attr-defined]
+    assert exc_info.value.status == 42  # ty: ignore[unresolved-attribute]
 
 
 def test_get_property_cfstring_wraps_and_releases_core_foundation_object(
@@ -506,7 +506,7 @@ def test_get_property_objc_object_raises_status_error(
     with pytest.raises(OSError, match="status 42") as exc_info:
         coreaudio_module.get_property_objc_object(7, 0x1234)
 
-    assert exc_info.value.status == 42  # type: ignore[attr-defined]
+    assert exc_info.value.status == 42  # ty: ignore[unresolved-attribute]
 
 
 def test_get_property_object_ids_returns_empty_for_empty_payload(

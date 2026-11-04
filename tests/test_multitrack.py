@@ -628,7 +628,7 @@ def test_stop_accepts_bad_object_after_interrupted_aggregate_destroy() -> None:
             if len(self.destroy_calls) == 1:
                 raise KeyboardInterrupt("interrupted after native destroy")
             error = OSError("aggregate no longer exists")
-            error.status = kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+            error.status = kAudioHardwareBadObjectError  # ty: ignore[unresolved-attribute]
             raise error
 
     engine = _AmbiguousAggregateEngine()

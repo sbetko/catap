@@ -1147,9 +1147,9 @@ class MultitrackRecordingSession:
         input_stream_count = len(input_device.input_streams) if input_device else 0
         labels = [
             (
-                input_device.name  # type: ignore[union-attr]
+                input_device.name  # ty: ignore[unresolved-attribute]
                 if input_stream_count == 1
-                else f"{input_device.name} {index}"  # type: ignore[union-attr]
+                else f"{input_device.name} {index}"  # ty: ignore[unresolved-attribute]
             )
             for index in range(input_stream_count)
         ] + [process.name for process in resolved]

@@ -226,7 +226,7 @@ def test_abandoned_recorder_handle_is_not_destroyed() -> None:
         cdll = _FakeCdll()
 
     recorder = NativeCoreAudioRecorder.__new__(NativeCoreAudioRecorder)
-    recorder._library = _FakeLibrary()
+    recorder._library = _FakeLibrary()  # ty: ignore[invalid-assignment]
     recorder._handle = ctypes.c_void_p(123)
 
     recorder.abandon()

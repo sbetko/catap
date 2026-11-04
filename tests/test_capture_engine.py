@@ -122,7 +122,7 @@ def test_aggregate_rejects_non_enum_drift_quality(quality: object) -> None:
         capture_module._create_aggregate_device(
             ["tap-one"],
             "test aggregate",
-            drift_compensation_quality=quality,  # type: ignore[arg-type]
+            drift_compensation_quality=quality,  # ty: ignore[invalid-argument-type]
         )
 
 
@@ -213,7 +213,7 @@ def test_describe_tap_stream_raises_stale_tap_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stale_error = OSError("bad object")
-    stale_error.status = kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    stale_error.status = kAudioHardwareBadObjectError  # ty: ignore[unresolved-attribute]
     monkeypatch.setattr(
         capture_module,
         "_get_tap_format",

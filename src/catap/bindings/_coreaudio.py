@@ -111,7 +111,7 @@ def _property_address(
 def _status_error(message: str, status: int) -> OSError:
     """Return an ``OSError`` annotated with the Core Audio status code."""
     error = OSError(message)
-    error.status = status  # type: ignore[attr-defined]
+    error.status = status  # ty: ignore[unresolved-attribute]
     return error
 
 

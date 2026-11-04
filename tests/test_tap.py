@@ -194,7 +194,7 @@ def test_get_tap_description_raises_audio_tap_not_found_for_bad_object(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stale_error = OSError("bad object")
-    stale_error.status = tap_module.kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    stale_error.status = tap_module.kAudioHardwareBadObjectError  # ty: ignore[unresolved-attribute]
     monkeypatch.setattr(
         tap_module,
         "_get_audio_object_objc_property",
@@ -277,7 +277,7 @@ def test_get_tap_format_raises_audio_tap_not_found_for_bad_object(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stale_error = OSError("bad object")
-    stale_error.status = tap_module.kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    stale_error.status = tap_module.kAudioHardwareBadObjectError  # ty: ignore[unresolved-attribute]
     monkeypatch.setattr(
         tap_module,
         "_get_audio_object_struct_property",
@@ -297,7 +297,7 @@ def test_set_tap_description_translates_permissions_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     denied_error = OSError("set refused")
-    denied_error.status = tap_module.kAudioDevicePermissionsError  # type: ignore[attr-defined]
+    denied_error.status = tap_module.kAudioDevicePermissionsError  # ty: ignore[unresolved-attribute]
     seen: list[tuple[int, int, Any]] = []
 
     def _set_objc_property(object_id: int, selector: int, value: Any) -> None:
@@ -326,7 +326,7 @@ def test_set_tap_description_raises_audio_tap_not_found_for_bad_object(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stale_error = OSError("bad object")
-    stale_error.status = tap_module.kAudioHardwareBadObjectError  # type: ignore[attr-defined]
+    stale_error.status = tap_module.kAudioHardwareBadObjectError  # ty: ignore[unresolved-attribute]
     monkeypatch.setattr(
         tap_module,
         "_set_audio_object_objc_property",
@@ -406,7 +406,7 @@ def test_get_tap_description_raises_audio_tap_not_found_for_unknown_property(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stale_error = OSError("unknown property")
-    stale_error.status = tap_module.kAudioHardwareUnknownPropertyError  # type: ignore[attr-defined]
+    stale_error.status = tap_module.kAudioHardwareUnknownPropertyError  # ty: ignore[unresolved-attribute]
     monkeypatch.setattr(
         tap_module,
         "_get_audio_object_objc_property",

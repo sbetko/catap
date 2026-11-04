@@ -1881,7 +1881,7 @@ def test_start_raises_audio_tap_not_found_error_for_stale_tap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stale_error = OSError("tap disappeared")
-    stale_error.status = int.from_bytes(b"!obj", "big")  # type: ignore[attr-defined]
+    stale_error.status = int.from_bytes(b"!obj", "big")  # ty: ignore[unresolved-attribute]
 
     monkeypatch.setattr(
         capture_module,

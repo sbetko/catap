@@ -218,7 +218,7 @@ def test_find_process_by_pid_returns_none_for_unknown_pid(
             selector
             == process_module.kAudioHardwarePropertyTranslatePIDToProcessObject
         )
-        assert qualifier.value == 4242  # type: ignore[attr-defined]
+        assert qualifier.value == 4242  # ty: ignore[unresolved-attribute]
         return process_module.kAudioObjectUnknown
 
     monkeypatch.setattr(process_module, "_translate_qualifier", _translate)
@@ -250,7 +250,7 @@ def test_find_process_by_pid_propagates_translation_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     error = OSError("translation failed")
-    error.status = -50  # type: ignore[attr-defined]
+    error.status = -50  # ty: ignore[unresolved-attribute]
     monkeypatch.setattr(
         process_module,
         "_translate_qualifier",
@@ -272,7 +272,7 @@ def test_find_process_by_pid_builds_process_from_translated_id(
             selector
             == process_module.kAudioHardwarePropertyTranslatePIDToProcessObject
         )
-        assert qualifier.value == 9001  # type: ignore[attr-defined]
+        assert qualifier.value == 9001  # ty: ignore[unresolved-attribute]
         return 41
 
     def get_property(
