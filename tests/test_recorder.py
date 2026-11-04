@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import struct
 import threading
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -46,6 +47,9 @@ def _stub_tap_format(tap_id: int) -> AudioStreamBasicDescription:
     return asbd
 
 
+_tracked_workers: list[worker_module._AudioWorker] = []
+
+
 def _make_worker(
     *,
     record_accepted_frames: Callable[[int], None] | None = None,
@@ -53,7 +57,7 @@ def _make_worker(
     consume_dropped_stats: Callable[[], tuple[int, int]] | None = None,
     capture_failure_event: threading.Event | None = None,
 ) -> worker_module._AudioWorker:
-    return worker_module._AudioWorker(
+    worker = worker_module._AudioWorker(
         record_accepted_frames=(
             (lambda num_frames: None)
             if record_accepted_frames is None
@@ -69,6 +73,8 @@ def _make_worker(
         ),
         capture_failure_event=capture_failure_event,
     )
+    _tracked_workers.append(worker)
+    return worker
 
 
 def _make_worker_config(
@@ -162,6 +168,18 @@ class _InspectableNativeRecorder:
 
     def abandon(self) -> None:
         self.abandoned = True
+
+
+@pytest.fixture(autouse=True)
+def _stop_leaked_workers() -> Iterator[None]:
+    """Stop workers a failed test left running; they block interpreter exit."""
+    yield
+    while _tracked_workers:
+        worker = _tracked_workers.pop()
+        with contextlib.suppress(BaseException):
+            thread = worker.thread
+            if thread is not None and thread.is_alive():
+                worker.stop(publish=False)
 
 
 @pytest.fixture(autouse=True)
@@ -2380,7 +2398,7 @@ def test_stop_preserves_callback_failure_cause() -> None:
 
     assert worker.enqueue_audio_bytes(b"\x01\x02", 1) is True
     assert callback_seen.wait(timeout=1)
-    assert capture_failure.is_set()
+    assert capture_failure.wait(timeout=1)
 
     with pytest.raises(
         RuntimeError,
