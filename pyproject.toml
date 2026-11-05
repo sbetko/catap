@@ -71,6 +71,10 @@ include-package-data = false
 catap = ["py.typed", "native/*.dylib"]
 
 [tool.uv]
+constraint-dependencies = [
+    # 0.3.1 is the last nh3 with a 3.13t wheel, and PyO3 no longer supports 3.13t.
+    "nh3<0.3.2; python_version == '3.13'",
+]
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "setup.py" },
